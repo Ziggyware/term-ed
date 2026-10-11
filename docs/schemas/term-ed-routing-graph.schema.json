@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TermEdAgentRoutingGraph",
+  "description": "Standardized JSON schema for defining agent, tool, protocol, and decision routing graphs in Ziggyware/term-ed.",
+  "type": "object",
+  "required": ["version", "graph_id", "name", "nodes", "edges"],
+  "properties": {
+    "version": {
+      "type": "string",
+      "enum": ["2026-04"]
+    },
+    "graph_id": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string"
+    },
+    "description": {
+      "type": "string"
+    },
+    "nodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "type", "label", "position"],
+        "properties": {
+          "id": { "type": "string" },
+          "type": {
+            "type": "string",
+            "enum": ["agent", "tool", "decision_gate", "data_source", "ui_sink"]
+          },
+          "label": { "type": "string" },
+          "position": {
+            "type": "object",
+            "required": ["x", "y"],
+            "properties": {
+              "x": { "type": "number" },
+              "y": { "type": "number" }
+            }
+          },
+          "config": {
+            "type": "object",
+            "properties": {
+              "provider": { "type": "string" },
+              "model": { "type": "string" },
+              "role": { "type": "string" },
+              "decision_primitive": {
+                "type": "string",
+                "enum": ["noul", "choice", "score"]
+              },
+              "thresholds": {
+                "type": "object",
+                "properties": {
+                  "auto_allow": { "type": "number" },
+                  "hard_block": { "type": "number" }
+                }
+              },
+              "tools": {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "edges": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "source", "target", "protocol"],
+        "properties": {
+          "id": { "type": "string" },
+          "source": { "type": "string" },
+          "target": { "type": "string" },
+          "protocol": {
+            "type": "string",
+            "enum": ["mcp", "a2a", "ag_ui", "aep", "typed_decision"]
+          },
+          "routing_condition": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

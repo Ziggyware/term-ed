@@ -10,6 +10,7 @@
 //! Agent Client Protocol messages as an external agent, only over in-process
 //! channels, so the agent panel treats it like any other ACP agent.
 
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -19,6 +20,13 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+
+use crate::aep::AepPatch;
+use crate::agui::AGUIHub;
+use crate::decisions::{
+    DecisionContext, DecisionEngine, ModelSelector, PermissionPolicy, PermissionVerdict,
+    default_engine,
+};
 
 pub const GATEWAY: &str = "https://api.kilo.ai/api/gateway";
 
@@ -187,6 +195,10 @@ struct Worker {
     history: Vec<Value>,
     next_id: u64,
     always_allow_commands: bool,
+    policy: PermissionPolicy,
+    model_selector: ModelSelector,
+    decisions: Arc<dyn DecisionEngine>,
+    agui: AGUIHub,
 }
 
 enum Step {
@@ -201,6 +213,16 @@ impl Worker {
         replies: Receiver<Value>,
         cancel: Arc<AtomicBool>,
     ) -> Self {
+        let decisions = default_engine();
+        let auto_allow_thresh = if std::env::var("TERMED_AUTO_ALLOW").map(|v| v == "0").unwrap_or(false) {
+            0.0
+        } else {
+            0.20
+        };
+        let policy = PermissionPolicy::with_thresholds(decisions.clone(), auto_allow_thresh, 0.75);
+        let model_selector = ModelSelector::new(decisions.clone());
+        let agui = AGUIHub::new();
+
         Self {
             cwd,
             out,
@@ -212,6 +234,10 @@ impl Worker {
             history: Vec::new(),
             next_id: 1000,
             always_allow_commands: false,
+            policy,
+            model_selector,
+            decisions,
+            agui,
         }
     }
 
@@ -344,13 +370,28 @@ impl Worker {
                 Err(Step::Failed(msg, status)) => {
                     // Busy or failing free model: move on to another free model.
                     let busy = matches!(status, Some(429) | Some(500..=599)) || status.is_none();
+                    let busy_set: HashSet<String> = tried_models.iter().cloned().collect();
                     let next = self
-                        .models
-                        .iter()
-                        .map(|(v, _)| v.clone())
-                        .find(|v| !tried_models.contains(v));
+                        .model_selector
+                        .select_fallback(&self.model, &self.models, &busy_set)
+                        .or_else(|| {
+                            self.models
+                                .iter()
+                                .map(|(v, _)| v.clone())
+                                .find(|v| !tried_models.contains(v))
+                        });
                     match next {
                         Some(n) if busy && tried_models.len() < 4 => {
+                            self.agui.emit(
+                                "decision:evaluated",
+                                "builtin",
+                                json!({
+                                    "query": "model_failover_choice",
+                                    "selected": n,
+                                    "reason": msg,
+                                    "backend": self.decisions.backend_name()
+                                }),
+                            );
                             let short = |s: &str| {
                                 s.split('/')
                                     .next_back()
@@ -559,11 +600,29 @@ impl Worker {
             .into_iter()
             .collect();
         self.update(json!({"sessionUpdate":"tool_call","toolCallId":id,"title":title,"kind":kind,"status":"in_progress","locations":locs}));
+        self.agui.emit(
+            "tool:started",
+            "builtin",
+            json!({
+                "tool_id": id,
+                "title": title,
+                "kind": kind,
+                "path": path.map(|p| p.display().to_string()),
+            }),
+        );
     }
 
     fn tool_end(&self, id: &str, ok: bool, content: Vec<Value>) {
         self.update(json!({"sessionUpdate":"tool_call_update","toolCallId":id,
             "status": if ok {"completed"} else {"failed"},"content":content}));
+        self.agui.emit(
+            "tool:completed",
+            "builtin",
+            json!({
+                "tool_id": id,
+                "status": if ok { "completed" } else { "failed" },
+            }),
+        );
     }
 
     fn text_block(s: &str) -> Value {
@@ -716,7 +775,44 @@ impl Worker {
             ));
         }
         let updated = text.replacen(old_n.as_str(), &new_n, 1);
-        std::fs::write(&p, updated).map_err(|e| e.to_string())?;
+        std::fs::write(&p, &updated).map_err(|e| e.to_string())?;
+
+        // Structured AEP patch tracking & AG-UI emission
+        let patch = AepPatch::from_replace(&rel, old, new);
+        self.agui.emit(
+            "patch:applied",
+            "builtin",
+            json!({
+                "path": rel,
+                "old_text": old,
+                "new_text": new,
+                "hunk_count": patch.hunks.len(),
+                "protocol": "AEP"
+            }),
+        );
+
+        // Jev-Judge post-edit verification (ask_noul)
+        let judge_ctx = DecisionContext {
+            task_id: format!("edit_judge_{id}"),
+            working_dir: self.cwd.to_string_lossy().into_owned(),
+            session_history_summary: String::new(),
+            metadata: json!({ "path": rel, "lines": updated.lines().count() }),
+        };
+        if let Ok(res) = self.decisions.ask_noul("Did the edit apply cleanly and keep document valid?", &judge_ctx) {
+            self.agui.emit(
+                "decision:evaluated",
+                "builtin",
+                json!({
+                    "query": "jev-judge: verify edit",
+                    "judgment": res.judgment,
+                    "confidence": res.confidence,
+                    "margin": res.margin,
+                    "rationale": res.rationale,
+                    "backend": self.decisions.backend_name()
+                }),
+            );
+        }
+
         self.tool_end(
             id,
             true,
@@ -781,9 +877,39 @@ impl Worker {
 
     fn run_command(&mut self, id: &str, command: &str) -> Result<String, String> {
         self.tool_start(id, &format!("Run `{command}`"), "execute", None);
-        if !self.permission(id, &format!("run `{command}`")) {
-            self.tool_end(id, false, vec![Self::text_block("Rejected by the user.")]);
-            return Ok("The user rejected this command.".into());
+
+        // Jev-governed permission risk evaluation
+        let verdict = self.policy.evaluate_command(command, &self.cwd.to_string_lossy());
+        self.agui.emit(
+            "decision:evaluated",
+            "builtin",
+            json!({
+                "metric": "shell_execution_risk",
+                "command": command,
+                "backend": self.decisions.backend_name(),
+                "verdict": match &verdict {
+                    PermissionVerdict::AutoAllow { score, rationale } => json!({"type": "AutoAllow", "score": score, "rationale": rationale}),
+                    PermissionVerdict::PromptUser { score, rationale } => json!({"type": "PromptUser", "score": score, "rationale": rationale}),
+                    PermissionVerdict::Block { score, reason } => json!({"type": "Block", "score": score, "reason": reason}),
+                }
+            }),
+        );
+
+        match verdict {
+            PermissionVerdict::AutoAllow { .. } => {
+                // Low risk command auto-allowed (e.g. read/test commands)
+            }
+            PermissionVerdict::Block { score, reason } => {
+                self.tool_end(id, false, vec![Self::text_block(&format!("Blocked by policy (risk {:.2}): {reason}", score))]);
+                return Ok(format!("Command blocked by Jev risk policy: {reason}"));
+            }
+            PermissionVerdict::PromptUser { score, rationale } => {
+                let prompt_desc = format!("run `{command}` (risk {:.2}: {})", score, rationale);
+                if !self.permission(id, &prompt_desc) {
+                    self.tool_end(id, false, vec![Self::text_block("Rejected by the user.")]);
+                    return Ok("The user rejected this command.".into());
+                }
+            }
         }
         let started = Instant::now();
         let mut child = Command::new("sh")
