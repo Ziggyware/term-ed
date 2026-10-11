@@ -40,11 +40,18 @@ impl AepPatch {
                 };
                 lines.push(format!("{}{}", prefix, change.value()));
             }
+            // `UnifiedDiffHunk` exposes no range accessors, so derive the hunk's
+            // old/new extents from the diff ops it groups together.
+            let ops = hunk.ops();
+            let old_start = ops.first().map_or(0, |op| op.old_range().start);
+            let new_start = ops.first().map_or(0, |op| op.new_range().start);
+            let old_lines: usize = ops.iter().map(|op| op.old_range().len()).sum();
+            let new_lines: usize = ops.iter().map(|op| op.new_range().len()).sum();
             hunks.push(AepHunk {
-                old_start: hunk.old_range().start(),
-                old_lines: hunk.old_range().len(),
-                new_start: hunk.new_range().start(),
-                new_lines: hunk.new_range().len(),
+                old_start,
+                old_lines,
+                new_start,
+                new_lines,
                 lines,
             });
         }

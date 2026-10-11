@@ -11,7 +11,7 @@
 //! channels, so the agent panel treats it like any other ACP agent.
 
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
