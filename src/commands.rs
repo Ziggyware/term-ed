@@ -60,6 +60,7 @@ pub enum Command {
     AgentModel,
     AgentPick,
     AgentSetKey,
+    GraphicsInfo,
 }
 
 pub struct CommandInfo {
@@ -133,4 +134,5 @@ cmds! {
     AgentModel, "Agent: Choose Model", "";
     AgentPick, "Agent: Choose Agent", "";
     AgentSetKey, "Agent: Set API Key", "";
+    GraphicsInfo, "View: Graphics Info", "";
 }

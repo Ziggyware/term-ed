@@ -106,6 +106,17 @@ fn main() -> anyhow::Result<()> {
     let root = std::path::absolute(&pos[3])?;
     let files: Vec<PathBuf> = pos[4..].iter().map(PathBuf::from).collect();
     let mut app = App::new(root, files, theme, false);
+    // SNAPSHOT_PIXELS=1 shows what a terminal with pixel graphics (kitty,
+    // Sixel, iTerm2) displays: pictures are recorded and placed as images.
+    if let Ok(p) = std::env::var("SNAPSHOT_PIXELS") {
+        app.graphics.record = true;
+        app.graphics.record_as = match p.as_str() {
+            "sixel" => "Sixel",
+            "iterm2" => "iTerm2",
+            _ => "kitty",
+        };
+    }
+    app.graphics.cell_px = Some((9, 19));
     let mut term = Terminal::new(TestBackend::new(w, h))?;
     term.draw(|f| termed::ui::draw(f, &mut app, true))?;
     for k in keys.iter().skip(1) {
@@ -145,6 +156,7 @@ fn main() -> anyhow::Result<()> {
             term.draw(|f| termed::ui::draw(f, &mut app, true))?;
         }
     }
+    app.graphics.recorded.clear();
     term.draw(|f| termed::ui::draw(f, &mut app, true))?;
     let cursor = term.backend_mut().get_cursor_position().ok();
     let cursor_visible = term.backend().cursor_visible();
@@ -178,10 +190,14 @@ fn main() -> anyhow::Result<()> {
             if cw > 1 {
                 let _ = write!(style, ";width:{:.2}px", 9.03 * cw as f32);
             }
-            let s = sym
-                .replace('&', "&amp;")
-                .replace('<', "&lt;")
-                .replace('>', "&gt;");
+            let s = match mosaic(sym, css(cell.fg, "#ddd")) {
+                // Drawn as vectors, like terminals with built-in block glyphs.
+                Some(svg) => svg,
+                None => sym
+                    .replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;"),
+            };
             let _ = write!(html, "<span class=c style=\"{style}\">{s}</span>");
             x += cw;
         }
@@ -195,7 +211,103 @@ fn main() -> anyhow::Result<()> {
             c.y as u32 * 19
         );
     }
+    for (r, img) in &app.graphics.recorded {
+        let mut png = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)?;
+        use base64::Engine as _;
+        let data = base64::engine::general_purpose::STANDARD.encode(&png);
+        let _ = write!(
+            html,
+            "<img style=\"position:absolute;left:{:.2}px;top:{}px;width:{:.2}px;height:{}px\" src=\"data:image/png;base64,{data}\">",
+            r.x as f32 * 9.03,
+            r.y as u32 * 19,
+            r.width as f32 * 9.03,
+            r.height as u32 * 19
+        );
+    }
     html.push_str("</div>");
     std::fs::write(&out, html)?;
     Ok(())
+}
+
+/// Block mosaics (halves, eighths, quadrants, sextants, octants) and braille
+/// as inline SVG, so screenshots match terminals that draw them natively
+/// instead of depending on the font.
+fn mosaic(sym: &str, fg: String) -> Option<String> {
+    use termed::ui::hires::Glyphs;
+    let mut it = sym.chars();
+    let ch = it.next()?;
+    if it.next().is_some() || ch == ' ' {
+        return None;
+    }
+    let svg = |vw: u32, vh: u32, body: String| {
+        format!(
+            "<svg width=9.03 height=19 viewBox=\"0 0 {vw} {vh}\" preserveAspectRatio=none \
+             shape-rendering=crispEdges style=\"display:block\" fill=\"{fg}\">{body}</svg>"
+        )
+    };
+    let cells = |cols: u32, rows: u32, mask: u32| {
+        let mut b = String::new();
+        for i in 0..cols * rows {
+            if mask & (1 << i) != 0 {
+                let _ = write!(
+                    b,
+                    "<rect x={} y={} width=1.02 height=1.02 />",
+                    i % cols,
+                    i / cols
+                );
+            }
+        }
+        svg(cols, rows, b)
+    };
+    let c = ch as u32;
+    // Eighth blocks.
+    if (0x2581..=0x2588).contains(&c) {
+        let k = c - 0x2580;
+        return Some(svg(
+            8,
+            8,
+            format!("<rect x=0 y={} width=8 height={k} />", 8 - k),
+        ));
+    }
+    if (0x2589..=0x258F).contains(&c) {
+        let k = 0x2590 - c;
+        return Some(svg(8, 8, format!("<rect x=0 y=0 width={k} height=8 />")));
+    }
+    match ch {
+        '▔' => return Some(svg(8, 8, "<rect x=0 y=0 width=8 height=1 />".into())),
+        '▕' => return Some(svg(8, 8, "<rect x=7 y=0 width=1 height=8 />".into())),
+        _ => {}
+    }
+    // Braille: dots 1-3,7 down the left column, 4-6,8 down the right.
+    if (0x2801..=0x28FF).contains(&c) {
+        let bits = c - 0x2800;
+        const POS: [(u32, u32); 8] = [
+            (0, 0),
+            (0, 1),
+            (0, 2),
+            (1, 0),
+            (1, 1),
+            (1, 2),
+            (0, 3),
+            (1, 3),
+        ];
+        let mut b = String::new();
+        for (i, (x, y)) in POS.iter().enumerate() {
+            if bits & (1 << i) != 0 {
+                let _ = write!(b, "<circle cx={}.5 cy={}.5 r=0.32 />", x, y);
+            }
+        }
+        return Some(svg(2, 4, b).replace("shape-rendering=crispEdges ", ""));
+    }
+    for (g, cols, rows, n) in [
+        (Glyphs::Quadrant, 2, 2, 16u32),
+        (Glyphs::Sextant, 2, 3, 64),
+        (Glyphs::Octant, 2, 4, 256),
+    ] {
+        if let Some(mask) = (1..n).find(|m| g.glyph(*m as u8) == ch) {
+            return Some(cells(cols, rows, mask));
+        }
+    }
+    None
 }

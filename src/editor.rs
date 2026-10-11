@@ -29,6 +29,30 @@ pub struct Editor {
     pub scroll_seg: usize,
     /// Box (column) selection, Visual Studio's Alt+Shift+arrows / Alt+drag.
     pub block: Option<BoxSel>,
+    /// Set for picture files, which open as a view-only image tab.
+    pub image: Option<ImageTab>,
+}
+
+/// A decoded picture shown in place of text.
+pub struct ImageTab {
+    pub img: std::sync::Arc<image::DynamicImage>,
+    /// Original size in pixels, format name and file size in bytes.
+    pub size: (u32, u32),
+    pub format: &'static str,
+    pub bytes: u64,
+}
+
+/// File extensions opened as pictures.
+pub fn is_image_path(path: &std::path::Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico"
+    )
 }
 
 /// A rectangular selection in display columns. Columns may lie past the end
@@ -278,11 +302,38 @@ impl Editor {
             wrap_width: None,
             scroll_seg: 0,
             block: None,
+            image: None,
         }
     }
 
     pub fn open(path: PathBuf) -> anyhow::Result<Self> {
+        if is_image_path(&path) {
+            return Self::open_image(path);
+        }
         Ok(Self::new(Document::open(&path)?))
+    }
+
+    fn open_image(path: PathBuf) -> anyhow::Result<Self> {
+        let bytes = std::fs::read(&path)?;
+        let format = image::guess_format(&bytes)?;
+        let img = image::load_from_memory_with_format(&bytes, format)?;
+        let size = (img.width(), img.height());
+        // Huge pictures are shown downscaled; the file is never rewritten.
+        let img = if size.0 > 4096 || size.1 > 4096 {
+            img.thumbnail(4096, 4096)
+        } else {
+            img
+        };
+        let mut doc = Document::from_text("", Some(path));
+        doc.read_only = true;
+        let mut e = Self::new(doc);
+        e.image = Some(ImageTab {
+            img: std::sync::Arc::new(img),
+            size,
+            format: format.extensions_str().first().copied().unwrap_or("image"),
+            bytes: bytes.len() as u64,
+        });
+        Ok(e)
     }
 
     pub fn language(&self) -> &'static str {

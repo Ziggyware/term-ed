@@ -3,6 +3,7 @@
 
 mod agent_panel;
 mod editor_view;
+pub mod hires;
 mod overlay;
 pub mod util;
 
@@ -876,7 +877,12 @@ fn render_status(buf: &mut Buffer, area: Rect, app: &mut App) {
 
     // Right: clickable segments; low-priority ones drop out on narrow screens.
     let mut segs: Vec<(String, Option<Command>, u8)> = Vec::new();
-    if let Some(e) = app.editor() {
+    if let Some(t) = app.editor().and_then(|e| e.image.as_ref()) {
+        let (w, h) = t.size;
+        segs.push((format!("{w}×{h}"), None, 9));
+        segs.push((t.format.to_uppercase(), None, 8));
+        segs.push(("view only".into(), None, 3));
+    } else if let Some(e) = app.editor() {
         let (line, _) = e.cursor();
         let col = e.cursor_display_col() + 1;
         let sel_len = e.sel.end() - e.sel.start();
@@ -976,15 +982,46 @@ fn render_welcome(buf: &mut Buffer, area: Rect, app: &mut App) {
             ("Quit", "Ctrl+Q", Command::Quit),
         ]
     };
-    let big = area.width >= width(LOGO[0]) + 4 && area.height >= 20;
-    let logo: &[&str] = if big { &LOGO } else { &SMALL_LOGO };
-    let logo_w = width(logo[0]);
+    // The wordmark: real pixels when the terminal has a graphics protocol,
+    // else a sub-cell mosaic when the glyph grid is fine enough, else the
+    // hand-drawn text logo.
+    let pixels = app.graphics.protocol().is_some();
+    let g = app.graphics.glyphs;
+    let big = area.height >= 22;
+    let hires_rows = [6u16, 4, 3]
+        .into_iter()
+        .filter(|r| big || *r < 6)
+        .find(|r| (pixels || hires::logo_fits(*r, g)) && hires::logo_cols(*r) + 4 <= area.width);
+    let text_logo: &[&str] = if big && area.width >= width(LOGO[0]) + 4 {
+        &LOGO
+    } else {
+        &SMALL_LOGO
+    };
+    let logo_rows = hires_rows.unwrap_or(text_logo.len() as u16);
     let gap = if compact { 1 } else { 2 };
-    let block_h = logo.len() as u16 + 2 + gap + shortcuts.len() as u16 * gap;
+    let block_h = logo_rows + 2 + gap + shortcuts.len() as u16 * gap;
     let top = area.y + area.height.saturating_sub(block_h) / 2;
-    if area.width >= logo_w + 2 {
+    if let Some(rows) = hires_rows {
+        let lw = hires::logo_cols(rows);
+        let lr = Rect::new(area.x + (area.width - lw) / 2, top, lw, rows);
+        let (from, to, back) = (
+            hires::rgb(pal.logo[0]),
+            hires::rgb(pal.logo[1]),
+            hires::rgb(pal.bg),
+        );
+        let key = format!("logo:{}", app.theme.name);
+        let shown = app.graphics.draw_image(buf, lr, &key, |w, h| {
+            hires::logo_image(w, h, from, to, back)
+        });
+        if !shown {
+            app.graphics
+                .draw_mosaic(buf, lr, &key, || hires::logo_canvas(lr, g, from, to, back));
+        }
+    } else if area.width >= width(text_logo[0]) + 2 {
+        let big = text_logo.len() > 2;
+        let logo_w = width(text_logo[0]);
         let lx = area.x + (area.width - logo_w) / 2;
-        for (row, line) in logo.iter().enumerate() {
+        for (row, line) in text_logo.iter().enumerate() {
             for (i, ch) in line.chars().enumerate() {
                 let t = (i as f32 / logo_w as f32 + row as f32 * 0.04).min(1.0);
                 let c = mix(pal.logo[0], pal.logo[1], t);
@@ -1009,7 +1046,7 @@ fn render_welcome(buf: &mut Buffer, area: Rect, app: &mut App) {
     } else {
         "the elite terminal code editor  ·  every language, one look"
     };
-    let ty = top + logo.len() as u16 + 1;
+    let ty = top + logo_rows + 1;
     put(
         buf,
         area.x + area.width.saturating_sub(width(tag)) / 2,

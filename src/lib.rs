@@ -9,6 +9,7 @@ pub mod document;
 pub mod editor;
 pub mod explorer;
 pub mod fuzzy;
+pub mod graphics;
 pub mod highlight;
 pub mod icons;
 pub mod providers;

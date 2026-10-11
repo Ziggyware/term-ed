@@ -33,6 +33,10 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
     let compact = app.compact;
     let wrap = app.word_wrap();
     let bg = pal.bg;
+    if app.editor()?.image.is_some() {
+        render_image(buf, area, app);
+        return None;
+    }
     let e = app.editors.get_mut(app.active)?;
 
     // ---------------------------------------------------------------- layout
@@ -659,14 +663,35 @@ fn render_scrollbar(
     let total = e.doc.len_lines().max(1);
     fill(buf, area, pal.scrollbar_track);
     let content = total + e.view_height.saturating_sub(1);
-    let thumb_len = ((h * e.view_height) / content.max(1)).clamp(1, h);
-    let thumb_pos = if total > 1 {
-        e.scroll_line * (h - thumb_len) / (total - 1).max(1)
+    // The thumb moves in eighths of a cell: partial cells use the eighth
+    // blocks (▁▂▃▄▅▆▇) so it glides instead of jumping a row at a time.
+    let h8 = h * 8;
+    let len8 = ((h8 * e.view_height) / content.max(1)).clamp(8, h8);
+    let pos8 = if total > 1 {
+        e.scroll_line * (h8 - len8) / (total - 1).max(1)
     } else {
         0
     };
-    for y in thumb_pos..(thumb_pos + thumb_len).min(h) {
-        super::util::set_bg(buf, area.x, area.y + y as u16, pal.scrollbar_thumb);
+    const LOWER: [&str; 9] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+    for y in 0..h {
+        let (c0, c1) = (y * 8, y * 8 + 8);
+        let covered = c1.min(pos8 + len8).saturating_sub(c0.max(pos8));
+        let Some(cell) = buf.cell_mut((area.x, area.y + y as u16)) else {
+            continue;
+        };
+        if covered == 8 {
+            cell.set_bg(pal.scrollbar_thumb);
+        } else if covered > 0 {
+            if pos8 > c0 {
+                // Thumb starts inside this cell: fill its lower part.
+                cell.set_symbol(LOWER[covered]).set_fg(pal.scrollbar_thumb);
+            } else {
+                // Thumb ends inside: track fills the lower part.
+                cell.set_symbol(LOWER[8 - covered])
+                    .set_fg(pal.scrollbar_track)
+                    .set_bg(pal.scrollbar_thumb);
+            }
+        }
     }
     let row_of = |line: usize| (line * h / total).min(h - 1) as u16;
     let mark = |buf: &mut Buffer, row: u16, sym: &str, color: Color| {
@@ -695,4 +720,105 @@ fn render_scrollbar(
     }
     let (cl, _) = e.cursor();
     mark(buf, row_of(cl), "━", pal.fg);
+}
+
+/// A picture tab: real pixels when the terminal supports a graphics
+/// protocol, otherwise a high-resolution block mosaic; transparent parts
+/// show a checkerboard.
+fn render_image(buf: &mut Buffer, area: Rect, app: &mut App) {
+    let pal = app.theme.palette.clone();
+    fill(buf, area, pal.bg);
+    let Some(e) = app.editor() else { return };
+    let Some(tab) = &e.image else { return };
+    let (img, (iw, ih), format, bytes) = (tab.img.clone(), tab.size, tab.format, tab.bytes);
+    let key = format!(
+        "{}:{}",
+        e.doc
+            .path
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
+        app.theme.name
+    );
+    let size = if bytes >= 1 << 20 {
+        format!("{:.1} MB", bytes as f64 / (1 << 20) as f64)
+    } else {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    };
+    let how = match app.graphics.protocol() {
+        Some(p) => format!("{p} graphics"),
+        None => app.graphics.glyphs.name().to_string(),
+    };
+    let info = format!(" {} · {iw}×{ih} · {size} · {how} ", format.to_uppercase());
+    let ix = area.x + area.width.saturating_sub(super::util::width(&info)) / 2;
+    put(
+        buf,
+        ix,
+        area.bottom().saturating_sub(1),
+        &info,
+        Style::default().fg(pal.sidebar_dim).bg(pal.bg),
+        area.right(),
+    );
+    let room = Rect::new(
+        area.x + 1,
+        area.y + 1,
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(3),
+    );
+    // Natural size in cells (small icons are enlarged at most 8×).
+    let (cw, chh) = app.graphics.cell_px.unwrap_or((10, 20));
+    let natural = (
+        ((iw * 8) / cw as u32).max(1).min(u16::MAX as u32) as u16,
+        ((ih * 8) / chh as u32).max(1).min(u16::MAX as u32) as u16,
+    );
+    let rect = super::hires::fit(room, iw, ih, app.graphics.cell_aspect(), Some(natural));
+    let light = super::hires::rgb(mix(pal.bg, pal.fg, 0.10));
+    let dark = super::hires::rgb(mix(pal.bg, pal.fg, 0.04));
+    let shown = app
+        .graphics
+        .draw_image(buf, rect, &key, |w, h| checkered(&img, w, h, (light, dark)));
+    if !shown {
+        let g = app.graphics.glyphs;
+        // Photos keep more color with half blocks; mosaics suit line art.
+        let g = if matches!(
+            g,
+            super::hires::Glyphs::Octant | super::hires::Glyphs::Sextant
+        ) {
+            g
+        } else {
+            super::hires::Glyphs::Half
+        };
+        app.graphics.draw_mosaic(buf, rect, &key, || {
+            super::hires::image_canvas(&img, rect, g, (light, dark))
+        });
+    }
+}
+
+/// Scale a picture to `w×h` over a checkerboard (for terminal graphics).
+fn checkered(
+    img: &image::DynamicImage,
+    w: u32,
+    h: u32,
+    check: (super::hires::Rgb, super::hires::Rgb),
+) -> image::DynamicImage {
+    let scaled = img
+        .resize_exact(w.max(1), h.max(1), image::imageops::FilterType::Triangle)
+        .to_rgba8();
+    let sq = (w.max(h) / 48).max(8);
+    let mut out = image::RgbaImage::new(w.max(1), h.max(1));
+    for (x, y, p) in out.enumerate_pixels_mut() {
+        let back = if ((x / sq) + (y / sq)).is_multiple_of(2) {
+            check.0
+        } else {
+            check.1
+        };
+        let s = scaled.get_pixel(x, y).0;
+        let c = super::hires::lerp(
+            back,
+            [s[0] as f32, s[1] as f32, s[2] as f32],
+            s[3] as f32 / 255.0,
+        );
+        *p = image::Rgba([c[0] as u8, c[1] as u8, c[2] as u8, 255]);
+    }
+    image::DynamicImage::ImageRgba8(out)
 }

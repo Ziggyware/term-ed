@@ -113,6 +113,8 @@ pub struct Document {
     undo: Vec<Transaction>,
     redo: Vec<Transaction>,
     pending: Option<Transaction>,
+    /// Never written back (e.g. the placeholder text of an image tab).
+    pub read_only: bool,
 }
 
 impl Document {
@@ -153,6 +155,7 @@ impl Document {
             undo: Vec::new(),
             redo: Vec::new(),
             pending: None,
+            read_only: false,
         }
     }
 
@@ -165,10 +168,12 @@ impl Document {
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.rev != self.saved_rev || self.pending.as_ref().is_some_and(|t| !t.changes.is_empty())
+        !self.read_only && self.rev != self.saved_rev
+            || self.pending.as_ref().is_some_and(|t| !t.changes.is_empty())
     }
 
     pub fn save(&mut self) -> Result<()> {
+        anyhow::ensure!(!self.read_only, "this file is view-only in termed");
         self.commit();
         let path = self.path.clone().context("document has no path")?;
         let mut text = self.rope.to_string();

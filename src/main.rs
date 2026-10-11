@@ -11,7 +11,9 @@ use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
-use ratatui::crossterm::terminal::supports_keyboard_enhancement;
+use ratatui::crossterm::terminal::{
+    BeginSynchronizedUpdate, EndSynchronizedUpdate, supports_keyboard_enhancement,
+};
 use ratatui::crossterm::{execute, queue};
 
 use termed::app::App;
@@ -123,6 +125,10 @@ fn main() -> Result<()> {
     }
 
     let mut terminal = ratatui::init();
+    // Ask the terminal for pixel graphics (kitty, Sixel, iTerm2) and its
+    // cell size, before any input is read.
+    app.graphics.query();
+    let truecolor = truecolor || app.graphics.needs_truecolor();
     let enhanced = supports_keyboard_enhancement().unwrap_or(false);
     let mut out = stdout();
     execute!(
@@ -158,7 +164,13 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App, truecolor: bool) 
     let mut dirty = true;
     loop {
         if dirty {
+            // Synchronized output (DEC mode 2026): the terminal shows the
+            // whole frame at once, so nothing tears or flickers. Terminals
+            // without it ignore the request.
+            let mut out = stdout();
+            queue!(out, BeginSynchronizedUpdate)?;
             terminal.draw(|f| ui::draw(f, app, truecolor))?;
+            execute!(out, EndSynchronizedUpdate)?;
             dirty = false;
         }
         if app.quit {

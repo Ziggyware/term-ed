@@ -7,14 +7,13 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, BorderType, Borders, Widget};
 use unicode_width::UnicodeWidthChar;
 
-use super::util::{bold, ellipsize, fg, fgbg, fill, put, shadow, width, wrap_text};
+use super::util::{bold, ellipsize, fg, fgbg, fill, put, shadow, soft_shadow, width, wrap_text};
 use crate::app::{App, Focus, PaletteMode, ToastKind};
 use crate::icons;
 use crate::theme::mix;
 
 fn panel(buf: &mut Buffer, r: Rect, border: Color, bg: Color, title: Option<&str>) {
-    shadow(buf, Rect::new(r.x + 1, r.bottom(), r.width, 1));
-    shadow(buf, Rect::new(r.right(), r.y + 1, 1, r.height));
+    soft_shadow(buf, r);
     fill(buf, r, bg);
     let mut b = Block::default()
         .borders(Borders::ALL)

@@ -53,15 +53,33 @@ pub fn set_bg(buf: &mut Buffer, x: u16, y: u16, bg: Color) {
 
 /// Darken the cells of `area` to fake a drop shadow under floating panels.
 pub fn shadow(buf: &mut Buffer, area: Rect) {
+    darken(buf, area, 0.4);
+}
+
+/// Soft drop shadow for a floating panel `r`: a darker band right next to
+/// it that fades out one cell further, offset down and right like light
+/// from the top left.
+pub fn soft_shadow(buf: &mut Buffer, r: Rect) {
+    darken(buf, Rect::new(r.x + 1, r.bottom(), r.width, 1), 0.42);
+    darken(buf, Rect::new(r.right(), r.y + 1, 1, r.height), 0.42);
+    darken(
+        buf,
+        Rect::new(r.x + 2, r.bottom() + 1, r.width + 1, 1),
+        0.16,
+    );
+    darken(buf, Rect::new(r.right() + 1, r.y + 2, 1, r.height), 0.16);
+}
+
+fn darken(buf: &mut Buffer, area: Rect, amount: f32) {
     let area = area.intersection(buf.area);
     for y in area.top()..area.bottom() {
         for x in area.left()..area.right() {
             if let Some(c) = buf.cell_mut((x, y)) {
                 if let Color::Rgb(..) = c.bg {
-                    c.bg = mix(c.bg, Color::Rgb(0, 0, 0), 0.4);
+                    c.bg = mix(c.bg, Color::Rgb(0, 0, 0), amount);
                 }
                 if let Color::Rgb(..) = c.fg {
-                    c.fg = mix(c.fg, Color::Rgb(0, 0, 0), 0.4);
+                    c.fg = mix(c.fg, Color::Rgb(0, 0, 0), amount);
                 }
             }
         }

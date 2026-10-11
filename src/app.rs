@@ -332,6 +332,8 @@ pub struct Settings {
 }
 
 pub struct App {
+    /// Pixel graphics protocol and sub-cell glyphs this terminal supports.
+    pub graphics: crate::graphics::Graphics,
     pub editors: Vec<Editor>,
     pub active: usize,
     pub explorer: Explorer,
@@ -367,6 +369,7 @@ impl App {
         let theme =
             theme::load(theme_name).unwrap_or_else(|| theme::load("Visual Studio Dark").unwrap());
         let mut app = Self {
+            graphics: Default::default(),
             editors: Vec::new(),
             active: 0,
             explorer: Explorer::new(root.clone()),
@@ -532,7 +535,7 @@ impl App {
             let (field, cur) = self.find_field();
             field.insert_str(byte_at(field, *cur), &t);
             *cur += t.chars().count();
-        } else if let Some(e) = self.editor_mut() {
+        } else if let Some(e) = self.editor_mut().filter(|e| e.image.is_none()) {
             e.insert_text(text);
             e.scroll_into_view();
         }
@@ -713,6 +716,8 @@ impl App {
             Focus::Find => self.find_key(code, ctrl, shift, alt),
             Focus::Agent => self.agent_key(code, ctrl, shift, alt),
             Focus::Explorer => self.explorer_key(code),
+            // Pictures are view-only.
+            Focus::Editor if self.editor().is_some_and(|e| e.image.is_some()) => {}
             Focus::Editor => self.editor_key(code, ctrl, shift, alt),
         }
     }
@@ -1021,6 +1026,14 @@ impl App {
                 self.toast(format!("Word wrap {state}"), ToastKind::Info);
             }
             ToggleToolbar => self.settings.toolbar = Some(!self.toolbar_visible()),
+            GraphicsInfo => {
+                let pixels = self.graphics.protocol().unwrap_or("none (mosaic fallback)");
+                let glyphs = self.graphics.glyphs.name();
+                self.toast(
+                    format!("Pixels: {pixels} · sub-cell: {glyphs}"),
+                    ToastKind::Info,
+                );
+            }
             ToggleSelectMode => {
                 self.mods.shift = if self.mods.select_mode() {
                     Latch::Off
@@ -1104,7 +1117,7 @@ impl App {
 
     fn edit_command(&mut self, cmd: Command) {
         use Command::*;
-        if self.editors.is_empty() {
+        if self.editor().is_none_or(|e| e.image.is_some()) {
             return;
         }
         // Clipboard on a box selection works per line.

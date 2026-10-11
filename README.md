@@ -62,6 +62,24 @@ termed adapts to phone terminals such as Termux, Blink, Termius and iSH. Below 8
 - **Phone-sized overlays.** The command palette is edge to edge, the find/replace bar spans the full width, and dialog text wraps; dialog buttons stack when they don't fit side by side. The welcome screen is a list of large buttons.
 - **Gestures and keyboards.** Swipes scroll, a tap moves the cursor (including on wrapped rows), and you can drag the scrollbar. Keyboards that send LF for Return work as Enter.
 
+## High-resolution graphics
+
+A terminal is a grid of character cells, but termed draws finer than the grid wherever it can:
+
+- **Real pixels.** At startup termed asks the terminal whether it supports a graphics protocol: the [kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) (kitty, Ghostty), [Sixel](https://en.wikipedia.org/wiki/Sixel) (foot, Windows Terminal, mlterm, xterm with Sixel enabled, and others) or iTerm2 inline images (iTerm2, WezTerm). If it does, the welcome logo and pictures are drawn as real anti-aliased images with a soft glow. It also asks for the cell size in pixels so images fit exactly.
+- **Pictures open in tabs.** PNG, JPEG, GIF, WebP, BMP and ICO files open as view-only image tabs, centered and fitted to the editor. A checkerboard shows through transparent parts. The tab can never write to the file.
+- **Sub-cell mosaics everywhere else.** Without a graphics protocol, pictures are drawn with block-mosaic glyphs that split each cell into 2×4 octants (Unicode 16), 2×3 sextants, 2×2 quadrants or half blocks. For every cell, termed picks the two colors and the glyph shape that best match the sub-pixels underneath. termed uses octants where the terminal draws them itself (kitty, Ghostty, foot), sextants on WezTerm and Windows Terminal, and quadrants elsewhere, because every common monospace font has them. If the grid is too coarse for a legible logo, the hand-drawn text logo is used instead.
+- **Smooth scrollbar.** The scrollbar thumb moves in eighths of a cell (using ▁▂▃▄▅▆▇), so it glides instead of jumping a whole row.
+- **Soft shadows.** Popups cast a two-step shadow that fades out.
+- **No tearing.** Every frame is sent as one synchronized update (DEC mode 2026), so the terminal never shows half-drawn frames. Terminals without it simply ignore it.
+
+| Terminal with pixel graphics | Octant mosaic fallback |
+|---|---|
+| ![Welcome screen with a real-pixel logo](docs/welcome.png) | ![Welcome screen with an octant mosaic logo](docs/welcome-octants.png) |
+| ![A PNG open in an image tab](docs/image-view.png) | ![The same PNG as an octant mosaic](docs/image-view-octants.png) |
+
+*View: Graphics Info* shows what termed detected. `TERMED_GRAPHICS=kitty|sixel|iterm2|off` overrides the pixel protocol, and `TERMED_GLYPHS=octant|sextant|quadrant|half` overrides the mosaic.
+
 ## Features
 
 **Visual Studio look**
@@ -147,6 +165,7 @@ Some combinations (Ctrl+Shift+…, Ctrl+Enter, Ctrl+[) can only be told apart in
 | File tree | [ignore](https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore) | ripgrep's walker; respects `.gitignore`. |
 | Change margin | [similar](https://github.com/mitsuhiko/similar) | Fast line diff against the saved file. |
 | Find / replace | [regex](https://github.com/rust-lang/regex) | Linear-time regex with capture-group replacement. |
+| Pixel graphics | [ratatui-image](https://github.com/ratatui/ratatui-image) + [image](https://github.com/image-rs/image) | Detects kitty, Sixel and iTerm2 support and the cell size, and encodes pictures for them (Sixel through the pure-Rust `icy_sixel`). The block-mosaic fallback with its two-color fitting is termed's own (`ui/hires.rs`). |
 | AI agents | [Agent Client Protocol](https://agentclientprotocol.com) + [serde_json](https://github.com/serde-rs/json) + [ureq](https://github.com/algesten/ureq) | ACP is the open standard Zed and JetBrains use for coding agents. ureq (with rustls and bundled root certificates) lets the built-in agent reach every provider from anywhere, including Android. |
 | Text width | [unicode-width](https://github.com/unicode-rs/unicode-width) | Correct columns for CJK and wide characters. |
 
@@ -158,11 +177,13 @@ src/
   editor.rs       caret/selection model, soft wrap and VS-style editing commands
   highlight.rs    incremental, time-budgeted highlighting + string-aware bracket analysis
   theme.rs        Visual Studio Dark / Termed Neon + derived palettes for bundled themes
+  graphics.rs     pixel graphics: protocol detection, image placement, mosaic cache
   agent.rs        Agent Client Protocol client: launches the agent, JSON-RPC, chat model, free-model failover
   builtin_agent.rs  built-in agent: OpenAI-compatible and Anthropic Messages streaming, file/search/command tools
   providers.rs    model providers, API key store (~/.config/termed)
   app.rs          state, key/mouse handling, palette, find/replace, dialogs
-  ui/             title bar, explorer/drawer, tabs, code view, minimap, toolbar, overlays
+  ui/             title bar, explorer/drawer, tabs, code view, minimap, toolbar, overlays,
+                  hires.rs: sub-cell canvas (half/quadrant/sextant/octant) with two-color fitting
 examples/
   snapshot.rs     renders frames to HTML headlessly (used for the screenshots)
 ```
