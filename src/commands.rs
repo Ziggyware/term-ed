@@ -54,6 +54,11 @@ pub enum Command {
     ToggleWordWrap,
     ToggleToolbar,
     ToggleSelectMode,
+    AgentToggle,
+    AgentNewChat,
+    AgentStop,
+    AgentModel,
+    AgentPick,
 }
 
 pub struct CommandInfo {
@@ -121,4 +126,9 @@ cmds! {
     ToggleWordWrap, "View: Toggle Word Wrap", "Alt+Z";
     ToggleToolbar, "View: Toggle Touch Toolbar", "";
     ToggleSelectMode, "Selection: Toggle Selection Mode (lock Shift)", "";
+    AgentToggle, "Agent: Open AI Agent Panel", "Ctrl+K A";
+    AgentNewChat, "Agent: New Chat", "";
+    AgentStop, "Agent: Stop", "Esc";
+    AgentModel, "Agent: Choose Model", "";
+    AgentPick, "Agent: Choose Agent", "";
 }

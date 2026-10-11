@@ -1,5 +1,6 @@
 //! termed — a terminal code editor with a Visual Studio-grade look and feel.
 
+pub mod agent;
 pub mod app;
 pub mod clipboard;
 pub mod commands;

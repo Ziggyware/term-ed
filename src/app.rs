@@ -9,6 +9,7 @@ use ratatui::crossterm::event::{
 use ratatui::layout::{Position, Rect};
 use regex::{Regex, RegexBuilder};
 
+use crate::agent::{self, Agent, AgentEvent, State as AgentState};
 use crate::clipboard::Clipboard;
 use crate::commands::{COMMANDS, Command};
 use crate::document::{Document, Indent, LineEnding, Selection};
@@ -23,6 +24,8 @@ pub enum Focus {
     Editor,
     Explorer,
     Find,
+    /// Typing into the AI agent panel.
+    Agent,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,6 +36,8 @@ pub enum PaletteMode {
     Themes,
     Languages,
     SaveAs,
+    AgentModels,
+    AgentPicker,
 }
 
 pub struct Palette {
@@ -203,7 +208,7 @@ pub const TOOLBAR_PAGES: [[[ToolKey; 9]; 2]; 2] = [
             key("Ln↑", "⇡", Tool::Cmd(Command::MoveLineUp)),
             key("Ln↓", "⇣", Tool::Cmd(Command::MoveLineDown)),
             key("Wrap", "↩", Tool::Cmd(Command::ToggleWordWrap)),
-            key("☰", "☰", Tool::Cmd(Command::ToggleSidebar)),
+            key("AI", "✦", Tool::Cmd(Command::AgentToggle)),
         ],
     ],
 ];
@@ -275,6 +280,26 @@ pub struct Layout {
     pub toolbar: Vec<(Rect, Tool)>,
     /// Explorer shown as a slide-over drawer (compact layout).
     pub drawer: Rect,
+    pub agent_panel: Rect,
+    pub agent_input: Rect,
+    pub agent_targets: Vec<(Rect, AgentTarget)>,
+}
+
+/// Tappable things in the agent panel.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AgentTarget {
+    OpenFile(PathBuf, Option<u32>),
+    Permission(usize, String),
+    Install,
+    Retry,
+    NewChat,
+    Close,
+    Model,
+    PickAgent,
+    Stop,
+    Send,
+    /// A one-tap starter prompt.
+    Suggest(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -320,6 +345,8 @@ pub struct App {
     pub compact: bool,
     /// Latched modifiers from the touch toolbar.
     pub mods: StickyMods,
+    pub agent: Agent,
+    pub show_agent: bool,
     pub toolbar_page: usize,
     drawer_init: bool,
     clipboard: Clipboard,
@@ -360,6 +387,8 @@ impl App {
             },
             compact: false,
             mods: StickyMods::default(),
+            agent: Agent::new(root.clone()),
+            show_agent: false,
             toolbar_page: 0,
             drawer_init: false,
             git_branch: git_branch(&root),
@@ -481,6 +510,12 @@ impl App {
     }
 
     fn on_paste(&mut self, text: &str) {
+        if self.focus == Focus::Agent && self.palette.is_none() {
+            let a = &mut self.agent;
+            a.input.insert_str(byte_at(&a.input, a.cursor), text);
+            a.cursor += text.chars().count();
+            return;
+        }
         if let Some(p) = &mut self.palette {
             let t = text.replace(['\n', '\r'], "");
             p.input.insert_str(byte_at(&p.input, p.cursor), &t);
@@ -592,6 +627,7 @@ impl App {
             self.chord = false;
             let cmd = match code {
                 KeyCode::Char('t') => Some(Command::SelectTheme),
+                KeyCode::Char('a') => Some(Command::AgentToggle),
                 KeyCode::Char('m') => Some(if ctrl {
                     Command::SelectLanguage
                 } else {
@@ -669,6 +705,7 @@ impl App {
 
         match self.focus {
             Focus::Find => self.find_key(code, ctrl, shift, alt),
+            Focus::Agent => self.agent_key(code, ctrl, shift, alt),
             Focus::Explorer => self.explorer_key(code),
             Focus::Editor => self.editor_key(code, ctrl, shift, alt),
         }
@@ -912,6 +949,47 @@ impl App {
                 }
             }
             ToggleMinimap => self.settings.minimap = !self.settings.minimap,
+            AgentToggle => {
+                if self.show_agent && self.focus == Focus::Agent {
+                    self.show_agent = false;
+                    self.focus = if self.editors.is_empty() {
+                        Focus::Explorer
+                    } else {
+                        Focus::Editor
+                    };
+                } else {
+                    self.show_agent = true;
+                    self.focus = Focus::Agent;
+                    if self.compact {
+                        self.show_sidebar = false;
+                    }
+                }
+            }
+            AgentNewChat => {
+                self.agent.new_chat();
+                self.show_agent = true;
+                self.focus = Focus::Agent;
+            }
+            AgentStop => self.agent.cancel(),
+            AgentModel => {
+                if self.agent.models.is_empty() {
+                    self.toast(
+                        "Send a first message to load the model list",
+                        ToastKind::Info,
+                    );
+                } else {
+                    self.open_palette(PaletteMode::AgentModels);
+                }
+            }
+            AgentPick => {
+                self.agent.available = agent::detect_agents();
+                if self.agent.available.is_empty() {
+                    self.show_agent = true;
+                    self.agent.state = AgentState::NoAgent;
+                } else {
+                    self.open_palette(PaletteMode::AgentPicker);
+                }
+            }
             ToggleWordWrap => {
                 let on = !self.word_wrap();
                 self.settings.word_wrap = Some(on);
@@ -1272,6 +1350,35 @@ impl App {
                 names.dedup();
                 (names, Vec::new())
             }
+            PaletteMode::AgentModels => {
+                // Free models first: they need no account.
+                let mut models = self.agent.models.clone();
+                models.sort_by_key(|(v, _)| !is_free_model(v));
+                models
+                    .into_iter()
+                    .map(|(v, name)| {
+                        let hint = if is_free_model(&v) {
+                            format!("{name} · free")
+                        } else {
+                            name
+                        };
+                        (v, hint)
+                    })
+                    .unzip()
+            }
+            PaletteMode::AgentPicker => self
+                .agent
+                .available
+                .iter()
+                .map(|a| {
+                    let hint = if a.free {
+                        "free, no account"
+                    } else {
+                        "may need sign-in"
+                    };
+                    (a.name.clone(), hint.to_string())
+                })
+                .unzip(),
             PaletteMode::GotoLine | PaletteMode::SaveAs => (Vec::new(), Vec::new()),
         };
         let mut input = String::new();
@@ -1435,6 +1542,19 @@ impl App {
                 if let Some(t) = chosen {
                     self.set_theme(&t);
                 }
+            }
+            PaletteMode::AgentModels => {
+                if let Some(v) = chosen {
+                    self.agent.set_model(&v);
+                }
+                self.focus = Focus::Agent;
+            }
+            PaletteMode::AgentPicker => {
+                if let Some(s) = p.filtered.get(p.selected) {
+                    self.agent.use_agent(s.index);
+                }
+                self.show_agent = true;
+                self.focus = Focus::Agent;
             }
             PaletteMode::Languages => {
                 if let (Some(name), Some(e)) = (chosen, self.editors.get_mut(self.active))
@@ -1749,6 +1869,9 @@ impl App {
                             .clamp(0, n.saturating_sub(1) as isize)
                             as usize;
                     }
+                } else if l.agent_panel.contains(pos) {
+                    let a = &mut self.agent;
+                    a.scroll = (a.scroll as isize - d).max(0) as usize;
                 } else if l.sidebar.contains(pos) {
                     let max = self
                         .explorer
@@ -1858,6 +1981,18 @@ impl App {
             self.show_sidebar = false;
             if self.focus == Focus::Explorer && !self.editors.is_empty() {
                 self.focus = Focus::Editor;
+            }
+            return;
+        }
+        if l.agent_panel.contains(pos) {
+            if let Some((_, t)) = l.agent_targets.iter().find(|(r, _)| r.contains(pos)) {
+                self.agent_target(t.clone());
+            } else {
+                self.focus = Focus::Agent;
+                if l.agent_input.contains(pos) {
+                    // Tap in the input: move the caret to the end (simple and predictable on touch).
+                    self.agent.cursor = self.agent.input.chars().count();
+                }
             }
             return;
         }
@@ -2085,6 +2220,316 @@ impl App {
         };
         let col = e.col_at_x(line, &seg, last, x);
         Some(e.doc.idx(line, col))
+    }
+}
+
+/// OpenCode's free models: Big Pickle and the "-free" variants.
+pub fn is_free_model(value: &str) -> bool {
+    value.contains("free") || value.ends_with("big-pickle")
+}
+
+impl App {
+    // ================================================================ agent
+
+    /// Drain agent messages and act on them. Returns true if anything changed.
+    pub fn pump_agent(&mut self) -> bool {
+        let (events, changed) = self.agent.poll();
+        for ev in events {
+            match ev {
+                AgentEvent::FileChanged { path, diffs } => self.agent_file_changed(&path, &diffs),
+                AgentEvent::ReadFile {
+                    rpc_id,
+                    path,
+                    line,
+                    limit,
+                } => {
+                    let text = match self
+                        .editors
+                        .iter()
+                        .find(|e| e.doc.path.as_deref() == Some(path.as_path()))
+                    {
+                        Some(e) => Some(e.doc.rope.to_string()),
+                        None => std::fs::read_to_string(&path).ok(),
+                    };
+                    match text {
+                        Some(t) => self.agent.respond_read(rpc_id, &t, line, limit),
+                        None => self
+                            .agent
+                            .respond_error(rpc_id, &format!("cannot read {}", path.display())),
+                    }
+                }
+                AgentEvent::WriteFile {
+                    rpc_id,
+                    path,
+                    content,
+                } => {
+                    let old = std::fs::read_to_string(&path).ok();
+                    match std::fs::write(&path, &content) {
+                        Ok(()) => {
+                            self.agent.respond(rpc_id, serde_json::Value::Null);
+                            let diffs = vec![(old, content)];
+                            self.agent_file_changed(&path, &diffs);
+                        }
+                        Err(e) => self.agent.respond_error(rpc_id, &e.to_string()),
+                    }
+                }
+                AgentEvent::TurnEnded => {
+                    self.explorer.refresh();
+                    self.project_files = None;
+                }
+            }
+        }
+        changed
+    }
+
+    /// Keep animating while the agent works (spinners, elapsed time).
+    pub fn agent_animating(&self) -> bool {
+        self.agent.is_working()
+    }
+
+    /// An agent changed `path` on disk: show it in the editor as an undoable
+    /// change with change bars, so you can review it (and Ctrl+Z it).
+    fn agent_file_changed(&mut self, path: &Path, diffs: &[(Option<String>, String)]) {
+        let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        let Ok(new) = std::fs::read_to_string(&path) else {
+            return; // deleted or moved: the explorer refresh at the end of the turn shows it
+        };
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if let Some(e) = self
+            .editors
+            .iter_mut()
+            .find(|e| e.doc.path.as_deref() == Some(path.as_path()))
+        {
+            if e.doc.is_dirty() {
+                self.toast(
+                    format!("{name} changed on disk; your unsaved edits were kept"),
+                    ToastKind::Error,
+                );
+                return;
+            }
+            e.apply_external(&new);
+        } else {
+            // Rebuild what the file looked like before the agent's edit, so
+            // the change bars and undo show exactly what the agent did.
+            let mut before = new.clone();
+            for (old, newer) in diffs.iter().rev() {
+                match old {
+                    None => before = String::new(),
+                    Some(o) if !newer.is_empty() && before.contains(newer.as_str()) => {
+                        before = before.replacen(newer.as_str(), o, 1);
+                    }
+                    _ => {}
+                }
+            }
+            let mut doc = Document::from_text(&before, Some(path.clone()));
+            doc.saved_text = before.replace("\r\n", "\n");
+            let mut ed = Editor::new(doc);
+            ed.apply_external(&new);
+            self.editors.push(ed);
+            if self.editors.len() == 1 {
+                self.active = 0;
+            }
+        }
+        self.toast(format!("✦ Agent edited {name}"), ToastKind::Success);
+    }
+
+    /// Send what is in the agent input box.
+    pub fn agent_send(&mut self) {
+        let text = std::mem::take(&mut self.agent.input);
+        self.agent.cursor = 0;
+        if text.trim().is_empty() {
+            return;
+        }
+        // The agent reads files from disk: save your work first.
+        let mut saved = 0;
+        for e in &mut self.editors {
+            if e.doc.is_dirty() && e.doc.path.is_some() && e.doc.save().is_ok() {
+                saved += 1;
+            }
+        }
+        if saved > 0 {
+            self.toast(
+                format!("Saved {saved} file(s) so the agent sees them"),
+                ToastKind::Info,
+            );
+        }
+        let context = self.agent_context();
+        self.agent.prompt(&text, context);
+    }
+
+    /// The open file (and selection) as ACP context blocks.
+    fn agent_context(&self) -> Vec<serde_json::Value> {
+        let Some(e) = self.editor() else {
+            return Vec::new();
+        };
+        let Some(path) = e.doc.path.as_ref() else {
+            return Vec::new();
+        };
+        let uri = agent::file_uri(path);
+        let mut blocks = vec![serde_json::json!({
+            "type": "resource_link", "uri": uri, "name": e.doc.name()
+        })];
+        if !e.sel.is_empty() {
+            let (sl, _) = e.doc.pos(e.sel.start());
+            let (el, _) = e.doc.pos(e.sel.end());
+            let text = e.selected_text();
+            if self.agent.embedded_context {
+                blocks.push(serde_json::json!({
+                    "type": "resource",
+                    "resource": { "uri": format!("{uri}#L{}-{}", sl + 1, el + 1), "mimeType": "text/plain", "text": text }
+                }));
+            } else {
+                blocks.push(serde_json::json!({
+                    "type": "text",
+                    "text": format!("Selected lines {}-{} of {}:\n```\n{text}\n```", sl + 1, el + 1, e.doc.name())
+                }));
+            }
+        }
+        blocks
+    }
+
+    /// Short description of the context that will be attached (for the chip).
+    pub fn agent_context_label(&self) -> Option<String> {
+        let e = self.editor()?;
+        e.doc.path.as_ref()?;
+        let name = e.doc.name();
+        if e.sel.is_empty() {
+            Some(name)
+        } else {
+            let (sl, _) = e.doc.pos(e.sel.start());
+            let (el, _) = e.doc.pos(e.sel.end());
+            Some(format!("{name}:{}-{}", sl + 1, el + 1))
+        }
+    }
+
+    fn agent_target(&mut self, t: AgentTarget) {
+        match t {
+            AgentTarget::OpenFile(p, line) => {
+                self.open_file(&p);
+                if let (Some(l), Some(e)) = (line, self.editor_mut()) {
+                    e.goto_line(l.saturating_sub(1) as usize);
+                }
+                if self.compact {
+                    self.show_agent = false;
+                }
+            }
+            AgentTarget::Permission(i, opt) => self.agent.choose(i, Some(&opt)),
+            AgentTarget::Install => self.agent.install(),
+            AgentTarget::Retry => {
+                self.agent.available = agent::detect_agents();
+                if self.agent.spec.is_none() {
+                    self.agent.spec = self.agent.available.first().cloned();
+                }
+                self.agent.stop();
+                self.agent.start();
+            }
+            AgentTarget::NewChat => self.run(Command::AgentNewChat),
+            AgentTarget::Close => {
+                self.show_agent = false;
+                self.focus = if self.editors.is_empty() {
+                    Focus::Explorer
+                } else {
+                    Focus::Editor
+                };
+            }
+            AgentTarget::Model => self.run(Command::AgentModel),
+            AgentTarget::PickAgent => self.run(Command::AgentPick),
+            AgentTarget::Stop => self.agent.cancel(),
+            AgentTarget::Send => {
+                self.focus = Focus::Agent;
+                self.agent_send();
+            }
+            AgentTarget::Suggest(text) => {
+                self.focus = Focus::Agent;
+                self.agent.input = text;
+                self.agent_send();
+            }
+        }
+    }
+
+    fn agent_key(&mut self, code: KeyCode, ctrl: bool, shift: bool, alt: bool) {
+        // Number keys answer a pending permission request.
+        if self.agent.input.is_empty()
+            && let KeyCode::Char(c @ '1'..='9') = code
+            && let Some(i) = self.agent.pending_permission()
+        {
+            let n = c as usize - '1' as usize;
+            let opt = match &self.agent.entries[i] {
+                agent::Entry::Permission(p) => p.options.get(n).map(|o| o.0.clone()),
+                _ => None,
+            };
+            if let Some(o) = opt {
+                self.agent.choose(i, Some(&o));
+            }
+            return;
+        }
+        let a = &mut self.agent;
+        match code {
+            KeyCode::Esc => {
+                if a.is_working() {
+                    a.cancel();
+                } else {
+                    self.focus = if self.editors.is_empty() {
+                        Focus::Explorer
+                    } else {
+                        Focus::Editor
+                    };
+                    if self.compact {
+                        self.show_agent = false;
+                    }
+                }
+            }
+            KeyCode::Enter if shift || alt => {
+                a.input.insert(byte_at(&a.input, a.cursor), '\n');
+                a.cursor += 1;
+            }
+            KeyCode::Enter => self.agent_send(),
+            KeyCode::Tab | KeyCode::BackTab => {
+                if !self.editors.is_empty() {
+                    self.focus = Focus::Editor;
+                }
+            }
+            KeyCode::Backspace if ctrl || alt => {
+                let before: String = a.input.chars().take(a.cursor).collect();
+                let trimmed = before.trim_end();
+                let cut = trimmed
+                    .rfind(char::is_whitespace)
+                    .map(|b| trimmed[..b + 1].chars().count())
+                    .unwrap_or(0);
+                let rest: String = a.input.chars().skip(a.cursor).collect();
+                a.input = format!("{}{rest}", before.chars().take(cut).collect::<String>());
+                a.cursor = cut;
+            }
+            KeyCode::Backspace => {
+                if a.cursor > 0 {
+                    let b = byte_at(&a.input, a.cursor - 1);
+                    a.input.remove(b);
+                    a.cursor -= 1;
+                }
+            }
+            KeyCode::Delete => {
+                if a.cursor < a.input.chars().count() {
+                    let b = byte_at(&a.input, a.cursor);
+                    a.input.remove(b);
+                }
+            }
+            KeyCode::Left => a.cursor = a.cursor.saturating_sub(1),
+            KeyCode::Right => a.cursor = (a.cursor + 1).min(a.input.chars().count()),
+            KeyCode::Home => a.cursor = 0,
+            KeyCode::End => a.cursor = a.input.chars().count(),
+            KeyCode::Up => a.scroll += 1,
+            KeyCode::Down => a.scroll = a.scroll.saturating_sub(1),
+            KeyCode::PageUp => a.scroll += 10,
+            KeyCode::PageDown => a.scroll = a.scroll.saturating_sub(10),
+            KeyCode::Char(c) if !ctrl && !alt => {
+                a.input.insert(byte_at(&a.input, a.cursor), c);
+                a.cursor += 1;
+            }
+            _ => {}
+        }
     }
 }
 

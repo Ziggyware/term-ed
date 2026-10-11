@@ -1,6 +1,7 @@
 //! Screen composition: title bar, explorer, tabs, breadcrumbs, editor,
 //! status bar, plus floating overlays.
 
+mod agent_panel;
 mod editor_view;
 mod overlay;
 pub mod util;
@@ -70,6 +71,20 @@ pub fn draw(frame: &mut Frame, app: &mut App, truecolor: bool) {
         render_sidebar(buf, sidebar, app);
     }
 
+    // Agent panel: docked on the right when there is room, otherwise a
+    // full-screen sheet drawn over everything (phones).
+    let dock_w = (main.width * 2 / 5).clamp(36, 64);
+    let docked = app.show_agent && !compact && main.width >= dock_w + 40;
+    let agent_area = if docked {
+        Rect::new(main.right() - dock_w, main.y, dock_w, main.height)
+    } else {
+        body
+    };
+    let main = if docked {
+        Rect::new(main.x, main.y, main.width - dock_w, main.height)
+    } else {
+        main
+    };
     let mut cursor = None;
     if app.editors.is_empty() {
         render_welcome(buf, main, app);
@@ -109,11 +124,27 @@ pub fn draw(frame: &mut Frame, app: &mut App, truecolor: bool) {
             cursor = None;
         }
     }
+    if app.show_agent {
+        let c = agent_panel::render(buf, agent_area, app);
+        if app.focus == Focus::Agent {
+            cursor = c;
+        } else if !docked {
+            cursor = None;
+        }
+    }
     if toolbar_h > 0 {
         render_toolbar(buf, toolbar, app);
     }
     render_status(buf, status, app);
-    overlay::render_toasts(buf, Rect::new(main.x, main.y, main.width, main.height), app);
+    // On a phone with the agent sheet open, toasts go to the top so they
+    // never cover the prompt box.
+    let toasts_top = app.show_agent && !docked;
+    overlay::render_toasts(
+        buf,
+        Rect::new(main.x, main.y, main.width, main.height),
+        app,
+        toasts_top,
+    );
     if app.palette.is_some() {
         cursor = overlay::render_palette(buf, area, app);
     }
@@ -188,9 +219,22 @@ fn render_title(buf: &mut Buffer, area: Rect, app: &mut App) {
         );
         app.layout.title_search = r;
     }
-    // Right: window-ish controls.
+    // Right: agent button + window-ish controls.
     let right = " ─  □  ✕ ";
     let rx = area.right().saturating_sub(width(right));
+    let ai = " ✦ Agent ";
+    let ax = rx.saturating_sub(width(ai) + 1);
+    if ax > bx + w {
+        let (abg, afg) = if app.show_agent {
+            (pal.accent, pal.accent_fg)
+        } else {
+            (mix(pal.titlebar_bg, pal.accent, 0.3), pal.fg)
+        };
+        put(buf, ax, area.y, ai, bold(fgbg(afg, abg)), rx);
+        app.layout
+            .click_items
+            .push((Rect::new(ax, area.y, width(ai), 1), Command::AgentToggle));
+    }
     if rx > bx + w {
         put(
             buf,
@@ -224,7 +268,7 @@ fn render_title_compact(buf: &mut Buffer, area: Rect, app: &mut App) {
     app.layout
         .click_items
         .push((Rect::new(x0, area.y, x - x0, 1), Command::ToggleSidebar));
-    let right_w = 7;
+    let right_w = 11;
     let rx = area.right().saturating_sub(right_w);
     // File name (tap = quick open), with a dirty dot.
     let (name, dirty) = match app.editor() {
@@ -265,10 +309,15 @@ fn render_title_compact(buf: &mut Buffer, area: Rect, app: &mut App) {
         );
     }
     app.layout.title_search = Rect::new(fx, area.y, rx.saturating_sub(fx), 1);
-    let sx = btn(buf, rx, "⌕", false);
+    let ax = btn(buf, rx, "✦", app.show_agent);
     app.layout
         .click_items
-        .push((Rect::new(rx, area.y, sx - rx, 1), Command::QuickOpen));
+        .push((Rect::new(rx, area.y, ax - rx, 1), Command::AgentToggle));
+    let qx = ax + 1;
+    let sx = btn(buf, qx, "⌕", false);
+    app.layout
+        .click_items
+        .push((Rect::new(qx, area.y, sx - qx, 1), Command::QuickOpen));
     let ex = btn(buf, sx + 1, "⋯", false);
     app.layout.click_items.push((
         Rect::new(sx + 1, area.y, ex - sx - 1, 1),
@@ -903,6 +952,7 @@ fn render_welcome(buf: &mut Buffer, area: Rect, app: &mut App) {
     // Every row is also a tap target.
     let shortcuts: &[(&str, &str, Command)] = if compact {
         &[
+            ("Ask the AI agent", "✦", Command::AgentToggle),
             ("Browse files", "☰", Command::ToggleSidebar),
             ("Open file…", "⌕", Command::QuickOpen),
             ("All commands…", "⋯", Command::CommandPalette),
@@ -913,6 +963,7 @@ fn render_welcome(buf: &mut Buffer, area: Rect, app: &mut App) {
     } else {
         &[
             ("Open File", "Ctrl+P", Command::QuickOpen),
+            ("AI Agent (free)", "Ctrl+K A", Command::AgentToggle),
             (
                 "Command Palette",
                 "Ctrl+Shift+P · F1",

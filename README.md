@@ -8,6 +8,20 @@ A terminal code editor that looks and feels like the Visual Studio C# editor, fo
 |---|---|
 | ![Command palette](docs/command-palette.png) | ![Find and replace](docs/find-neon.png) |
 
+## AI agent (free, no setup)
+
+![The agent panel fixing a bug with OpenCode's free model](docs/agent.png)
+
+Press `Ctrl+K A`, click **✦ Agent** in the title bar, or tap **✦** on a phone. Then ask in plain words, or tap one of the suggestions ("Find bugs in calc.py"). The agent can read and edit your project:
+
+- **Free by default.** termed runs [OpenCode](https://opencode.ai) through the [Agent Client Protocol](https://agentclientprotocol.com). OpenCode's free models need no account, no API key and no configuration. If OpenCode isn't installed, the panel offers a one-tap **Install OpenCode (free)** button, which runs `npm install -g opencode-ai`.
+- **Free models are busy sometimes.** Free models are shared and occasionally rate-limited. If one stays silent for 25 seconds, termed switches to another free model and asks again automatically, telling you in the chat. Tap the model name to choose one yourself; free models are listed first.
+- **You stay in control.** The agent's edits appear in your open files as normal edits with change bars, and one Ctrl+Z (↶) reverts an edit. Diffs show inline in the chat, and tapping a change opens the file at that spot. If the agent asks permission to run a tool, you tap Allow or Reject (or press 1–3).
+- **Context is automatic.** The open file, and your selection if there is one, are attached to every message (shown as `@ file.py:12-20` above the prompt). Unsaved files are saved first so the agent sees your latest code.
+- **Esc or ■ stops the agent.** + New starts a fresh chat.
+- **Other agents work too.** Gemini CLI (`gemini --acp`), Claude Code (`claude-agent-acp`) and Codex (`codex-acp`) are detected automatically if installed; pick one with *Agent: Choose Agent*. Note that these generally need a sign-in or paid plan. Any other ACP agent works with `TERMED_AGENT="command args"`.
+- **On a phone** the panel is a full-screen sheet above the touch keyboard ([screenshot](docs/agent-phone.png)).
+
 ## On a phone
 
 ![termed on a 46-column phone screen: explorer drawer, wrapped C#, find, command palette](docs/mobile.png)
@@ -100,6 +114,7 @@ You need a terminal with truecolor support to get the full look (Windows Termina
 | Language mode | `Ctrl+K Ctrl+M` |
 | Toggle minimap / whitespace / indent guides / line numbers | `Ctrl+K M` / `W` / `I` / `L` |
 | Toggle word wrap | `Alt+Z` |
+| AI agent panel | `Ctrl+K A` |
 
 Some combinations (Ctrl+Shift+…, Ctrl+Enter, Ctrl+[) can only be told apart in terminals that support the kitty keyboard protocol, which termed turns on when it is available. In other terminals, Ctrl+Backspace arrives as Ctrl+H (Replace), so use Alt+Backspace to delete a word. Every command can also be run from the command palette.
 
@@ -115,6 +130,7 @@ Some combinations (Ctrl+Shift+…, Ctrl+Enter, Ctrl+[) can only be told apart in
 | File tree | [ignore](https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore) | ripgrep's walker; respects `.gitignore`. |
 | Change margin | [similar](https://github.com/mitsuhiko/similar) | Fast line diff against the saved file. |
 | Find / replace | [regex](https://github.com/rust-lang/regex) | Linear-time regex with capture-group replacement. |
+| AI agents | [Agent Client Protocol](https://agentclientprotocol.com) + [serde_json](https://github.com/serde-rs/json) | The open standard used by Zed and JetBrains for plugging in coding agents; OpenCode supplies free models. |
 | Text width | [unicode-width](https://github.com/unicode-rs/unicode-width) | Correct columns for CJK and wide characters. |
 
 Source layout:
@@ -125,6 +141,7 @@ src/
   editor.rs       caret/selection model, soft wrap and VS-style editing commands
   highlight.rs    incremental, time-budgeted highlighting + string-aware bracket analysis
   theme.rs        Visual Studio Dark / Termed Neon + derived palettes for bundled themes
+  agent.rs        Agent Client Protocol client: launches the agent, JSON-RPC, chat model, free-model failover
   app.rs          state, key/mouse handling, palette, find/replace, dialogs
   ui/             title bar, explorer/drawer, tabs, code view, minimap, toolbar, overlays
 examples/
@@ -134,7 +151,7 @@ examples/
 ## Development
 
 ```sh
-cargo test                  # includes tests/mobile.rs: phone layout, taps, toolbar, rotation
+cargo test                  # includes phone layout/touch tests and agent tests against a scripted ACP agent
 cargo clippy --all-targets
 # Render a frame to HTML, replaying keystrokes, taps and swipes:
 cargo run --example snapshot -- out.html 150x42 "Visual Studio Dark" . src/main.rs -- ctrl+p text:editor

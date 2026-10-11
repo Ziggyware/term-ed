@@ -1423,6 +1423,49 @@ impl Editor {
         }
     }
 
+    // ------------------------------------------------------------ external edits
+
+    /// Replace the buffer with `new` (a file an agent just changed on disk)
+    /// as a single undoable step. Only the changed middle is rewritten, so
+    /// the caret and scroll position stay put where possible. The buffer is
+    /// marked as matching disk, while the change bars keep showing what
+    /// changed since you last saved.
+    pub fn apply_external(&mut self, new: &str) {
+        let new = new.replace("\r\n", "\n");
+        let old = self.doc.rope.to_string();
+        if old == new {
+            return;
+        }
+        let a: Vec<char> = old.chars().collect();
+        let b: Vec<char> = new.chars().collect();
+        let prefix = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+        let max_suffix = a.len().min(b.len()) - prefix;
+        let suffix = a
+            .iter()
+            .rev()
+            .zip(b.iter().rev())
+            .take(max_suffix)
+            .take_while(|(x, y)| x == y)
+            .count();
+        let (old_end, new_end) = (a.len() - suffix, b.len() - suffix);
+        let insert: String = b[prefix..new_end].iter().collect();
+        let head = self.sel.head;
+        self.doc.begin(EditKind::Other, self.sel);
+        self.doc.remove(prefix, old_end);
+        self.doc.insert(prefix, &insert);
+        let delta = new_end as isize - old_end as isize;
+        let moved = if head >= old_end {
+            (head as isize + delta).max(0) as usize
+        } else {
+            head.min(prefix.max(head))
+        };
+        self.sel = Selection::caret(moved.min(self.doc.rope.len_chars()));
+        self.block = None;
+        self.doc.end(self.sel);
+        self.doc.mark_saved();
+        self.sync();
+    }
+
     // ------------------------------------------------------------ viewport
 
     pub fn scroll_into_view(&mut self) {
@@ -1474,8 +1517,8 @@ impl Editor {
         if stale {
             let n = self.doc.len_lines();
             let mut marks = vec![LineChange::None; n];
-            if n < 50_000 && self.doc.is_dirty() {
-                let current = self.doc.rope.to_string();
+            let current = self.doc.rope.to_string();
+            if n < 50_000 && current != self.doc.saved_text {
                 let diff = similar::TextDiff::configure()
                     .timeout(std::time::Duration::from_millis(50))
                     .diff_lines(&self.doc.saved_text, &current);
@@ -1716,5 +1759,19 @@ mod tests {
         assert!(e.block.unwrap().is_carets());
         e.box_delete();
         assert_eq!(text(&e), "a12\ne34\nijkl");
+    }
+
+    #[test]
+    fn external_change_is_one_undo_step_and_keeps_change_bars() {
+        let mut e = ed("def add(a, b):\n    return a - b\n", "py");
+        e.move_to(0, 4, false);
+        e.apply_external("def add(a, b):\n    return a + b\n");
+        assert_eq!(text(&e), "def add(a, b):\n    return a + b\n");
+        assert!(!e.doc.is_dirty(), "buffer matches disk");
+        assert_eq!(e.cursor(), (0, 4), "caret before the change stays");
+        assert_eq!(e.line_changes()[1], LineChange::Modified);
+        e.undo();
+        assert_eq!(text(&e), "def add(a, b):\n    return a - b\n");
+        assert!(e.doc.is_dirty(), "undoing the agent's edit needs a save");
     }
 }
