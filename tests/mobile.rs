@@ -5,8 +5,10 @@ use std::path::PathBuf;
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use ratatui::crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use termed::app::{App, Focus};
+use ratatui::crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use termed::app::{App, Focus, Mod, Tool};
 
 fn project() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("termed-mobile-{}", std::process::id()));
@@ -72,9 +74,9 @@ fn phone_portrait_uses_compact_layout_with_wrap_and_toolbar() {
         find(&term, "sum::<f64>();").is_some(),
         "wrapped tail should be on screen"
     );
-    // Toolbar sits above the status bar.
-    assert!(row(&term, 22).contains("Esc"));
-    assert!(row(&term, 22).contains("»"));
+    // The two-row touch keyboard sits above the status bar.
+    assert!(row(&term, 21).contains("Esc"));
+    assert!(row(&term, 22).contains("↓"));
 
     // ☰ opens the explorer drawer; tapping a file opens it and closes the drawer.
     tap(&mut app, 1, 0);
@@ -90,8 +92,27 @@ fn phone_portrait_uses_compact_layout_with_wrap_and_toolbar() {
     assert_eq!(app.focus, Focus::Editor);
 }
 
+/// Tap a touch-keyboard key by what it does (labels shorten on narrow screens).
+fn tap_tool(app: &mut App, term: &mut Terminal<TestBackend>, tool: Tool) {
+    draw(term, app);
+    let (r, _) = *app
+        .layout
+        .toolbar
+        .iter()
+        .find(|(_, t)| *t == tool)
+        .unwrap_or_else(|| panic!("no toolbar key {tool:?}"));
+    tap(app, r.x + r.width / 2, r.y);
+    draw(term, app);
+}
+
+fn sel_len(app: &App) -> usize {
+    let e = app.editor().unwrap();
+    e.sel.end() - e.sel.start()
+}
+
 #[test]
-fn touch_selection_mode_extends_selection_with_toolbar_arrows() {
+fn sticky_modifiers_latch_for_one_key_or_lock() {
+    use termed::app::Latch;
     let root = project();
     let mut app = App::new(
         root.clone(),
@@ -100,24 +121,96 @@ fn touch_selection_mode_extends_selection_with_toolbar_arrows() {
         false,
     );
     let mut term = Terminal::new(TestBackend::new(44, 24)).unwrap();
-    draw(&mut term, &mut app);
 
-    let (x, y) = find(&term, "Sel").unwrap();
-    tap(&mut app, x, y);
-    draw(&mut term, &mut app);
-    assert!(app.select_mode);
+    // One tap on Shift: applies to the next key only.
+    tap_tool(&mut app, &mut term, Tool::Mod(Mod::Shift));
+    assert_eq!(app.mods.shift, Latch::Once);
+    assert!(row(&term, 23).contains("SHIFT+"));
+    tap_tool(&mut app, &mut term, Tool::Key(KeyCode::Right));
+    assert_eq!(sel_len(&app), 1);
+    assert_eq!(app.mods.shift, Latch::Off);
+
+    // Two taps lock it: arrows keep extending (selection mode)...
+    tap_tool(&mut app, &mut term, Tool::Mod(Mod::Shift));
+    tap_tool(&mut app, &mut term, Tool::Mod(Mod::Shift));
+    assert_eq!(app.mods.shift, Latch::Locked);
     assert!(row(&term, 23).contains("SELECT"));
-    let (x, y) = find(&term, "▶").unwrap();
-    tap(&mut app, x, y);
-    tap(&mut app, x, y);
-    draw(&mut term, &mut app);
-    let e = app.editor().unwrap();
-    assert_eq!(e.sel.end() - e.sel.start(), 2);
+    tap_tool(&mut app, &mut term, Tool::Key(KeyCode::Right));
+    tap_tool(&mut app, &mut term, Tool::Key(KeyCode::Right));
+    tap_tool(&mut app, &mut term, Tool::Key(KeyCode::Right));
+    // Continues the existing 1-char selection.
+    assert_eq!(sel_len(&app), 4);
+    // ...and typing replaces the selection (lower-case) and ends the mode.
+    app.handle_event(Event::Key(KeyEvent::new(
+        KeyCode::Char('x'),
+        KeyModifiers::NONE,
+    )));
+    assert_eq!(app.mods.shift, Latch::Off);
+    assert!(app.editor().unwrap().doc.rope.to_string().starts_with("x"));
 
-    // Esc on the toolbar leaves selection mode.
-    let (x, y) = find(&term, "Esc").unwrap();
-    tap(&mut app, x, y);
-    assert!(!app.select_mode);
+    // Ctrl latched + a letter from the soft keyboard = Ctrl+letter.
+    tap_tool(&mut app, &mut term, Tool::Mod(Mod::Ctrl));
+    app.handle_event(Event::Key(KeyEvent::new(
+        KeyCode::Char('a'),
+        KeyModifiers::NONE,
+    )));
+    assert_eq!(sel_len(&app), app.editor().unwrap().doc.rope.len_chars());
+    assert_eq!(app.mods.ctrl, Latch::Off);
+
+    // Esc releases everything.
+    tap_tool(&mut app, &mut term, Tool::Mod(Mod::Ctrl));
+    tap_tool(&mut app, &mut term, Tool::Mod(Mod::Ctrl));
+    tap_tool(&mut app, &mut term, Tool::Key(KeyCode::Esc));
+    assert!(!app.mods.any());
+}
+
+#[test]
+fn box_mode_edits_a_column_on_every_line() {
+    let root = project();
+    std::fs::write(root.join("cols.txt"), "alpha\nbeta\ngamma\n").unwrap();
+    let mut app = App::new(
+        root.clone(),
+        vec![root.join("cols.txt")],
+        "Visual Studio Dark",
+        false,
+    );
+    let mut term = Terminal::new(TestBackend::new(44, 24)).unwrap();
+
+    tap_tool(&mut app, &mut term, Tool::BoxMode);
+    assert!(app.mods.box_mode());
+    tap_tool(&mut app, &mut term, Tool::Key(KeyCode::Down));
+    tap_tool(&mut app, &mut term, Tool::Key(KeyCode::Down));
+    assert!(row(&term, 23).contains("BOX 3×"), "{}", row(&term, 23));
+    // Typing goes to every line of the box.
+    for c in "- ".chars() {
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(c),
+            KeyModifiers::NONE,
+        )));
+    }
+    assert_eq!(
+        app.editor().unwrap().doc.rope.to_string(),
+        "- alpha\n- beta\n- gamma\n"
+    );
+    // Widen the box with → and delete the column.
+    tap_tool(&mut app, &mut term, Tool::Key(KeyCode::Right));
+    app.handle_event(Event::Key(KeyEvent::new(
+        KeyCode::Delete,
+        KeyModifiers::NONE,
+    )));
+    assert_eq!(
+        app.editor().unwrap().doc.rope.to_string(),
+        "- lpha\n- eta\n- amma\n"
+    );
+    tap_tool(&mut app, &mut term, Tool::BoxMode);
+    assert!(!app.mods.box_mode());
+
+    // Physical keyboard: Alt+Shift+Down also makes a box.
+    app.handle_event(Event::Key(KeyEvent::new(
+        KeyCode::Down,
+        KeyModifiers::ALT | KeyModifiers::SHIFT,
+    )));
+    assert!(app.editor().unwrap().block.is_some());
 }
 
 #[test]
@@ -130,15 +223,14 @@ fn toolbar_pages_and_rotation_restore_desktop_layout() {
         false,
     );
     let mut term = Terminal::new(TestBackend::new(44, 24)).unwrap();
-    draw(&mut term, &mut app);
-    let (x, y) = find(&term, "»").unwrap();
-    tap(&mut app, x, y);
-    draw(&mut term, &mut app);
+    tap_tool(&mut app, &mut term, Tool::Page);
     assert!(
-        row(&term, 22).contains("Paste"),
-        "second toolbar page: {}",
-        row(&term, 22)
+        row(&term, 21).contains("Copy"),
+        "actions page: {}",
+        row(&term, 21)
     );
+    tap_tool(&mut app, &mut term, Tool::Page);
+    assert!(row(&term, 21).contains("Esc"));
 
     // Rotate to landscape: full layout, no toolbar, no wrap.
     term.backend_mut().resize(120, 30);
@@ -147,5 +239,5 @@ fn toolbar_pages_and_rotation_restore_desktop_layout() {
     assert!(!app.compact);
     assert!(!app.word_wrap());
     assert!(row(&term, 0).contains("File"));
-    assert!(!row(&term, 28).contains("Esc"));
+    assert!(!row(&term, 27).contains("Esc"));
 }

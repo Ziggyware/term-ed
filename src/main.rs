@@ -166,6 +166,9 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App, truecolor: bool) 
         }
         let timeout = if app.busy() {
             Duration::from_millis(1)
+        } else if app.agent.running() || app.agent_animating() {
+            // Pick up streamed agent output promptly.
+            Duration::from_millis(40)
         } else {
             Duration::from_millis(250)
         };
@@ -180,7 +183,10 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App, truecolor: bool) 
             }
             dirty = true;
         }
-        if app.tick() || app.busy() {
+        if app.pump_agent() {
+            dirty = true;
+        }
+        if app.tick() || app.busy() || app.agent_animating() {
             dirty = true;
         }
     }

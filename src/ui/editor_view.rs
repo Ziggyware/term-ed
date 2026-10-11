@@ -110,6 +110,7 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
     fill(buf, gutter, bg);
 
     let sel = e.sel;
+    let block = e.block;
     let changes: Vec<LineChange> = e.line_changes().to_vec();
     let bracket_pair = e.bracket_pair();
     let word_refs = reference_ranges(e, h);
@@ -193,9 +194,36 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
             bracket_pair,
             line_bg,
             render_ws,
+            box_cols: block.and_then(|b| {
+                let (t, btm) = b.lines();
+                (line >= t && line <= btm).then(|| b.cols())
+            }),
         };
         let origin = seg.dstart + e.scroll_col;
         draw_line(buf, text, y, &line_text, seg, origin, tab, &ctx);
+
+        // Box selection past the end of a short line (virtual space), and the
+        // column of carets for a zero-width box.
+        if let Some((l, r)) = ctx.box_cols
+            && last
+        {
+            let eol = crate::editor::display_col(&line_text, line_text.chars().count(), tab);
+            let left_px = text.x as usize + seg.indent;
+            let paint = |buf: &mut Buffer, dc: usize, color: Color| {
+                if dc >= origin {
+                    let x = left_px + dc - origin;
+                    if x < text.right() as usize {
+                        super::util::set_bg(buf, x as u16, y, color);
+                    }
+                }
+            };
+            for dc in eol.max(l)..r {
+                paint(buf, dc, pal.selection);
+            }
+            if l == r && l >= eol {
+                paint(buf, l, mix(pal.bg, pal.fg, 0.7));
+            }
+        }
 
         // Selection includes the newline: show one cell past EOL like VS.
         if let Some((s, en)) = ctx.sel_range {
@@ -268,6 +296,8 @@ struct LineCtx<'a> {
     bracket_pair: Option<((usize, usize), (usize, usize))>,
     line_bg: Color,
     render_ws: bool,
+    /// Display-column range of a box selection on this line.
+    box_cols: Option<(usize, usize)>,
 }
 
 /// Draw one visual row: the chars of `seg`, with display column `origin`
@@ -352,7 +382,15 @@ fn draw_line(
         {
             style = style.bg(pal.bracket_match).add_modifier(Modifier::BOLD);
         }
-        let selected = ctx.sel_range.is_some_and(|(s, e)| idx >= s && idx < e);
+        let mut selected = ctx.sel_range.is_some_and(|(s, e)| idx >= s && idx < e);
+        if let Some((l, r)) = ctx.box_cols {
+            if dcol >= l && dcol < r {
+                selected = true;
+            } else if l == r && dcol == l {
+                // One of the box's carets: draw it as a block cursor.
+                style = style.bg(mix(pal.bg, pal.fg, 0.7)).fg(pal.bg);
+            }
+        }
         if selected {
             style = style.bg(pal.selection);
         }

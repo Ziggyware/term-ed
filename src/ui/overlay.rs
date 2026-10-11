@@ -110,6 +110,8 @@ pub fn render_palette(buf: &mut Buffer, screen: Rect, app: &mut App) -> Option<P
         PaletteMode::GotoLine => "Go to Line",
         PaletteMode::Themes => "Color Theme",
         PaletteMode::Languages => "Language Mode",
+        PaletteMode::AgentModels => "Agent Model",
+        PaletteMode::AgentPicker => "AI Agent",
         PaletteMode::SaveAs => "Save As",
     };
     panel(buf, r, pal.accent, pal.popup_bg, Some(title));
@@ -121,6 +123,8 @@ pub fn render_palette(buf: &mut Buffer, screen: Rect, app: &mut App) -> Option<P
         PaletteMode::GotoLine => (":", "line[:column]"),
         PaletteMode::Themes => ("◐", "Select a color theme (↑↓ to preview)"),
         PaletteMode::Languages => ("{}", "Select language mode"),
+        PaletteMode::AgentModels => ("✦", "Choose a model (free ones first)"),
+        PaletteMode::AgentPicker => ("✦", "Choose an AI agent"),
         PaletteMode::SaveAs => ("⤓", "path/relative/to/project"),
     };
     let iy = r.y + 1;
@@ -228,7 +232,11 @@ pub fn render_palette(buf: &mut Buffer, screen: Rect, app: &mut App) -> Option<P
             label.clone()
         };
         // Keyboard hints are noise on a phone and steal width from the label.
-        let hint = if compact { String::new() } else { hint };
+        let hint = if compact && matches!(p.mode, PaletteMode::Commands | PaletteMode::Files) {
+            String::new()
+        } else {
+            hint
+        };
         let hint_w = if hint.is_empty() { 0 } else { width(&hint) + 3 };
         let max_x = list.right().saturating_sub(hint_w + 1);
         for (ci, ch) in display.chars().enumerate() {
@@ -509,9 +517,9 @@ pub fn render_dialog(buf: &mut Buffer, screen: Rect, app: &mut App) {
     app.layout.dialog_buttons = buttons;
 }
 
-pub fn render_toasts(buf: &mut Buffer, area: Rect, app: &App) {
+pub fn render_toasts(buf: &mut Buffer, area: Rect, app: &App, top: bool) {
     let pal = &app.theme.palette;
-    let mut y = area.bottom();
+    let mut y = if top { area.y + 1 } else { area.bottom() };
     for t in app.toasts.iter().rev() {
         let (icon, color) = match t.kind {
             ToastKind::Info => ("ℹ", pal.accent),
@@ -520,14 +528,15 @@ pub fn render_toasts(buf: &mut Buffer, area: Rect, app: &App) {
         };
         let text = ellipsize(&t.text, (area.width as usize).saturating_sub(10).min(70));
         let w = width(&text) + 7;
-        if y < area.y + 4 || w > area.width {
+        if w > area.width || (!top && y < area.y + 4) || (top && y + 3 > area.bottom()) {
             break;
         }
-        y -= 3;
+        let ty = if top { y } else { y - 3 };
+        y = if top { y + 3 } else { y - 3 };
         let x = area
             .right()
             .saturating_sub(w + 1 + app.layout.minimap.width + app.layout.scrollbar.width);
-        let r = Rect::new(x, y, w, 3);
+        let r = Rect::new(x, ty, w, 3);
         panel(buf, r, mix(pal.popup_bg, color, 0.6), pal.popup_bg, None);
         put(
             buf,

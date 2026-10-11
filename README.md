@@ -8,6 +8,20 @@ A terminal code editor that looks and feels like the Visual Studio C# editor, fo
 |---|---|
 | ![Command palette](docs/command-palette.png) | ![Find and replace](docs/find-neon.png) |
 
+## AI agent (free, no setup)
+
+![The agent panel fixing a bug with OpenCode's free model](docs/agent.png)
+
+Press `Ctrl+K A`, click **✦ Agent** in the title bar, or tap **✦** on a phone. Then ask in plain words, or tap one of the suggestions ("Find bugs in calc.py"). The agent can read and edit your project:
+
+- **Free by default.** termed runs [OpenCode](https://opencode.ai) through the [Agent Client Protocol](https://agentclientprotocol.com). OpenCode's free models need no account, no API key and no configuration. If OpenCode isn't installed, the panel offers a one-tap **Install OpenCode (free)** button, which runs `npm install -g opencode-ai`.
+- **Free models are busy sometimes.** Free models are shared and occasionally rate-limited. If one stays silent for 25 seconds, termed switches to another free model and asks again automatically, telling you in the chat. Tap the model name to choose one yourself; free models are listed first.
+- **You stay in control.** The agent's edits appear in your open files as normal edits with change bars, and one Ctrl+Z (↶) reverts an edit. Diffs show inline in the chat, and tapping a change opens the file at that spot. If the agent asks permission to run a tool, you tap Allow or Reject (or press 1–3).
+- **Context is automatic.** The open file, and your selection if there is one, are attached to every message (shown as `@ file.py:12-20` above the prompt). Unsaved files are saved first so the agent sees your latest code.
+- **Esc or ■ stops the agent.** + New starts a fresh chat.
+- **Other agents work too.** Gemini CLI (`gemini --acp`), Claude Code (`claude-agent-acp`) and Codex (`codex-acp`) are detected automatically if installed; pick one with *Agent: Choose Agent*. Note that these generally need a sign-in or paid plan. Any other ACP agent works with `TERMED_AGENT="command args"`.
+- **On a phone** the panel is a full-screen sheet above the touch keyboard ([screenshot](docs/agent-phone.png)).
+
 ## On a phone
 
 ![termed on a 46-column phone screen: explorer drawer, wrapped C#, find, command palette](docs/mobile.png)
@@ -15,8 +29,17 @@ A terminal code editor that looks and feels like the Visual Studio C# editor, fo
 termed adapts to phone terminals such as Termux, Blink, Termius and iSH. Below 80 columns it switches to a compact layout automatically; `--mobile` (or `TERMED_MOBILE=1`) forces it at any size. Rotating the device or resizing the window re-lays out the screen immediately.
 
 - **Word wrap.** Long lines wrap, so you never scroll sideways. Wrapped rows keep the line's indent and get a `↪` marker in the gutter, and long expressions break at spaces, commas, brackets or before a `.`. `Alt+Z` or the **Wrap** button toggles it.
-- **Touch toolbar.** A row of tappable keys that phone keyboards lack: ☰, Esc, Tab, arrows, **Sel**, undo/redo, Copy/Cut/Paste, Save, Find, Home/End, PgUp/PgDn, select all/line, comment, outdent, Wrap, Go to line and ⋯ (all commands). Buttons stretch to fill the width, and **»** shows the next page. The toolbar stays on in Termux, Blink and a-Shell even in landscape; `--no-toolbar` hides it.
-- **Selection without Shift.** Tap **Sel**, then use the arrow buttons or tap in the text to extend the selection. Copy, Cut, Esc or typing ends selection mode. Double-tap selects a word, and a triple-tap selects a line.
+- **Touch keyboard.** A fixed 2×9 grid of the keys a phone keyboard lacks, laid out like a laptop: modifiers on the left and an arrow cluster with ↑ above ↓ and ← → beside it. Every key always sits in the same place, so you can build muscle memory. **Fn** switches to an actions page (Copy, Cut, Paste, Save, Find, Replace, go to line, all commands, select all/line/word, comment, duplicate, move line, wrap). The keyboard stays on in Termux, Blink and a-Shell even in landscape; `--no-toolbar` hides it.
+
+  ![Touch keyboard states: one-shot Ctrl, locked Shift selecting, box selection, Fn page](docs/touch-keys.png)
+
+- **Sticky Ctrl / Alt / Shift.** A soft keyboard can't hold a modifier while you press another key, so the toolbar modifiers latch:
+  - **Tap once** and the key is tinted and underlined, and the status bar shows `CTRL+`. It applies to the **next key only**, whether you tap a toolbar key, type on the soft keyboard or tap the text.
+  - **Tap twice** and it is **locked** (solid) until you tap it again or press Esc.
+  - Modifiers combine. For example, Ctrl+Shift+→ selects a word, Alt+↑ moves the line up, Ctrl+`s` (typed on the soft keyboard) saves, and Ctrl locked lets you press → → → to jump word by word.
+  - **Locked Shift is selection mode** (status `SELECT`). Arrows, Home/End and taps extend the selection. Typing replaces the selection and ends the mode, and Copy or Cut also ends it.
+- **Box (column) selection.** Tap **Box**, which locks Alt+Shift, then use the arrows or tap a corner to draw a rectangle. The status bar shows `BOX 4×6`, and the box may extend past the end of short lines. Typing, Tab, Backspace and Delete apply to **every line** at once; short lines are padded with spaces. Copy and cut take the column, and pasting a column puts one line on each row. Tap **Box** or Esc to leave. On a hardware keyboard, use Visual Studio's `Alt+Shift+arrows` or Alt+drag with the mouse.
+- **Selection by touch.** Double-tap selects a word and triple-tap a line. Shift+tap (Shift latched, then tap) extends the selection to the tapped point.
 - **Explorer drawer.** ☰ slides the file tree over the editor. Tapping a file opens it and closes the drawer, and tapping outside dismisses it.
 - **Compact chrome.** The title bar has large ☰, ⌕ (open file) and ⋯ (commands) buttons, and tapping the file name opens quick open. The tab row appears only when more than one file is open. Breadcrumbs, the minimap and keyboard hints are hidden. The status bar drops lower-priority items first.
 - **Phone-sized overlays.** The command palette is edge to edge, the find/replace bar spans the full width, and dialog text wraps; dialog buttons stack when they don't fit side by side. The welcome screen is a list of large buttons.
@@ -40,6 +63,7 @@ termed adapts to phone terminals such as Termux, Blink, Termius and iSH. Below 8
 - Highlighting for 192 languages (C#, C/C++, Rust, Go, Python, TypeScript, Java, Kotlin, Swift, SQL, YAML, Markdown and more; run `termed --list-languages` for the full list).
 - Auto-indent, smart block expansion when you press Enter between braces, and auto-closing brackets and quotes with type-over.
 - Smart Home, word navigation, Ctrl+D to select the next occurrence, line move and duplicate, toggle comment for each language, and block indent and outdent.
+- Box (column) selection like Visual Studio: Alt+Shift+arrows or Alt+drag. Typing, Tab, Backspace and Delete edit every line of the column, and copy/paste work per line.
 - Undo and redo that group typing into words, like VS.
 - Find and replace with match case, whole word and regex options (including `$1` capture groups), plus replace-one and replace-all.
 - Copy with no selection copies the whole line, and pasting it inserts the line above, as in VS.
@@ -80,7 +104,8 @@ You need a terminal with truecolor support to get the full look (Windows Termina
 | Select all / line / next occurrence | `Ctrl+A` / `Ctrl+L` / `Ctrl+D` |
 | Toggle comment | `Ctrl+/` |
 | Move line(s) up / down | `Alt+Up` / `Alt+Down` |
-| Copy line(s) up / down | `Alt+Shift+Up` / `Alt+Shift+Down` |
+| Duplicate line(s) | `Ctrl+Shift+D` |
+| Box (column) selection | `Alt+Shift+arrows`, Alt+drag |
 | Delete line | `Ctrl+Shift+K` |
 | Insert line below / above | `Ctrl+Enter` / `Ctrl+Shift+Enter` |
 | Indent / outdent | `Tab` / `Shift+Tab`, `Ctrl+]` / `Ctrl+[` |
@@ -89,6 +114,7 @@ You need a terminal with truecolor support to get the full look (Windows Termina
 | Language mode | `Ctrl+K Ctrl+M` |
 | Toggle minimap / whitespace / indent guides / line numbers | `Ctrl+K M` / `W` / `I` / `L` |
 | Toggle word wrap | `Alt+Z` |
+| AI agent panel | `Ctrl+K A` |
 
 Some combinations (Ctrl+Shift+…, Ctrl+Enter, Ctrl+[) can only be told apart in terminals that support the kitty keyboard protocol, which termed turns on when it is available. In other terminals, Ctrl+Backspace arrives as Ctrl+H (Replace), so use Alt+Backspace to delete a word. Every command can also be run from the command palette.
 
@@ -104,6 +130,7 @@ Some combinations (Ctrl+Shift+…, Ctrl+Enter, Ctrl+[) can only be told apart in
 | File tree | [ignore](https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore) | ripgrep's walker; respects `.gitignore`. |
 | Change margin | [similar](https://github.com/mitsuhiko/similar) | Fast line diff against the saved file. |
 | Find / replace | [regex](https://github.com/rust-lang/regex) | Linear-time regex with capture-group replacement. |
+| AI agents | [Agent Client Protocol](https://agentclientprotocol.com) + [serde_json](https://github.com/serde-rs/json) | The open standard used by Zed and JetBrains for plugging in coding agents; OpenCode supplies free models. |
 | Text width | [unicode-width](https://github.com/unicode-rs/unicode-width) | Correct columns for CJK and wide characters. |
 
 Source layout:
@@ -114,6 +141,7 @@ src/
   editor.rs       caret/selection model, soft wrap and VS-style editing commands
   highlight.rs    incremental, time-budgeted highlighting + string-aware bracket analysis
   theme.rs        Visual Studio Dark / Termed Neon + derived palettes for bundled themes
+  agent.rs        Agent Client Protocol client: launches the agent, JSON-RPC, chat model, free-model failover
   app.rs          state, key/mouse handling, palette, find/replace, dialogs
   ui/             title bar, explorer/drawer, tabs, code view, minimap, toolbar, overlays
 examples/
@@ -123,7 +151,7 @@ examples/
 ## Development
 
 ```sh
-cargo test                  # includes tests/mobile.rs: phone layout, taps, toolbar, rotation
+cargo test                  # includes phone layout/touch tests and agent tests against a scripted ACP agent
 cargo clippy --all-targets
 # Render a frame to HTML, replaying keystrokes, taps and swipes:
 cargo run --example snapshot -- out.html 150x42 "Visual Studio Dark" . src/main.rs -- ctrl+p text:editor

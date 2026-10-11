@@ -9,6 +9,7 @@ use ratatui::crossterm::event::{
 use ratatui::layout::{Position, Rect};
 use regex::{Regex, RegexBuilder};
 
+use crate::agent::{self, Agent, AgentEvent, State as AgentState};
 use crate::clipboard::Clipboard;
 use crate::commands::{COMMANDS, Command};
 use crate::document::{Document, Indent, LineEnding, Selection};
@@ -23,6 +24,8 @@ pub enum Focus {
     Editor,
     Explorer,
     Find,
+    /// Typing into the AI agent panel.
+    Agent,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,6 +36,8 @@ pub enum PaletteMode {
     Themes,
     Languages,
     SaveAs,
+    AgentModels,
+    AgentPicker,
 }
 
 pub struct Palette {
@@ -48,42 +53,164 @@ pub struct Palette {
     pub restore_theme: Option<String>,
 }
 
+/// A sticky modifier for touch screens: soft keyboards cannot hold Ctrl,
+/// Alt or Shift while pressing another key, so a tap latches the modifier.
+/// Tap once: applies to the next key. Tap again: locked until tapped off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Latch {
+    #[default]
+    Off,
+    Once,
+    Locked,
+}
+
+impl Latch {
+    pub fn on(self) -> bool {
+        self != Latch::Off
+    }
+    fn tapped(self) -> Self {
+        match self {
+            Latch::Off => Latch::Once,
+            Latch::Once => Latch::Locked,
+            Latch::Locked => Latch::Off,
+        }
+    }
+    fn spent(self) -> Self {
+        if self == Latch::Once {
+            Latch::Off
+        } else {
+            self
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mod {
+    Ctrl,
+    Alt,
+    Shift,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StickyMods {
+    pub ctrl: Latch,
+    pub alt: Latch,
+    pub shift: Latch,
+}
+
+impl StickyMods {
+    pub fn get(&self, m: Mod) -> Latch {
+        match m {
+            Mod::Ctrl => self.ctrl,
+            Mod::Alt => self.alt,
+            Mod::Shift => self.shift,
+        }
+    }
+    pub fn tap(&mut self, m: Mod) {
+        let l = match m {
+            Mod::Ctrl => &mut self.ctrl,
+            Mod::Alt => &mut self.alt,
+            Mod::Shift => &mut self.shift,
+        };
+        *l = l.tapped();
+    }
+    pub fn any(&self) -> bool {
+        self.ctrl.on() || self.alt.on() || self.shift.on()
+    }
+    /// Alt+Shift locked: box (column) selection mode.
+    pub fn box_mode(&self) -> bool {
+        self.alt == Latch::Locked && self.shift == Latch::Locked
+    }
+    /// Shift locked on its own: selection mode.
+    pub fn select_mode(&self) -> bool {
+        self.shift == Latch::Locked && !self.box_mode()
+    }
+    fn spend(&mut self) {
+        self.ctrl = self.ctrl.spent();
+        self.alt = self.alt.spent();
+        self.shift = self.shift.spent();
+    }
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// What a touch-toolbar button does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
     Cmd(Command),
     Key(KeyCode),
+    Mod(Mod),
+    /// Toggle box-selection mode (Alt+Shift locked).
+    BoxMode,
+    /// Switch between the keys page and the actions page.
+    Page,
 }
 
-/// The on-screen toolbar for phones (no Ctrl/Alt/Esc/arrow keys on soft
-/// keyboards). Buttons are paginated to fit the screen width.
-pub const TOOLBAR: &[(&str, Tool)] = &[
-    ("☰", Tool::Cmd(Command::ToggleSidebar)),
-    ("Esc", Tool::Key(KeyCode::Esc)),
-    ("Tab", Tool::Key(KeyCode::Tab)),
-    ("◀", Tool::Key(KeyCode::Left)),
-    ("▲", Tool::Key(KeyCode::Up)),
-    ("▼", Tool::Key(KeyCode::Down)),
-    ("▶", Tool::Key(KeyCode::Right)),
-    ("Sel", Tool::Cmd(Command::ToggleSelectMode)),
-    ("↶", Tool::Cmd(Command::Undo)),
-    ("↷", Tool::Cmd(Command::Redo)),
-    ("Copy", Tool::Cmd(Command::Copy)),
-    ("Cut", Tool::Cmd(Command::Cut)),
-    ("Paste", Tool::Cmd(Command::Paste)),
-    ("Save", Tool::Cmd(Command::Save)),
-    ("Find", Tool::Cmd(Command::Find)),
-    ("Home", Tool::Key(KeyCode::Home)),
-    ("End", Tool::Key(KeyCode::End)),
-    ("PgUp", Tool::Key(KeyCode::PageUp)),
-    ("PgDn", Tool::Key(KeyCode::PageDown)),
-    ("All", Tool::Cmd(Command::SelectAll)),
-    ("Line", Tool::Cmd(Command::SelectLine)),
-    ("//", Tool::Cmd(Command::ToggleComment)),
-    ("⇤", Tool::Key(KeyCode::BackTab)),
-    ("Wrap", Tool::Cmd(Command::ToggleWordWrap)),
-    ("Go", Tool::Cmd(Command::GotoLine)),
-    ("⋯", Tool::Cmd(Command::CommandPalette)),
+#[derive(Clone, Copy, Debug)]
+pub struct ToolKey {
+    pub label: &'static str,
+    /// Used when the button is too narrow for `label`.
+    pub short: &'static str,
+    pub tool: Tool,
+}
+
+const fn key(label: &'static str, short: &'static str, tool: Tool) -> ToolKey {
+    ToolKey { label, short, tool }
+}
+
+/// The touch keyboard: a fixed 2×9 grid with a laptop-style arrow cluster
+/// (↑ sits above ↓, with ← → beside it) and the modifiers on the left, like
+/// Termux's extra keys. The second page holds editing actions.
+pub const TOOLBAR_PAGES: [[[ToolKey; 9]; 2]; 2] = [
+    [
+        [
+            key("Esc", "Esc", Tool::Key(KeyCode::Esc)),
+            key("Ctrl", "Ctl", Tool::Mod(Mod::Ctrl)),
+            key("Alt", "Alt", Tool::Mod(Mod::Alt)),
+            key("Shift", "⇧", Tool::Mod(Mod::Shift)),
+            key("Home", "⇱", Tool::Key(KeyCode::Home)),
+            key("↑", "↑", Tool::Key(KeyCode::Up)),
+            key("End", "⇲", Tool::Key(KeyCode::End)),
+            key("PgUp", "⇞", Tool::Key(KeyCode::PageUp)),
+            key("Fn", "Fn", Tool::Page),
+        ],
+        [
+            key("Tab", "⇥", Tool::Key(KeyCode::Tab)),
+            key("Box", "▦", Tool::BoxMode),
+            key("Undo", "↶", Tool::Cmd(Command::Undo)),
+            key("Redo", "↷", Tool::Cmd(Command::Redo)),
+            key("←", "←", Tool::Key(KeyCode::Left)),
+            key("↓", "↓", Tool::Key(KeyCode::Down)),
+            key("→", "→", Tool::Key(KeyCode::Right)),
+            key("PgDn", "⇟", Tool::Key(KeyCode::PageDown)),
+            key("☰", "☰", Tool::Cmd(Command::ToggleSidebar)),
+        ],
+    ],
+    [
+        [
+            key("Copy", "Cpy", Tool::Cmd(Command::Copy)),
+            key("Cut", "Cut", Tool::Cmd(Command::Cut)),
+            key("Paste", "Pst", Tool::Cmd(Command::Paste)),
+            key("Save", "Sav", Tool::Cmd(Command::Save)),
+            key("Find", "⌕", Tool::Cmd(Command::Find)),
+            key("Repl", "⇄", Tool::Cmd(Command::Replace)),
+            key("Line#", "#", Tool::Cmd(Command::GotoLine)),
+            key("Cmds", "⋯", Tool::Cmd(Command::CommandPalette)),
+            key("Keys", "⌨", Tool::Page),
+        ],
+        [
+            key("All", "All", Tool::Cmd(Command::SelectAll)),
+            key("Line", "Ln", Tool::Cmd(Command::SelectLine)),
+            key("Word", "W", Tool::Cmd(Command::SelectNextOccurrence)),
+            key("//", "//", Tool::Cmd(Command::ToggleComment)),
+            key("Dup", "Dup", Tool::Cmd(Command::DuplicateLineDown)),
+            key("Ln↑", "⇡", Tool::Cmd(Command::MoveLineUp)),
+            key("Ln↓", "⇣", Tool::Cmd(Command::MoveLineDown)),
+            key("Wrap", "↩", Tool::Cmd(Command::ToggleWordWrap)),
+            key("AI", "✦", Tool::Cmd(Command::AgentToggle)),
+        ],
+    ],
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,14 +278,34 @@ pub struct Layout {
     pub dialog_buttons: Vec<(Rect, usize)>,
     pub click_items: Vec<(Rect, Command)>,
     pub toolbar: Vec<(Rect, Tool)>,
-    pub toolbar_next: Rect,
     /// Explorer shown as a slide-over drawer (compact layout).
     pub drawer: Rect,
+    pub agent_panel: Rect,
+    pub agent_input: Rect,
+    pub agent_targets: Vec<(Rect, AgentTarget)>,
+}
+
+/// Tappable things in the agent panel.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AgentTarget {
+    OpenFile(PathBuf, Option<u32>),
+    Permission(usize, String),
+    Install,
+    Retry,
+    NewChat,
+    Close,
+    Model,
+    PickAgent,
+    Stop,
+    Send,
+    /// A one-tap starter prompt.
+    Suggest(String),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Drag {
     Text,
+    Box,
     Scrollbar,
     Minimap,
     SidebarResize,
@@ -196,8 +343,10 @@ pub struct App {
     pub quit: bool,
     /// Phone-sized screen: single-column layout (set by the renderer each frame).
     pub compact: bool,
-    /// Touch selection mode: arrows and taps extend the selection (no Shift on phones).
-    pub select_mode: bool,
+    /// Latched modifiers from the touch toolbar.
+    pub mods: StickyMods,
+    pub agent: Agent,
+    pub show_agent: bool,
     pub toolbar_page: usize,
     drawer_init: bool,
     clipboard: Clipboard,
@@ -237,7 +386,9 @@ impl App {
                 force_compact: false,
             },
             compact: false,
-            select_mode: false,
+            mods: StickyMods::default(),
+            agent: Agent::new(root.clone()),
+            show_agent: false,
             toolbar_page: 0,
             drawer_init: false,
             git_branch: git_branch(&root),
@@ -359,6 +510,12 @@ impl App {
     }
 
     fn on_paste(&mut self, text: &str) {
+        if self.focus == Focus::Agent && self.palette.is_none() {
+            let a = &mut self.agent;
+            a.input.insert_str(byte_at(&a.input, a.cursor), text);
+            a.cursor += text.chars().count();
+            return;
+        }
         if let Some(p) = &mut self.palette {
             let t = text.replace(['\n', '\r'], "");
             p.input.insert_str(byte_at(&p.input, p.cursor), &t);
@@ -375,24 +532,82 @@ impl App {
         }
     }
 
+    /// Fold latched toolbar modifiers into a key event, then spend the
+    /// one-shot ones. Locked Shift is "selection mode" and locked Alt+Shift
+    /// is "box mode": they steer movement keys but let typing through, so
+    /// you can type into a box selection or replace a selection normally.
+    fn apply_sticky(&self, mut k: KeyEvent) -> KeyEvent {
+        let m = self.mods;
+        let typing = matches!(
+            k.code,
+            KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete | KeyCode::Enter
+        );
+        let applies = |latch: Latch, is_shift_or_alt: bool, is_shift: bool| match latch {
+            Latch::Off => false,
+            Latch::Once => true,
+            Latch::Locked => {
+                if m.box_mode() && is_shift_or_alt || is_shift {
+                    !typing
+                } else {
+                    true
+                }
+            }
+        };
+        if applies(m.ctrl, false, false) {
+            k.modifiers |= KeyModifiers::CONTROL;
+        }
+        if applies(m.alt, true, false) {
+            k.modifiers |= KeyModifiers::ALT;
+        }
+        if applies(m.shift, true, true) {
+            k.modifiers |= KeyModifiers::SHIFT;
+            if let KeyCode::Char(c) = k.code
+                && !k
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
+                k.code = KeyCode::Char(c.to_uppercase().next().unwrap_or(c));
+            }
+        }
+        k
+    }
+
     /// Synthesize a key press (touch toolbar).
     pub fn press(&mut self, code: KeyCode) {
         self.on_key(KeyEvent::new(code, KeyModifiers::NONE));
     }
 
-    fn on_key(&mut self, mut k: KeyEvent) {
+    fn on_key(&mut self, k: KeyEvent) {
+        let typing = matches!(
+            k.code,
+            KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete | KeyCode::Enter
+        );
+        let esc = k.code == KeyCode::Esc;
+        self.on_key_inner(k);
+        self.mods.spend();
+        if esc {
+            // Esc always releases latched/locked modifiers.
+            self.mods.clear();
+        } else if typing && self.mods.select_mode() && self.focus == Focus::Editor {
+            // Typing over a selection ends selection mode.
+            self.mods.shift = Latch::Off;
+        }
+    }
+
+    fn on_key_inner(&mut self, mut k: KeyEvent) {
         // Some phone keyboards send LF for Return, which arrives as Ctrl+J.
         if k.code == KeyCode::Char('j') && k.modifiers == KeyModifiers::CONTROL {
             k = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         }
+        if self.mods.any() {
+            k = self.apply_sticky(k);
+        }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
-        // Touch selection mode stands in for a held Shift key.
-        let shift = k.modifiers.contains(KeyModifiers::SHIFT)
-            || (self.select_mode
-                && is_movement(k.code)
-                && self.focus == Focus::Editor
-                && self.palette.is_none());
+        let shift = k.modifiers.contains(KeyModifiers::SHIFT);
+        if k.code == KeyCode::Tab && shift {
+            k.code = KeyCode::BackTab;
+        }
         // Normalize Ctrl+Shift+<letter>, which may arrive upper- or lower-case.
         let code = match k.code {
             KeyCode::Char(c) if ctrl || alt => KeyCode::Char(c.to_ascii_lowercase()),
@@ -412,6 +627,7 @@ impl App {
             self.chord = false;
             let cmd = match code {
                 KeyCode::Char('t') => Some(Command::SelectTheme),
+                KeyCode::Char('a') => Some(Command::AgentToggle),
                 KeyCode::Char('m') => Some(if ctrl {
                     Command::SelectLanguage
                 } else {
@@ -489,6 +705,7 @@ impl App {
 
         match self.focus {
             Focus::Find => self.find_key(code, ctrl, shift, alt),
+            Focus::Agent => self.agent_key(code, ctrl, shift, alt),
             Focus::Explorer => self.explorer_key(code),
             Focus::Editor => self.editor_key(code, ctrl, shift, alt),
         }
@@ -504,6 +721,7 @@ impl App {
             (KeyCode::Char('v'), true, ..) | (KeyCode::Insert, _, true, _) => Some(Command::Paste),
             (KeyCode::Char('a'), true, ..) => Some(Command::SelectAll),
             (KeyCode::Char('l'), true, ..) => Some(Command::SelectLine),
+            (KeyCode::Char('d'), true, true, _) => Some(Command::DuplicateLineDown),
             (KeyCode::Char('d'), true, ..) => Some(Command::SelectNextOccurrence),
             (KeyCode::Char('/'), true, ..) | (KeyCode::Char('7'), true, ..) => {
                 Some(Command::ToggleComment)
@@ -513,8 +731,6 @@ impl App {
             (KeyCode::Char(']' | '5'), true, ..) => Some(Command::Indent),
             (KeyCode::Char('['), true, ..) => Some(Command::Outdent),
             (KeyCode::Char('k'), true, true, _) => Some(Command::DeleteLine),
-            (KeyCode::Up, false, true, true) => Some(Command::DuplicateLineUp),
-            (KeyCode::Down, false, true, true) => Some(Command::DuplicateLineDown),
             (KeyCode::Up, false, false, true) => Some(Command::MoveLineUp),
             (KeyCode::Down, false, false, true) => Some(Command::MoveLineDown),
             (KeyCode::Enter, true, true, _) => Some(Command::InsertLineAbove),
@@ -526,16 +742,60 @@ impl App {
             return;
         }
         let find_visible = self.find.visible;
-        if !is_movement(code) && self.select_mode {
-            // Any edit or Esc ends touch selection mode.
-            self.select_mode = false;
-            if code == KeyCode::Esc {
-                return;
-            }
-        }
         let Some(e) = self.editors.get_mut(self.active) else {
             return;
         };
+        // Visual Studio box selection: Alt+Shift+arrows.
+        if alt && shift && !ctrl {
+            let (dl, dc) = match code {
+                KeyCode::Up => (-1, 0),
+                KeyCode::Down => (1, 0),
+                KeyCode::Left => (0, -1),
+                KeyCode::Right => (0, 1),
+                KeyCode::PageUp => (-(e.view_height.max(2) as isize - 1), 0),
+                KeyCode::PageDown => (e.view_height.max(2) as isize - 1, 0),
+                _ => (0, 0),
+            };
+            if (dl, dc) != (0, 0) {
+                e.box_extend(dl, dc);
+                e.scroll_into_view();
+                return;
+            }
+        }
+        if e.block.is_some() {
+            let handled = match code {
+                KeyCode::Char(c) if !ctrl && !alt => {
+                    e.box_type(&c.to_string());
+                    true
+                }
+                KeyCode::Tab => {
+                    let unit = e.doc.indent.unit();
+                    e.box_type(&unit);
+                    true
+                }
+                KeyCode::Backspace => {
+                    e.box_backspace();
+                    true
+                }
+                KeyCode::Delete => {
+                    e.box_delete();
+                    true
+                }
+                KeyCode::Esc => {
+                    e.box_clear();
+                    true
+                }
+                _ => {
+                    // Any other key leaves box mode and acts normally.
+                    e.box_clear();
+                    false
+                }
+            };
+            if handled {
+                e.scroll_into_view();
+                return;
+            }
+        }
         match code {
             KeyCode::Esc => {
                 if find_visible {
@@ -689,6 +949,47 @@ impl App {
                 }
             }
             ToggleMinimap => self.settings.minimap = !self.settings.minimap,
+            AgentToggle => {
+                if self.show_agent && self.focus == Focus::Agent {
+                    self.show_agent = false;
+                    self.focus = if self.editors.is_empty() {
+                        Focus::Explorer
+                    } else {
+                        Focus::Editor
+                    };
+                } else {
+                    self.show_agent = true;
+                    self.focus = Focus::Agent;
+                    if self.compact {
+                        self.show_sidebar = false;
+                    }
+                }
+            }
+            AgentNewChat => {
+                self.agent.new_chat();
+                self.show_agent = true;
+                self.focus = Focus::Agent;
+            }
+            AgentStop => self.agent.cancel(),
+            AgentModel => {
+                if self.agent.models.is_empty() {
+                    self.toast(
+                        "Send a first message to load the model list",
+                        ToastKind::Info,
+                    );
+                } else {
+                    self.open_palette(PaletteMode::AgentModels);
+                }
+            }
+            AgentPick => {
+                self.agent.available = agent::detect_agents();
+                if self.agent.available.is_empty() {
+                    self.show_agent = true;
+                    self.agent.state = AgentState::NoAgent;
+                } else {
+                    self.open_palette(PaletteMode::AgentPicker);
+                }
+            }
             ToggleWordWrap => {
                 let on = !self.word_wrap();
                 self.settings.word_wrap = Some(on);
@@ -697,7 +998,11 @@ impl App {
             }
             ToggleToolbar => self.settings.toolbar = Some(!self.toolbar_visible()),
             ToggleSelectMode => {
-                self.select_mode = !self.select_mode;
+                self.mods.shift = if self.mods.select_mode() {
+                    Latch::Off
+                } else {
+                    Latch::Locked
+                };
                 if !self.editors.is_empty() {
                     self.focus = Focus::Editor;
                 }
@@ -778,6 +1083,29 @@ impl App {
         if self.editors.is_empty() {
             return;
         }
+        // Clipboard on a box selection works per line.
+        if self.editors[self.active].block.is_some() {
+            match cmd {
+                Copy | Cut => {
+                    let e = &mut self.editors[self.active];
+                    let text = e.box_text();
+                    if cmd == Cut && !e.block.is_some_and(|b| b.is_carets()) {
+                        e.box_delete();
+                    }
+                    self.clipboard.set(text, false);
+                    return;
+                }
+                Paste => {
+                    let text = self.clipboard.get();
+                    let e = &mut self.editors[self.active];
+                    e.box_paste(&text);
+                    e.scroll_into_view();
+                    return;
+                }
+                Undo | Redo => {}
+                _ => self.editors[self.active].box_clear(),
+            }
+        }
         if cmd == Paste {
             let whole = self.clipboard.whole_line;
             let text = self.clipboard.get();
@@ -818,7 +1146,9 @@ impl App {
         }
         e.scroll_into_view();
         if let Some((text, whole)) = clip {
-            self.select_mode = false;
+            if self.mods.select_mode() {
+                self.mods.shift = Latch::Off;
+            }
             self.clipboard.set(text, whole);
         }
     }
@@ -1020,6 +1350,35 @@ impl App {
                 names.dedup();
                 (names, Vec::new())
             }
+            PaletteMode::AgentModels => {
+                // Free models first: they need no account.
+                let mut models = self.agent.models.clone();
+                models.sort_by_key(|(v, _)| !is_free_model(v));
+                models
+                    .into_iter()
+                    .map(|(v, name)| {
+                        let hint = if is_free_model(&v) {
+                            format!("{name} · free")
+                        } else {
+                            name
+                        };
+                        (v, hint)
+                    })
+                    .unzip()
+            }
+            PaletteMode::AgentPicker => self
+                .agent
+                .available
+                .iter()
+                .map(|a| {
+                    let hint = if a.free {
+                        "free, no account"
+                    } else {
+                        "may need sign-in"
+                    };
+                    (a.name.clone(), hint.to_string())
+                })
+                .unzip(),
             PaletteMode::GotoLine | PaletteMode::SaveAs => (Vec::new(), Vec::new()),
         };
         let mut input = String::new();
@@ -1183,6 +1542,19 @@ impl App {
                 if let Some(t) = chosen {
                     self.set_theme(&t);
                 }
+            }
+            PaletteMode::AgentModels => {
+                if let Some(v) = chosen {
+                    self.agent.set_model(&v);
+                }
+                self.focus = Focus::Agent;
+            }
+            PaletteMode::AgentPicker => {
+                if let Some(s) = p.filtered.get(p.selected) {
+                    self.agent.use_agent(s.index);
+                }
+                self.show_agent = true;
+                self.focus = Focus::Agent;
             }
             PaletteMode::Languages => {
                 if let (Some(name), Some(e)) = (chosen, self.editors.get_mut(self.active))
@@ -1497,6 +1869,9 @@ impl App {
                             .clamp(0, n.saturating_sub(1) as isize)
                             as usize;
                     }
+                } else if l.agent_panel.contains(pos) {
+                    let a = &mut self.agent;
+                    a.scroll = (a.scroll as isize - d).max(0) as usize;
                 } else if l.sidebar.contains(pos) {
                     let max = self
                         .explorer
@@ -1541,19 +1916,36 @@ impl App {
         count
     }
 
+    pub fn run_tool(&mut self, tool: Tool) {
+        match tool {
+            Tool::Cmd(c) => {
+                self.run(c);
+                self.mods.spend();
+            }
+            Tool::Key(k) => self.press(k),
+            Tool::Mod(m) => self.mods.tap(m),
+            Tool::BoxMode => {
+                if self.mods.box_mode() {
+                    self.mods.alt = Latch::Off;
+                    self.mods.shift = Latch::Off;
+                } else {
+                    self.mods.alt = Latch::Locked;
+                    self.mods.shift = Latch::Locked;
+                    if !self.editors.is_empty() {
+                        self.focus = Focus::Editor;
+                    }
+                }
+            }
+            Tool::Page => self.toolbar_page ^= 1,
+        }
+    }
+
     fn mouse_down(&mut self, pos: Position, mods: KeyModifiers) {
         let l = self.layout.clone();
         // The touch toolbar works on top of everything (it is how you press
         // Esc or arrows in a dialog or palette on a phone).
-        if l.toolbar_next.contains(pos) {
-            self.toolbar_page += 1;
-            return;
-        }
         if let Some((_, tool)) = l.toolbar.iter().find(|(r, _)| r.contains(pos)) {
-            match *tool {
-                Tool::Cmd(c) => self.run(c),
-                Tool::Key(k) => self.press(k),
-            }
+            self.run_tool(*tool);
             return;
         }
         if let Some(d) = &self.dialog {
@@ -1589,6 +1981,18 @@ impl App {
             self.show_sidebar = false;
             if self.focus == Focus::Explorer && !self.editors.is_empty() {
                 self.focus = Focus::Editor;
+            }
+            return;
+        }
+        if l.agent_panel.contains(pos) {
+            if let Some((_, t)) = l.agent_targets.iter().find(|(r, _)| r.contains(pos)) {
+                self.agent_target(t.clone());
+            } else {
+                self.focus = Focus::Agent;
+                if l.agent_input.contains(pos) {
+                    // Tap in the input: move the caret to the end (simple and predictable on touch).
+                    self.agent.cursor = self.agent.input.chars().count();
+                }
             }
             return;
         }
@@ -1682,8 +2086,26 @@ impl App {
             let count = self.click_count(pos);
             let in_gutter = l.gutter.contains(pos);
             let Some(idx) = self.idx_at(pos) else { return };
-            let shift = mods.contains(KeyModifiers::SHIFT) || self.select_mode;
+            let shift = mods.contains(KeyModifiers::SHIFT) || self.mods.shift.on();
+            let alt = mods.contains(KeyModifiers::ALT) || self.mods.alt.on();
+            let point = self.point_at(pos);
+            self.mods.spend();
             let Some(e) = self.editor_mut() else { return };
+            if alt && !in_gutter {
+                // Alt+click / Alt+drag (or a tap in box mode): box selection
+                // from the existing box anchor, or from the caret.
+                if let Some((line, col)) = point {
+                    let _ = (shift, count);
+                    let (al, ac) = match e.block {
+                        Some(b) => (b.anchor_line, b.anchor_col),
+                        None => (e.cursor().0, e.cursor_display_col()),
+                    };
+                    e.box_to(al, ac, line, col);
+                }
+                self.drag = Some(Drag::Box);
+                return;
+            }
+            e.box_clear();
             if in_gutter {
                 let (line, _) = e.doc.pos(idx);
                 let start = e.doc.line_start(line);
@@ -1738,6 +2160,20 @@ impl App {
                     e.sel = Selection::new(e.sel.anchor, idx);
                 }
             }
+            Some(Drag::Box) => {
+                let clamped = Position::new(
+                    pos.x
+                        .clamp(l.text.x, l.text.x + l.text.width.saturating_sub(1)),
+                    pos.y
+                        .clamp(l.text.y, l.text.y + l.text.height.saturating_sub(1)),
+                );
+                if let Some((line, col)) = self.point_at(clamped)
+                    && let Some(e) = self.editor_mut()
+                    && let Some(b) = e.block
+                {
+                    e.box_to(b.anchor_line, b.anchor_col, line, col);
+                }
+            }
             Some(Drag::Scrollbar) | Some(Drag::Minimap) => {
                 let area = if self.drag == Some(Drag::Scrollbar) {
                     l.scrollbar
@@ -1759,6 +2195,18 @@ impl App {
         }
     }
 
+    /// (line, display column) under a screen position; the column may lie
+    /// past the end of the line (virtual space, for box selection).
+    fn point_at(&self, pos: Position) -> Option<(usize, usize)> {
+        let l = &self.layout;
+        let e = self.editor()?;
+        let row = pos.y.checked_sub(l.text.y)? as usize;
+        let x = pos.x.saturating_sub(l.text.x) as usize + e.scroll_col;
+        let rows = e.visual_rows(row + 1);
+        let &(line, _, seg, _) = rows.get(row).or(rows.last())?;
+        Some((line, seg.dstart + x.saturating_sub(seg.indent)))
+    }
+
     /// Document char index under a screen position in the text area.
     fn idx_at(&self, pos: Position) -> Option<usize> {
         let l = &self.layout;
@@ -1775,18 +2223,314 @@ impl App {
     }
 }
 
-fn is_movement(code: KeyCode) -> bool {
-    matches!(
-        code,
-        KeyCode::Left
-            | KeyCode::Right
-            | KeyCode::Up
-            | KeyCode::Down
-            | KeyCode::Home
-            | KeyCode::End
-            | KeyCode::PageUp
-            | KeyCode::PageDown
-    )
+/// OpenCode's free models: Big Pickle and the "-free" variants.
+pub fn is_free_model(value: &str) -> bool {
+    value.contains("free") || value.ends_with("big-pickle")
+}
+
+impl App {
+    // ================================================================ agent
+
+    /// Drain agent messages and act on them. Returns true if anything changed.
+    pub fn pump_agent(&mut self) -> bool {
+        let (events, changed) = self.agent.poll();
+        for ev in events {
+            match ev {
+                AgentEvent::FileChanged { path, diffs } => self.agent_file_changed(&path, &diffs),
+                AgentEvent::ReadFile {
+                    rpc_id,
+                    path,
+                    line,
+                    limit,
+                } => {
+                    let text = match self
+                        .editors
+                        .iter()
+                        .find(|e| e.doc.path.as_deref() == Some(path.as_path()))
+                    {
+                        Some(e) => Some(e.doc.rope.to_string()),
+                        None => std::fs::read_to_string(&path).ok(),
+                    };
+                    match text {
+                        Some(t) => self.agent.respond_read(rpc_id, &t, line, limit),
+                        None => self
+                            .agent
+                            .respond_error(rpc_id, &format!("cannot read {}", path.display())),
+                    }
+                }
+                AgentEvent::WriteFile {
+                    rpc_id,
+                    path,
+                    content,
+                } => {
+                    let old = std::fs::read_to_string(&path).ok();
+                    match std::fs::write(&path, &content) {
+                        Ok(()) => {
+                            self.agent.respond(rpc_id, serde_json::Value::Null);
+                            let diffs = vec![(old, content)];
+                            self.agent_file_changed(&path, &diffs);
+                        }
+                        Err(e) => self.agent.respond_error(rpc_id, &e.to_string()),
+                    }
+                }
+                AgentEvent::TurnEnded => {
+                    self.explorer.refresh();
+                    self.project_files = None;
+                }
+            }
+        }
+        changed
+    }
+
+    /// Keep animating while the agent works (spinners, elapsed time).
+    pub fn agent_animating(&self) -> bool {
+        self.agent.is_working()
+    }
+
+    /// An agent changed `path` on disk: show it in the editor as an undoable
+    /// change with change bars, so you can review it (and Ctrl+Z it).
+    fn agent_file_changed(&mut self, path: &Path, diffs: &[(Option<String>, String)]) {
+        let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        let Ok(new) = std::fs::read_to_string(&path) else {
+            return; // deleted or moved: the explorer refresh at the end of the turn shows it
+        };
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if let Some(e) = self
+            .editors
+            .iter_mut()
+            .find(|e| e.doc.path.as_deref() == Some(path.as_path()))
+        {
+            if e.doc.is_dirty() {
+                self.toast(
+                    format!("{name} changed on disk; your unsaved edits were kept"),
+                    ToastKind::Error,
+                );
+                return;
+            }
+            e.apply_external(&new);
+        } else {
+            // Rebuild what the file looked like before the agent's edit, so
+            // the change bars and undo show exactly what the agent did.
+            let mut before = new.clone();
+            for (old, newer) in diffs.iter().rev() {
+                match old {
+                    None => before = String::new(),
+                    Some(o) if !newer.is_empty() && before.contains(newer.as_str()) => {
+                        before = before.replacen(newer.as_str(), o, 1);
+                    }
+                    _ => {}
+                }
+            }
+            let mut doc = Document::from_text(&before, Some(path.clone()));
+            doc.saved_text = before.replace("\r\n", "\n");
+            let mut ed = Editor::new(doc);
+            ed.apply_external(&new);
+            self.editors.push(ed);
+            if self.editors.len() == 1 {
+                self.active = 0;
+            }
+        }
+        self.toast(format!("✦ Agent edited {name}"), ToastKind::Success);
+    }
+
+    /// Send what is in the agent input box.
+    pub fn agent_send(&mut self) {
+        let text = std::mem::take(&mut self.agent.input);
+        self.agent.cursor = 0;
+        if text.trim().is_empty() {
+            return;
+        }
+        // The agent reads files from disk: save your work first.
+        let mut saved = 0;
+        for e in &mut self.editors {
+            if e.doc.is_dirty() && e.doc.path.is_some() && e.doc.save().is_ok() {
+                saved += 1;
+            }
+        }
+        if saved > 0 {
+            self.toast(
+                format!("Saved {saved} file(s) so the agent sees them"),
+                ToastKind::Info,
+            );
+        }
+        let context = self.agent_context();
+        self.agent.prompt(&text, context);
+    }
+
+    /// The open file (and selection) as ACP context blocks.
+    fn agent_context(&self) -> Vec<serde_json::Value> {
+        let Some(e) = self.editor() else {
+            return Vec::new();
+        };
+        let Some(path) = e.doc.path.as_ref() else {
+            return Vec::new();
+        };
+        let uri = agent::file_uri(path);
+        let mut blocks = vec![serde_json::json!({
+            "type": "resource_link", "uri": uri, "name": e.doc.name()
+        })];
+        if !e.sel.is_empty() {
+            let (sl, _) = e.doc.pos(e.sel.start());
+            let (el, _) = e.doc.pos(e.sel.end());
+            let text = e.selected_text();
+            if self.agent.embedded_context {
+                blocks.push(serde_json::json!({
+                    "type": "resource",
+                    "resource": { "uri": format!("{uri}#L{}-{}", sl + 1, el + 1), "mimeType": "text/plain", "text": text }
+                }));
+            } else {
+                blocks.push(serde_json::json!({
+                    "type": "text",
+                    "text": format!("Selected lines {}-{} of {}:\n```\n{text}\n```", sl + 1, el + 1, e.doc.name())
+                }));
+            }
+        }
+        blocks
+    }
+
+    /// Short description of the context that will be attached (for the chip).
+    pub fn agent_context_label(&self) -> Option<String> {
+        let e = self.editor()?;
+        e.doc.path.as_ref()?;
+        let name = e.doc.name();
+        if e.sel.is_empty() {
+            Some(name)
+        } else {
+            let (sl, _) = e.doc.pos(e.sel.start());
+            let (el, _) = e.doc.pos(e.sel.end());
+            Some(format!("{name}:{}-{}", sl + 1, el + 1))
+        }
+    }
+
+    fn agent_target(&mut self, t: AgentTarget) {
+        match t {
+            AgentTarget::OpenFile(p, line) => {
+                self.open_file(&p);
+                if let (Some(l), Some(e)) = (line, self.editor_mut()) {
+                    e.goto_line(l.saturating_sub(1) as usize);
+                }
+                if self.compact {
+                    self.show_agent = false;
+                }
+            }
+            AgentTarget::Permission(i, opt) => self.agent.choose(i, Some(&opt)),
+            AgentTarget::Install => self.agent.install(),
+            AgentTarget::Retry => {
+                self.agent.available = agent::detect_agents();
+                if self.agent.spec.is_none() {
+                    self.agent.spec = self.agent.available.first().cloned();
+                }
+                self.agent.stop();
+                self.agent.start();
+            }
+            AgentTarget::NewChat => self.run(Command::AgentNewChat),
+            AgentTarget::Close => {
+                self.show_agent = false;
+                self.focus = if self.editors.is_empty() {
+                    Focus::Explorer
+                } else {
+                    Focus::Editor
+                };
+            }
+            AgentTarget::Model => self.run(Command::AgentModel),
+            AgentTarget::PickAgent => self.run(Command::AgentPick),
+            AgentTarget::Stop => self.agent.cancel(),
+            AgentTarget::Send => {
+                self.focus = Focus::Agent;
+                self.agent_send();
+            }
+            AgentTarget::Suggest(text) => {
+                self.focus = Focus::Agent;
+                self.agent.input = text;
+                self.agent_send();
+            }
+        }
+    }
+
+    fn agent_key(&mut self, code: KeyCode, ctrl: bool, shift: bool, alt: bool) {
+        // Number keys answer a pending permission request.
+        if self.agent.input.is_empty()
+            && let KeyCode::Char(c @ '1'..='9') = code
+            && let Some(i) = self.agent.pending_permission()
+        {
+            let n = c as usize - '1' as usize;
+            let opt = match &self.agent.entries[i] {
+                agent::Entry::Permission(p) => p.options.get(n).map(|o| o.0.clone()),
+                _ => None,
+            };
+            if let Some(o) = opt {
+                self.agent.choose(i, Some(&o));
+            }
+            return;
+        }
+        let a = &mut self.agent;
+        match code {
+            KeyCode::Esc => {
+                if a.is_working() {
+                    a.cancel();
+                } else {
+                    self.focus = if self.editors.is_empty() {
+                        Focus::Explorer
+                    } else {
+                        Focus::Editor
+                    };
+                    if self.compact {
+                        self.show_agent = false;
+                    }
+                }
+            }
+            KeyCode::Enter if shift || alt => {
+                a.input.insert(byte_at(&a.input, a.cursor), '\n');
+                a.cursor += 1;
+            }
+            KeyCode::Enter => self.agent_send(),
+            KeyCode::Tab | KeyCode::BackTab => {
+                if !self.editors.is_empty() {
+                    self.focus = Focus::Editor;
+                }
+            }
+            KeyCode::Backspace if ctrl || alt => {
+                let before: String = a.input.chars().take(a.cursor).collect();
+                let trimmed = before.trim_end();
+                let cut = trimmed
+                    .rfind(char::is_whitespace)
+                    .map(|b| trimmed[..b + 1].chars().count())
+                    .unwrap_or(0);
+                let rest: String = a.input.chars().skip(a.cursor).collect();
+                a.input = format!("{}{rest}", before.chars().take(cut).collect::<String>());
+                a.cursor = cut;
+            }
+            KeyCode::Backspace => {
+                if a.cursor > 0 {
+                    let b = byte_at(&a.input, a.cursor - 1);
+                    a.input.remove(b);
+                    a.cursor -= 1;
+                }
+            }
+            KeyCode::Delete => {
+                if a.cursor < a.input.chars().count() {
+                    let b = byte_at(&a.input, a.cursor);
+                    a.input.remove(b);
+                }
+            }
+            KeyCode::Left => a.cursor = a.cursor.saturating_sub(1),
+            KeyCode::Right => a.cursor = (a.cursor + 1).min(a.input.chars().count()),
+            KeyCode::Home => a.cursor = 0,
+            KeyCode::End => a.cursor = a.input.chars().count(),
+            KeyCode::Up => a.scroll += 1,
+            KeyCode::Down => a.scroll = a.scroll.saturating_sub(1),
+            KeyCode::PageUp => a.scroll += 10,
+            KeyCode::PageDown => a.scroll = a.scroll.saturating_sub(10),
+            KeyCode::Char(c) if !ctrl && !alt => {
+                a.input.insert(byte_at(&a.input, a.cursor), c);
+                a.cursor += 1;
+            }
+            _ => {}
+        }
+    }
 }
 
 fn byte_at(s: &str, char_idx: usize) -> usize {

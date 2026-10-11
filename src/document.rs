@@ -188,6 +188,13 @@ impl Document {
         Ok(())
     }
 
+    /// Record that the buffer now matches the file on disk, without moving
+    /// the change-bar baseline (so edits made by an agent stay visible).
+    pub fn mark_saved(&mut self) {
+        self.commit();
+        self.saved_rev = self.rev;
+    }
+
     /// Flag the document as needing a save without changing its text
     /// (e.g. after switching line endings).
     pub fn mark_modified(&mut self) {

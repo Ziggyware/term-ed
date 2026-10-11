@@ -117,11 +117,31 @@ fn main() -> anyhow::Result<()> {
             continue;
         }
         if let Some(ms) = k.strip_prefix("wait:") {
-            std::thread::sleep(std::time::Duration::from_millis(ms.parse()?));
+            // Let background work (the agent) progress.
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(ms.parse()?);
+            while std::time::Instant::now() < until {
+                app.pump_agent();
+                term.draw(|f| termed::ui::draw(f, &mut app, true))?;
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+            continue;
+        }
+        if let Some(ms) = k.strip_prefix("idle:") {
+            // Wait (up to ms) until the agent finishes its turn.
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(ms.parse()?);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            while std::time::Instant::now() < until
+                && (app.agent.is_working() || app.agent.pending_permission().is_some())
+            {
+                app.pump_agent();
+                term.draw(|f| termed::ui::draw(f, &mut app, true))?;
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
             continue;
         }
         for ev in key(k) {
             app.handle_event(ev);
+            app.pump_agent();
             term.draw(|f| termed::ui::draw(f, &mut app, true))?;
         }
     }

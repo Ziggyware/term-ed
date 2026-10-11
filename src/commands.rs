@@ -54,6 +54,11 @@ pub enum Command {
     ToggleWordWrap,
     ToggleToolbar,
     ToggleSelectMode,
+    AgentToggle,
+    AgentNewChat,
+    AgentStop,
+    AgentModel,
+    AgentPick,
 }
 
 pub struct CommandInfo {
@@ -98,8 +103,8 @@ cmds! {
     Outdent, "Edit: Outdent Line", "Shift+Tab";
     MoveLineUp, "Edit: Move Line Up", "Alt+Up";
     MoveLineDown, "Edit: Move Line Down", "Alt+Down";
-    DuplicateLineDown, "Edit: Copy Line Down", "Alt+Shift+Down";
-    DuplicateLineUp, "Edit: Copy Line Up", "Alt+Shift+Up";
+    DuplicateLineDown, "Edit: Duplicate Line", "Ctrl+Shift+D";
+    DuplicateLineUp, "Edit: Duplicate Line Up", "";
     DeleteLine, "Edit: Delete Line", "Ctrl+Shift+K";
     InsertLineBelow, "Edit: Insert Line Below", "Ctrl+Enter";
     InsertLineAbove, "Edit: Insert Line Above", "Ctrl+Shift+Enter";
@@ -120,5 +125,10 @@ cmds! {
     ShowKeybindings, "Help: Keyboard Shortcuts", "Ctrl+K Ctrl+S";
     ToggleWordWrap, "View: Toggle Word Wrap", "Alt+Z";
     ToggleToolbar, "View: Toggle Touch Toolbar", "";
-    ToggleSelectMode, "Selection: Toggle Touch Selection Mode", "";
+    ToggleSelectMode, "Selection: Toggle Selection Mode (lock Shift)", "";
+    AgentToggle, "Agent: Open AI Agent Panel", "Ctrl+K A";
+    AgentNewChat, "Agent: New Chat", "";
+    AgentStop, "Agent: Stop", "Esc";
+    AgentModel, "Agent: Choose Model", "";
+    AgentPick, "Agent: Choose Agent", "";
 }
