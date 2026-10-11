@@ -73,6 +73,20 @@ termed adapts to phone terminals such as Termux, Blink, Termius and iSH. Below 8
 - Full mouse support: click, drag-select, double-click a word, triple-click a line, click the gutter to select a line, scroll, use tabs and the tree, drag the minimap or scrollbar, and resize the sidebar.
 - Large files stay responsive. Highlighting is incremental and runs within a time budget, so jumping to the end of a 100k-line file is instant: provisional colors appear first and exact colors fill in over the next frames.
 
+## Substrata: the same question, in WebGL
+
+![The evidence overlay of fifteen 2020–2026 claims, coloured by domain and filled by confidence](docs/webgl-mosaic.png)
+
+[`webgl/`](webgl/README.md) is a standalone WebGL2 page that takes one argument the editor kept running into and draws it seven ways: **clay keeps impressions, sand does not, and a liquid crystal decides the same thing with light instead of sediment.** Rock weathers to clay, clay holds a root, sand forgets a shell by the next tide; a cell of rod molecules imprints a wavefront and light reads it back with δ = 2π·Δn·d/λ.
+
+- **Seven modes, one shader shape.** Substrata (traces stamped into a memory field that decays), Director, Conoscope (a Jones-matrix polarising microscope, eye to the pupil), Hologram (phase recorded by a pixel grid and read back by diffraction), Crystal, Weathering, and Causal (dormant substrate → slow mechanism → drastic result).
+- **287 parameters, 264 of them live in the shader.** Packed into 96 of the 224 uniform vectors WebGL2 guarantees, generated into 274 rows of panel controls from a single registry, with presets, a command palette, a live shader reader, JSON export, share links and PNG capture. Everything visible is adjustable, and every knob that is not a physical quantity is marked `✱` artistic or `≈` approximate.
+- **It shows its evidence.** Fifteen claims dated 2020–2026 tile across the frame as an overlay — coloured by domain, filled by confidence, banded by their window of years — and the Field notes pane prints each one with the hinge that makes it interesting.
+- **No build, no dependencies, no network.** Plain ES modules and GLSL files; `node tools/validate.mjs` parses every assembled program without a GPU, and `node tools/smoke.mjs` boots the page in a headless DOM and drives it.
+
+![The twelve colour ramps, stop for stop](docs/webgl-ramps.png)
+
+
 ## Install
 
 ```sh
@@ -159,4 +173,11 @@ cargo clippy --all-targets
 # Render a frame to HTML, replaying keystrokes, taps and swipes:
 cargo run --example snapshot -- out.html 150x42 "Visual Studio Dark" . src/main.rs -- ctrl+p text:editor
 cargo run --example snapshot -- phone.html 46x30 "Visual Studio Dark" . src/main.rs -- tap:1,0 swipeup:20,10 resize:100x24
+
+# The WebGL page (webgl/): nothing to build, but the checkers are worth running
+cd webgl && npm install            # only the two checkers need this
+node tools/gen-globals.mjs         # params.js -> globals.glsl + claims.glsl
+node tools/validate.mjs            # assemble and parse all 14 programs without a GPU
+node tools/smoke.mjs               # boot the page in a headless DOM and drive every control
+node tools/shots.mjs               # redraw docs/webgl-*.png with the shader's own numbers
 ```
