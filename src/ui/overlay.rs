@@ -98,12 +98,14 @@ pub fn render_palette(buf: &mut Buffer, screen: Rect, app: &mut App) -> Option<P
     };
     let list_rows = match p.mode {
         PaletteMode::GotoLine | PaletteMode::SaveAs => 1,
+        PaletteMode::ApiKey(_) => 4,
         _ => (p.filtered.len() as u16)
             .clamp(1, 14)
             .min(screen.height.saturating_sub(top + 4 + reserved).max(1)),
     };
     let h = list_rows + 4;
     let r = Rect::new(x, top, w, h);
+    let key_title;
     let title = match p.mode {
         PaletteMode::Commands => "Command Palette",
         PaletteMode::Files => "Go to File",
@@ -113,6 +115,11 @@ pub fn render_palette(buf: &mut Buffer, screen: Rect, app: &mut App) -> Option<P
         PaletteMode::AgentModels => "Agent Model",
         PaletteMode::AgentPicker => "AI Agent",
         PaletteMode::SaveAs => "Save As",
+        PaletteMode::ApiKey(id) => {
+            let name = crate::providers::get(id).map(|p| p.name).unwrap_or(id);
+            key_title = format!("API Key · {name}");
+            &key_title
+        }
     };
     panel(buf, r, pal.accent, pal.popup_bg, Some(title));
 
@@ -126,6 +133,15 @@ pub fn render_palette(buf: &mut Buffer, screen: Rect, app: &mut App) -> Option<P
         PaletteMode::AgentModels => ("✦", "Choose a model (free ones first)"),
         PaletteMode::AgentPicker => ("✦", "Choose an AI agent"),
         PaletteMode::SaveAs => ("⤓", "path/relative/to/project"),
+        PaletteMode::ApiKey(_) => ("›", "paste your API key"),
+    };
+    // Keys are secrets: never draw them.
+    let masked;
+    let shown = if matches!(p.mode, PaletteMode::ApiKey(_)) {
+        masked = "•".repeat(p.input.chars().count());
+        &masked
+    } else {
+        &p.input
     };
     let iy = r.y + 1;
     let field = Rect::new(r.x + 2, iy, r.width.saturating_sub(4), 1);
@@ -142,7 +158,7 @@ pub fn render_palette(buf: &mut Buffer, screen: Rect, app: &mut App) -> Option<P
     let caret = input(
         buf,
         Rect::new(px, iy, field.right().saturating_sub(px + 1), 1),
-        &p.input,
+        shown,
         p.cursor,
         placeholder,
         pal.popup_fg,
@@ -175,6 +191,24 @@ pub fn render_palette(buf: &mut Buffer, screen: Rect, app: &mut App) -> Option<P
                 fgbg(pal.popup_dim, pal.popup_bg),
                 list.right(),
             );
+            return Some(caret);
+        }
+        PaletteMode::ApiKey(id) => {
+            let url = crate::providers::get(id).map(|p| p.key_url).unwrap_or("");
+            let text = format!(
+                "Get a key at {url} · Enter ↵ saves it to ~/.config/termed (only you can read it)"
+            );
+            let lines = wrap_text(&text, list.width.saturating_sub(3) as usize);
+            for (i, l) in lines.iter().take(list.height as usize).enumerate() {
+                put(
+                    buf,
+                    list.x + 2,
+                    list.y + i as u16,
+                    l,
+                    fgbg(pal.popup_dim, pal.popup_bg),
+                    list.right(),
+                );
+            }
             return Some(caret);
         }
         PaletteMode::SaveAs => {
@@ -233,6 +267,18 @@ pub fn render_palette(buf: &mut Buffer, screen: Rect, app: &mut App) -> Option<P
         };
         // Keyboard hints are noise on a phone and steal width from the label.
         let hint = if compact && matches!(p.mode, PaletteMode::Commands | PaletteMode::Files) {
+            String::new()
+        } else {
+            hint
+        };
+        // The label always shows in full when it fits; a long hint is cut.
+        let room = list.width.saturating_sub(width(&display) + 6) as usize;
+        let hint = if width(&hint) as usize > room {
+            ellipsize(&hint, room)
+        } else {
+            hint
+        };
+        let hint = if hint.chars().count() < 4 {
             String::new()
         } else {
             hint

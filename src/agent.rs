@@ -2,8 +2,9 @@
 //!
 //! termed is an ACP *client*: it launches an agent (OpenCode, Gemini CLI,
 //! Claude Code, Codex, ...) as a subprocess and talks JSON-RPC 2.0 over its
-//! stdin/stdout. Out of the box it uses OpenCode, whose free models need no
-//! account or API key, so the panel works with zero configuration.
+//! stdin/stdout. termed also has its own in-process agent (see
+//! `builtin_agent`) that runs on a choice of model providers, free by
+//! default, so the panel works with zero configuration everywhere.
 //!
 //! The protocol runs on a reader thread that forwards parsed messages over a
 //! channel; everything else happens on the UI thread in `poll()`.
@@ -18,6 +19,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use crate::providers::{self, Provider};
+
 /// How to launch an agent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentSpec {
@@ -26,30 +29,168 @@ pub struct AgentSpec {
     pub args: Vec<String>,
     /// Usable without an account or payment.
     pub free: bool,
-    /// termed's own in-process agent (no install needed).
-    pub builtin: bool,
+    /// termed's own in-process agent on this provider (no install needed).
+    pub builtin: Option<&'static str>,
+    /// One-line hint for the agent picker.
+    pub note: String,
 }
 
-/// termed's built-in agent: free models, nothing to install. Works on
-/// Termux/Android, where OpenCode can't be installed.
-pub fn builtin_spec() -> AgentSpec {
-    AgentSpec {
-        name: "termed AI".into(),
-        program: String::new(),
-        args: Vec::new(),
-        free: true,
-        builtin: true,
+impl AgentSpec {
+    /// Stable id remembered in the config file.
+    pub fn id(&self) -> String {
+        match self.builtin {
+            Some(p) => format!("builtin:{p}"),
+            None => self.name.clone(),
+        }
+    }
+
+    /// The provider of a built-in agent.
+    pub fn provider(&self) -> Option<&'static Provider> {
+        self.builtin.and_then(providers::get)
     }
 }
 
-/// Known ACP agents, in order of preference. OpenCode comes first because
-/// its bundled free models work without signing in.
-const KNOWN: &[(&str, &str, &[&str], bool)] = &[
-    ("OpenCode", "opencode", &["acp"], true),
-    ("Gemini CLI", "gemini", &["--acp"], false),
-    ("Claude Code", "claude-agent-acp", &[], false),
-    ("Claude Code", "claude-code-acp", &[], false),
-    ("Codex", "codex-acp", &[], false),
+/// termed's built-in agent on its default provider: free models, nothing to
+/// install. Works on Termux/Android, where most agents can't be installed.
+pub fn builtin_spec() -> AgentSpec {
+    builtin_on(&providers::PROVIDERS[0])
+}
+
+pub fn builtin_on(p: &'static Provider) -> AgentSpec {
+    AgentSpec {
+        name: if p.id == "kilo" {
+            "termed AI".into()
+        } else {
+            p.name.into()
+        },
+        program: String::new(),
+        args: Vec::new(),
+        free: !p.needs_key,
+        builtin: Some(p.id),
+        note: format!("built-in · {}", p.note),
+    }
+}
+
+/// Known ACP agents, in order of preference: (name, program, args, free,
+/// note). OpenCode comes first because its bundled free models work without
+/// signing in. Programs are the names their installers put on PATH.
+const KNOWN: &[(&str, &str, &[&str], bool, &str)] = &[
+    (
+        "OpenCode",
+        "opencode",
+        &["acp"],
+        true,
+        "free models, no account",
+    ),
+    ("Gemini CLI", "gemini", &["--acp"], false, "Google account"),
+    (
+        "Qwen Code",
+        "qwen",
+        &["--acp"],
+        false,
+        "OpenAI-compatible key",
+    ),
+    (
+        "Claude Code",
+        "claude-agent-acp",
+        &[],
+        false,
+        "Claude plan or key",
+    ),
+    (
+        "Claude Code",
+        "claude-code-acp",
+        &[],
+        false,
+        "Claude plan or key",
+    ),
+    ("Codex", "codex-acp", &[], false, "ChatGPT plan or key"),
+    (
+        "GitHub Copilot",
+        "copilot",
+        &["--acp"],
+        false,
+        "Copilot plan, free tier",
+    ),
+    ("Cline", "cline", &["--acp"], false, "Cline account or key"),
+    (
+        "Kilo Code",
+        "kilo",
+        &["acp"],
+        true,
+        "free models, Kilo account",
+    ),
+    ("Goose", "goose", &["acp"], false, "your own provider keys"),
+    ("Cursor", "cursor-agent", &["acp"], false, "Cursor account"),
+    ("Auggie", "auggie", &["--acp"], false, "Augment account"),
+    ("Grok", "grok", &["agent", "stdio"], false, "xAI account"),
+    (
+        "Factory Droid",
+        "droid",
+        &["exec", "--output-format", "acp-daemon"],
+        false,
+        "Factory account",
+    ),
+    ("Kimi CLI", "kimi", &["acp"], false, "Moonshot account"),
+    ("Devin", "devin", &["acp"], false, "Devin account"),
+    ("Mistral Vibe", "vibe-acp", &[], false, "Mistral API key"),
+    (
+        "Junie",
+        "junie",
+        &["--acp=true"],
+        false,
+        "JetBrains account",
+    ),
+    ("Qoder", "qodercli", &["--acp"], false, "Qoder account"),
+    ("Stakpak", "stakpak", &["acp"], false, "Stakpak account"),
+    (
+        "VT Code",
+        "vtcode",
+        &["acp"],
+        false,
+        "your own provider keys",
+    ),
+];
+
+/// Agents that can run straight from npm through `npx` when not installed:
+/// (name, package, args, works on Android). Only pure-JavaScript packages
+/// run on Termux; the others ship native binaries for desktop platforms.
+const NPX: &[(&str, &str, &[&str], bool, &str)] = &[
+    (
+        "Gemini CLI",
+        "@google/gemini-cli",
+        &["--acp"],
+        true,
+        "Google account",
+    ),
+    (
+        "Qwen Code",
+        "@qwen-code/qwen-code",
+        &["--acp"],
+        true,
+        "OpenAI-compatible key",
+    ),
+    (
+        "Claude Code",
+        "@agentclientprotocol/claude-agent-acp",
+        &[],
+        false,
+        "Claude plan or key",
+    ),
+    (
+        "Codex",
+        "@agentclientprotocol/codex-acp",
+        &[],
+        false,
+        "ChatGPT plan or key",
+    ),
+    (
+        "GitHub Copilot",
+        "@github/copilot",
+        &["--acp"],
+        false,
+        "Copilot plan, free tier",
+    ),
 ];
 
 /// Look a program up on PATH (plus npm's global bin, where installs land).
@@ -75,41 +216,52 @@ fn base_name(p: &str) -> String {
         .unwrap_or_else(|| p.to_string())
 }
 
-/// Agents available on this machine. `TERMED_AGENT="cmd args"` overrides.
+/// Agents available on this machine. `TERMED_AGENT="cmd args"` (or
+/// `builtin`, or `builtin:<provider>`) overrides; otherwise the agent picked
+/// last time comes first.
 pub fn detect_agents() -> Vec<AgentSpec> {
     let mut out = Vec::new();
     let chosen = std::env::var("TERMED_AGENT").ok();
-    if chosen.as_deref() == Some("builtin") {
-        out.push(builtin_spec());
-    } else if let Some(cmd) = chosen {
-        let mut parts = cmd.split_whitespace().map(String::from);
-        if let Some(program) = parts.next() {
-            let args: Vec<String> = parts.collect();
-            // `python3 my_agent.py` is better named after the script.
-            let shown = match args.first() {
-                Some(a)
-                    if ["python", "python3", "node", "npx", "bun", "deno", "uvx"]
-                        .contains(&base_name(&program).as_str()) =>
-                {
-                    base_name(a)
-                }
-                _ => base_name(&program),
-            };
-            out.push(AgentSpec {
-                name: shown,
-                program,
-                args,
-                free: false,
-                builtin: false,
-            });
+    match chosen.as_deref() {
+        Some("builtin") => out.push(builtin_spec()),
+        Some(b) if b.starts_with("builtin:") => out.push(
+            providers::get(&b[8..])
+                .map(builtin_on)
+                .unwrap_or_else(builtin_spec),
+        ),
+        Some(cmd) => {
+            let mut parts = cmd.split_whitespace().map(String::from);
+            if let Some(program) = parts.next() {
+                let args: Vec<String> = parts.collect();
+                // `python3 my_agent.py` is better named after the script.
+                let shown = match args.first() {
+                    Some(a)
+                        if ["python", "python3", "node", "npx", "bun", "deno", "uvx"]
+                            .contains(&base_name(&program).as_str()) =>
+                    {
+                        base_name(a)
+                    }
+                    _ => base_name(&program),
+                };
+                out.push(AgentSpec {
+                    name: shown,
+                    program,
+                    args,
+                    free: false,
+                    builtin: None,
+                    note: "from TERMED_AGENT".into(),
+                });
+            }
         }
+        None => {}
     }
-    // On Android (Termux) the external agents' npm packages don't install,
-    // so the built-in agent comes first there.
-    if cfg!(target_os = "android") && out.is_empty() {
+    let android = cfg!(target_os = "android");
+    // On Android (Termux) most agents' npm packages don't install, so the
+    // built-in agent comes first there.
+    if android && out.is_empty() {
         out.push(builtin_spec());
     }
-    for (name, program, args, free) in KNOWN {
+    for (name, program, args, free, note) in KNOWN {
         if let Some(path) = which(program) {
             if out.iter().any(|s: &AgentSpec| s.name == *name) {
                 continue;
@@ -119,12 +271,40 @@ pub fn detect_agents() -> Vec<AgentSpec> {
                 program: path.to_string_lossy().into_owned(),
                 args: args.iter().map(|s| s.to_string()).collect(),
                 free: *free,
-                builtin: false,
+                builtin: None,
+                note: note.to_string(),
             });
         }
     }
-    if !out.iter().any(|s| s.builtin) {
-        out.push(builtin_spec());
+    for p in providers::PROVIDERS.iter().filter(|p| p.configured()) {
+        if !out.iter().any(|s| s.builtin == Some(p.id)) {
+            out.push(builtin_on(p));
+        }
+    }
+    if let Some(npx) = which("npx") {
+        for (name, package, args, on_android, note) in NPX {
+            if (android && !on_android) || out.iter().any(|s| s.name == *name) {
+                continue;
+            }
+            let mut a = vec!["-y".to_string(), package.to_string()];
+            a.extend(args.iter().map(|s| s.to_string()));
+            out.push(AgentSpec {
+                name: name.to_string(),
+                program: npx.to_string_lossy().into_owned(),
+                args: a,
+                free: false,
+                builtin: None,
+                note: format!("{note} · via npx"),
+            });
+        }
+    }
+    // The agent picked last time goes first (unless TERMED_AGENT is set).
+    if chosen.is_none()
+        && let Some(saved) = providers::saved_agent()
+        && let Some(i) = out.iter().position(|s| s.id() == saved)
+    {
+        let s = out.remove(i);
+        out.insert(0, s);
     }
     out
 }
@@ -236,6 +416,7 @@ enum Pending {
     NewSession,
     Prompt,
     SetModel,
+    Authenticate,
     Other,
 }
 
@@ -250,9 +431,14 @@ pub struct Agent {
     model_config_id: String,
     pub agent_title: String,
     /// Tokens used / context size / cost of the session.
-    pub usage: Option<(u64, u64, f64)>,
+    /// Tokens used, context size and cost (None when the agent gave no cost).
+    pub usage: Option<(u64, u64, Option<f64>)>,
     pub embedded_context: bool,
     pub auth_hint: Option<String>,
+    /// Sign-in methods the agent offers: (id, name, description).
+    pub auth_methods: Vec<(String, String, String)>,
+    /// The agent asked the user to sign in before a session can start.
+    pub needs_auth: bool,
     pub turn_started: Option<Instant>,
     pub install_log: Vec<String>,
     // UI state for the input box and transcript.
@@ -305,6 +491,8 @@ impl Agent {
             usage: None,
             embedded_context: false,
             auth_hint: None,
+            auth_methods: Vec::new(),
+            needs_auth: false,
             turn_started: None,
             install_log: Vec::new(),
             input: String::new(),
@@ -381,16 +569,29 @@ impl Agent {
             self.state = State::NoAgent;
             return;
         };
-        if spec.builtin {
+        if let Some(provider) = spec.builtin {
             let tx = self.tx.clone();
-            self.builtin_tx = Some(crate::builtin_agent::spawn(self.cwd.clone(), move |v| {
-                let _ = tx.send(Inbound::Message(v));
-            }));
+            self.builtin_tx = Some(crate::builtin_agent::spawn(
+                self.cwd.clone(),
+                provider,
+                move |v| {
+                    let _ = tx.send(Inbound::Message(v));
+                },
+            ));
             self.state = State::Starting;
             self.handshake();
             return;
         }
         let mut cmd = Command::new(&spec.program);
+        // Keys saved in termed also reach external agents (Gemini CLI reads
+        // GEMINI_API_KEY, Codex OPENAI_API_KEY, ...), unless already set.
+        for p in providers::PROVIDERS {
+            if let (Some(var), Some(key)) = (p.key_envs.first(), providers::saved_key(p.id))
+                && std::env::var_os(var).is_none()
+            {
+                cmd.env(var, key);
+            }
+        }
         cmd.args(&spec.args)
             .current_dir(&self.cwd)
             .stdin(Stdio::piped())
@@ -465,7 +666,10 @@ impl Agent {
     /// Switch to another detected agent (restarts the session).
     pub fn use_agent(&mut self, idx: usize) {
         if let Some(spec) = self.available.get(idx).cloned() {
+            let _ = providers::save_agent(&spec.id());
             self.stop();
+            self.needs_auth = false;
+            self.usage = None;
             self.spec = Some(spec);
             self.models.clear();
             self.model = None;
@@ -670,6 +874,26 @@ impl Agent {
     pub fn respond_error(&mut self, id: Value, message: &str) {
         self.write(
             json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32603, "message": message } }),
+        );
+    }
+
+    /// Sign in with one of the agent's methods, then open the session.
+    pub fn authenticate(&mut self, method: usize) {
+        let Some((id, name, _)) = self.auth_methods.get(method).cloned() else {
+            return;
+        };
+        if !self.running() {
+            self.start();
+        }
+        self.state = State::Starting;
+        self.entries.push(Entry::Notice {
+            text: format!("Signing in with {name}… follow any link or prompt it opens."),
+            error: false,
+        });
+        self.request(
+            "authenticate",
+            json!({ "methodId": id }),
+            Pending::Authenticate,
         );
     }
 
@@ -906,13 +1130,22 @@ impl Agent {
                     .pointer("/agentCapabilities/promptCapabilities/embeddedContext")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                self.auth_hint = r
+                self.auth_methods = r
                     .get("authMethods")
                     .and_then(Value::as_array)
-                    .and_then(|a| a.first())
-                    .and_then(|m| m.get("description").or(m.get("name")))
-                    .and_then(Value::as_str)
-                    .map(String::from);
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|m| {
+                        let s =
+                            |k: &str| m.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+                        let id = s("id");
+                        (!id.is_empty()).then(|| (id, s("name"), s("description")))
+                    })
+                    .collect();
+                self.auth_hint = self
+                    .auth_methods
+                    .first()
+                    .map(|(_, n, d)| if d.is_empty() { n.clone() } else { d.clone() });
                 self.new_session();
             }
             Pending::NewSession => {
@@ -967,6 +1200,11 @@ impl Agent {
                 events.push(AgentEvent::TurnEnded);
             }
             Pending::SetModel => self.read_models(&r),
+            Pending::Authenticate => {
+                self.needs_auth = false;
+                self.state = State::Starting;
+                self.new_session();
+            }
             Pending::Other => {}
         }
     }
@@ -981,13 +1219,19 @@ impl Agent {
         match kind {
             Pending::Initialize | Pending::NewSession => {
                 let mut text = format!("Could not start a session: {msg}");
-                if code == -32000
-                    && let Some(h) = &self.auth_hint
-                {
-                    text = format!("{} needs you to sign in: {h}", self.name());
+                if code == -32000 || msg.to_lowercase().contains("auth") {
+                    if !self.auth_methods.is_empty() {
+                        self.needs_auth = true;
+                        text = format!("{} needs you to sign in. Choose how:", self.name());
+                    } else if let Some(h) = &self.auth_hint {
+                        text = format!("{} needs you to sign in: {h}", self.name());
+                    }
                 }
                 self.state = State::Failed(text);
-                self.queued = None;
+            }
+            Pending::Authenticate => {
+                self.needs_auth = true;
+                self.state = State::Failed(format!("Sign-in failed: {msg}"));
             }
             Pending::Prompt => {
                 self.state = State::Ready;
@@ -1250,10 +1494,7 @@ impl Agent {
             }
             "usage_update" => {
                 let n = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
-                let cost = u
-                    .pointer("/cost/amount")
-                    .and_then(Value::as_f64)
-                    .unwrap_or(0.0);
+                let cost = u.pointer("/cost/amount").and_then(Value::as_f64);
                 self.usage = Some((n("used"), n("size"), cost));
             }
             "notice" => {
@@ -1263,7 +1504,16 @@ impl Agent {
                     .unwrap_or("")
                     .to_string();
                 let error = u.get("severity").and_then(Value::as_str) == Some("error");
-                self.entries.push(Entry::Notice { text: title, error });
+                // The same problem reported again (e.g. on connect and on
+                // send) only needs to show once in a row.
+                let repeat = matches!(self.entries.last(),
+                    Some(Entry::Notice { text, .. }) if *text == title)
+                    || matches!(self.entries.iter().rev().nth(1),
+                    Some(Entry::Notice { text, .. }) if *text == title)
+                        && matches!(self.entries.last(), Some(Entry::User(_)));
+                if !repeat {
+                    self.entries.push(Entry::Notice { text: title, error });
+                }
             }
             "config_option_update" => {
                 self.read_models(&json!({ "configOptions": u.get("configOptions") }))

@@ -59,6 +59,7 @@ pub enum Command {
     AgentStop,
     AgentModel,
     AgentPick,
+    AgentSetKey,
 }
 
 pub struct CommandInfo {
@@ -131,4 +132,5 @@ cmds! {
     AgentStop, "Agent: Stop", "Esc";
     AgentModel, "Agent: Choose Model", "";
     AgentPick, "Agent: Choose Agent", "";
+    AgentSetKey, "Agent: Set API Key", "";
 }

@@ -1,15 +1,19 @@
-//! termed's built-in coding agent: no install, no account, no API key.
+//! termed's built-in coding agent. It needs no install and, with the default
+//! provider, no account or API key.
 //!
-//! It talks to the free models of Kilo Gateway (an OpenAI-compatible API
-//! that allows anonymous use of its `:free` models, rate-limited per IP) and
-//! runs a small tool-using agent loop: list, read, search, edit and create
-//! files, and run commands (each command needs your approval).
+//! It runs a small tool-using agent loop (list, read, search, edit and create
+//! files, and run commands, each command with your approval) against a model
+//! provider from [`crate::providers`]. By default that is Kilo Gateway's free
+//! models (anonymous, rate-limited per IP). Ollama, OpenRouter, Gemini, Groq,
+//! Cerebras, Mistral, OpenAI, DeepSeek, xAI or any OpenAI-compatible server
+//! work the same way, and Claude goes through Anthropic's native Messages API.
 //!
-//! It is pure Rust, so it works anywhere termed runs — including Termux on
+//! It is pure Rust, so it works anywhere termed runs, including Termux on
 //! Android, where Node/Bun-based agents can't be installed. It speaks the same
 //! Agent Client Protocol messages as an external agent, only over in-process
 //! channels, so the agent panel treats it like any other ACP agent.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -20,19 +24,24 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-pub const GATEWAY: &str = "https://api.kilo.ai/api/gateway";
+use crate::providers::{self, Api, Provider};
 
-/// The API base (overridable for tests and self-hosted gateways).
-fn gateway() -> String {
-    std::env::var("TERMED_FREE_GATEWAY").unwrap_or_else(|_| GATEWAY.to_string())
-}
 /// Kilo's router across its free models.
 pub const DEFAULT_MODEL: &str = "kilo-auto/free";
 const MAX_STEPS: usize = 30;
+const ANTHROPIC_VERSION: &str = "2023-06-01";
+/// Server-side refusal fallbacks (`"fallbacks": "default"`).
+const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 
-/// Start the agent thread. `out` receives the JSON-RPC messages an external
-/// agent would print; the returned sender takes the messages we'd write to it.
-pub fn spawn(cwd: PathBuf, out: impl Fn(Value) + Send + Sync + 'static) -> Sender<Value> {
+/// Start the agent thread for `provider` (an id from [`providers::PROVIDERS`]).
+/// `out` receives the JSON-RPC messages an external agent would print; the
+/// returned sender takes the messages we'd write to it.
+pub fn spawn(
+    cwd: PathBuf,
+    provider: &str,
+    out: impl Fn(Value) + Send + Sync + 'static,
+) -> Sender<Value> {
+    let provider = providers::get(provider).unwrap_or(&providers::PROVIDERS[0]);
     let (to_agent, inbox) = channel::<Value>();
     let (work_tx, work_rx) = channel::<Value>();
     let (reply_tx, reply_rx) = channel::<Value>();
@@ -58,7 +67,7 @@ pub fn spawn(cwd: PathBuf, out: impl Fn(Value) + Send + Sync + 'static) -> Sende
     });
     let out: Arc<dyn Fn(Value) + Send + Sync> = Arc::new(out);
     std::thread::spawn(move || {
-        let mut w = Worker::new(cwd, out, reply_rx, cancel);
+        let mut w = Worker::new(cwd, provider, out, reply_rx, cancel);
         for msg in work_rx {
             w.handle(msg);
         }
@@ -93,97 +102,187 @@ fn http() -> ureq::Agent {
     cfg.build().new_agent()
 }
 
-/// Free, tool-capable models from the gateway (falls back to the router).
-pub fn free_models(http: &ureq::Agent) -> Vec<(String, String)> {
-    let mut out = vec![(
-        DEFAULT_MODEL.to_string(),
-        "Auto (best free model)".to_string(),
-    )];
-    let Ok(resp) = http.get(format!("{}/models", gateway())).call() else {
-        return out;
-    };
-    let Ok(text) = resp.into_body().read_to_string() else {
-        return out;
-    };
-    let Ok(v) = serde_json::from_str::<Value>(&text) else {
-        return out;
-    };
-    for m in v
-        .get("data")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let id = m.get("id").and_then(Value::as_str).unwrap_or("");
-        let tools = m
-            .get("supported_parameters")
-            .and_then(Value::as_array)
-            .is_some_and(|p| p.iter().any(|x| x == "tools"));
-        if id.ends_with(":free") && tools && id != DEFAULT_MODEL {
-            let name = m
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or(id)
-                .to_string();
-            out.push((id.to_string(), name));
-        }
-    }
-    out
+/// What the Anthropic models endpoint says a Claude model supports.
+#[derive(Clone, Copy, Debug)]
+struct ClaudeCaps {
+    adaptive: bool,
+    effort_high: bool,
+    max_out: u64,
 }
 
-fn tools_schema() -> Value {
-    let f = |name: &str, desc: &str, props: Value, req: &[&str]| {
-        json!({"type":"function","function":{"name":name,"description":desc,
-            "parameters":{"type":"object","properties":props,"required":req}}})
-    };
-    json!([
-        f(
+impl ClaudeCaps {
+    /// Used when the model isn't in the listing (e.g. set by hand).
+    fn guess(model: &str) -> Self {
+        let modern = [
+            "opus-5",
+            "fable-5",
+            "sonnet-5",
+            "opus-4-6",
+            "opus-4-7",
+            "opus-4-8",
+            "sonnet-4-6",
+        ]
+        .iter()
+        .any(|m| model.contains(m));
+        Self {
+            adaptive: modern,
+            effort_high: modern,
+            max_out: 64_000,
+        }
+    }
+}
+
+/// Models that accept `"fallbacks": "default"`.
+fn supports_fallbacks(model: &str) -> bool {
+    ["claude-opus-5", "claude-fable-5-1", "claude-sonnet-5-5"]
+        .iter()
+        .any(|m| model.starts_with(m))
+}
+
+fn get_json(
+    http: &ureq::Agent,
+    url: &str,
+    headers: &[(&str, String)],
+) -> Result<Value, (String, Option<u16>)> {
+    let mut req = http.get(url);
+    for (k, v) in headers {
+        req = req.header(*k, v);
+    }
+    let resp = req.call().map_err(|e| (e.to_string(), None))?;
+    let status = resp.status().as_u16();
+    let text = resp.into_body().read_to_string().unwrap_or_default();
+    if status != 200 {
+        return Err((providers::error_message(&text, status), Some(status)));
+    }
+    serde_json::from_str(&text).map_err(|e| (e.to_string(), Some(status)))
+}
+
+fn tool_specs() -> Vec<(&'static str, &'static str, Value, &'static [&'static str])> {
+    vec![
+        (
             "list_files",
             "List files in a directory of the project (recursive, respects .gitignore).",
             json!({"path":{"type":"string","description":"Directory relative to the project root; default '.'"}}),
-            &[]
+            &[],
         ),
-        f(
+        (
             "read_file",
             "Read a text file. Optionally a line range (1-based, inclusive).",
             json!({"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}}),
-            &["path"]
+            &["path"],
         ),
-        f(
+        (
             "search",
             "Search file contents with a regular expression. Returns file:line: text.",
             json!({"pattern":{"type":"string"},"path":{"type":"string","description":"Directory to search; default '.'"}}),
-            &["pattern"]
+            &["pattern"],
         ),
-        f(
+        (
             "edit_file",
             "Replace old_text with new_text in a file. old_text must match exactly once; include enough surrounding lines to make it unique.",
             json!({"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}}),
-            &["path", "old_text", "new_text"]
+            &["path", "old_text", "new_text"],
         ),
-        f(
+        (
             "write_file",
             "Create a file or overwrite it completely.",
             json!({"path":{"type":"string"},"content":{"type":"string"}}),
-            &["path", "content"]
+            &["path", "content"],
         ),
-        f(
+        (
             "run_command",
             "Run a shell command in the project root (the user must approve it). Use for builds and tests.",
             json!({"command":{"type":"string"}}),
-            &["command"]
+            &["command"],
         ),
-    ])
+    ]
+}
+
+/// OpenAI-style function tools.
+fn openai_tools() -> Value {
+    tool_specs()
+        .into_iter()
+        .map(|(name, desc, props, req)| {
+            json!({"type":"function","function":{"name":name,"description":desc,
+                "parameters":{"type":"object","properties":props,"required":req}}})
+        })
+        .collect()
+}
+
+/// Anthropic tools. Inputs stream as they are generated, so every input is
+/// parsed strictly and checked with [`validate_input`] before a tool runs.
+fn anthropic_tools() -> Value {
+    tool_specs()
+        .into_iter()
+        .map(|(name, desc, props, req)| {
+            json!({"name":name,"description":desc,"eager_input_streaming":true,
+                "input_schema":{"type":"object","properties":props,"required":req}})
+        })
+        .collect()
+}
+
+/// Check a tool input against its schema: an object, required keys present,
+/// and every known key of the declared type.
+fn validate_input(name: &str, input: &Value) -> Result<(), String> {
+    let Some(obj) = input.as_object() else {
+        return Err("input is not a JSON object".into());
+    };
+    let Some((_, _, props, req)) = tool_specs().into_iter().find(|t| t.0 == name) else {
+        return Err(format!("unknown tool {name}"));
+    };
+    for r in req {
+        if !obj.contains_key(*r) {
+            return Err(format!("missing required field {r}"));
+        }
+    }
+    for (k, v) in obj {
+        let ok = match props.pointer(&format!("/{k}/type")).and_then(Value::as_str) {
+            Some("string") => v.is_string(),
+            Some("integer") => v.is_u64() || v.is_i64(),
+            _ => true,
+        };
+        if !ok {
+            return Err(format!("field {k} has the wrong type"));
+        }
+    }
+    Ok(())
+}
+
+/// Drop the blocks a mid-output refusal fallback made stale: thinking,
+/// redacted thinking, tool calls and unknown internal blocks before the last
+/// `fallback` block. Text, the fallback markers and everything after stay.
+fn strip_before_fallback(blocks: Vec<Value>) -> Vec<Value> {
+    let ty = |b: &Value| {
+        b.get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let Some(last) = blocks.iter().rposition(|b| ty(b) == "fallback") else {
+        return blocks;
+    };
+    blocks
+        .into_iter()
+        .enumerate()
+        .filter(|(i, b)| *i >= last || matches!(ty(b).as_str(), "text" | "fallback"))
+        .map(|(_, b)| b)
+        .collect()
 }
 
 struct Worker {
     cwd: PathBuf,
+    provider: &'static Provider,
+    key: Option<String>,
     out: Arc<dyn Fn(Value) + Send + Sync>,
     replies: Receiver<Value>,
     cancel: Arc<AtomicBool>,
     http: ureq::Agent,
     model: String,
     models: Vec<(String, String)>,
+    /// Model ids that cost nothing (so busy ones can be swapped).
+    free_models: Vec<String>,
+    claude_caps: HashMap<String, ClaudeCaps>,
+    /// Conversation in the provider's own message format.
     history: Vec<Value>,
     next_id: u64,
     always_allow_commands: bool,
@@ -192,23 +291,35 @@ struct Worker {
 enum Step {
     Cancelled,
     Failed(String, Option<u16>),
+    /// The model declined or was cut off; the turn ends with this notice.
+    Stopped(String),
 }
 
 impl Worker {
     fn new(
         cwd: PathBuf,
+        provider: &'static Provider,
         out: Arc<dyn Fn(Value) + Send + Sync>,
         replies: Receiver<Value>,
         cancel: Arc<AtomicBool>,
     ) -> Self {
+        let env_model = if provider.id == "kilo" {
+            std::env::var("TERMED_FREE_MODEL").ok()
+        } else {
+            std::env::var("TERMED_MODEL").ok()
+        };
         Self {
             cwd,
+            provider,
+            key: provider.api_key(),
             out,
             replies,
             cancel,
             http: http(),
-            model: std::env::var("TERMED_FREE_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into()),
+            model: env_model.unwrap_or_default(),
             models: Vec::new(),
+            free_models: Vec::new(),
+            claude_caps: HashMap::new(),
             history: Vec::new(),
             next_id: 1000,
             always_allow_commands: false,
@@ -240,6 +351,189 @@ impl Worker {
         json!([{"id":"model","name":"Model","category":"model","type":"select","currentValue":self.model,"options":opts}])
     }
 
+    fn base(&self) -> String {
+        self.provider.base_url()
+    }
+
+    fn auth_headers(&self) -> Vec<(&'static str, String)> {
+        let mut h = Vec::new();
+        match self.provider.api {
+            Api::OpenAi => {
+                if let Some(k) = &self.key {
+                    h.push(("Authorization", format!("Bearer {k}")));
+                }
+                h.push(("HTTP-Referer", "https://github.com/Ziggyware/termed".into()));
+                h.push(("X-Title", "termed".into()));
+            }
+            Api::Anthropic => {
+                if let Some(k) = &self.key {
+                    h.push(("x-api-key", k.clone()));
+                }
+                h.push(("anthropic-version", ANTHROPIC_VERSION.into()));
+            }
+        }
+        h
+    }
+
+    /// Fill `models` from the provider; returns a problem to show, if any.
+    fn load_models(&mut self) -> Option<String> {
+        let p = self.provider;
+        if p.needs_key && self.key.is_none() {
+            return Some(self.key_hint());
+        }
+        let url = match p.api {
+            Api::OpenAi => format!("{}/models", self.base()),
+            Api::Anthropic => format!("{}/v1/models?limit=100", self.base()),
+        };
+        let listing = get_json(&self.http, &url, &self.auth_headers());
+        let mut models = Vec::new();
+        let mut free = Vec::new();
+        let problem = match listing {
+            Ok(v) => {
+                for m in v
+                    .get("data")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let id = m
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let name = m
+                        .get("display_name")
+                        .or(m.get("name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or(&id)
+                        .to_string();
+                    let tools = m.get("supported_parameters").and_then(Value::as_array);
+                    let has_tools = tools.is_none_or(|t| t.iter().any(|x| x == "tools"));
+                    match p.id {
+                        // Only the anonymous free models work on Kilo without a key.
+                        "kilo" if self.key.is_none() => {
+                            if id.ends_with(":free") && has_tools {
+                                free.push(id.clone());
+                                models.push((id, name));
+                            }
+                        }
+                        "kilo" | "openrouter" => {
+                            if has_tools {
+                                if id.ends_with(":free") {
+                                    free.push(id.clone());
+                                }
+                                models.push((id, name));
+                            }
+                        }
+                        _ if p.api == Api::Anthropic => {
+                            let caps = m.get("capabilities");
+                            let leaf = |path: &str| {
+                                caps.and_then(|c| c.pointer(path))
+                                    .and_then(|s| s.get("supported"))
+                                    .and_then(Value::as_bool)
+                            };
+                            let guess = ClaudeCaps::guess(&id);
+                            self.claude_caps.insert(
+                                id.clone(),
+                                ClaudeCaps {
+                                    adaptive: leaf("/thinking/types/adaptive")
+                                        .unwrap_or(guess.adaptive),
+                                    effort_high: leaf("/effort/high").unwrap_or(guess.effort_high),
+                                    max_out: m
+                                        .get("max_tokens")
+                                        .and_then(Value::as_u64)
+                                        .unwrap_or(guess.max_out),
+                                },
+                            );
+                            models.push((id, name));
+                        }
+                        _ => {
+                            if providers::is_chat_model(&id) {
+                                models.push((id.trim_start_matches("models/").to_string(), name));
+                            }
+                        }
+                    }
+                }
+                // Free ones first, the rest sorted.
+                models.sort_by_key(|(id, _)| (!free.contains(id), id.clone()));
+                None
+            }
+            Err((msg, status)) => Some(self.explain(&msg, status)),
+        };
+        // Routers that pick a model for you.
+        match p.id {
+            "kilo" => {
+                models.insert(0, (DEFAULT_MODEL.into(), "Auto (best free model)".into()));
+                free.insert(0, DEFAULT_MODEL.into());
+            }
+            "openrouter" => {
+                models.insert(
+                    0,
+                    ("openrouter/free".into(), "Auto (best free model)".into()),
+                );
+                free.insert(0, "openrouter/free".into());
+            }
+            _ => {}
+        }
+        if self.model.is_empty() {
+            self.model = p.pick_model(&models);
+        }
+        if !self.model.is_empty() && !models.iter().any(|(v, _)| *v == self.model) {
+            models.insert(0, (self.model.clone(), self.model.clone()));
+        }
+        self.models = models;
+        self.free_models = free;
+        if self.model.is_empty() && problem.is_none() {
+            return Some(match p.id {
+                "ollama" => {
+                    "Ollama has no models yet. Pull one first, e.g. `ollama pull qwen2.5-coder`."
+                        .into()
+                }
+                _ => format!("{} offered no models.", p.name),
+            });
+        }
+        problem
+    }
+
+    fn key_hint(&self) -> String {
+        let p = self.provider;
+        let env = p.key_envs.first().copied().unwrap_or("");
+        format!(
+            "{} needs an API key. Get one at {} and paste it with the command \"Agent: Set API Key\" (or set {env}).",
+            p.name, p.key_url
+        )
+    }
+
+    /// Turn an HTTP failure into advice.
+    fn explain(&self, msg: &str, status: Option<u16>) -> String {
+        let p = self.provider;
+        match status {
+            Some(401 | 403) if p.needs_key || self.key.is_some() => {
+                format!(
+                    "{} rejected the API key ({msg}). Paste a valid one with \"Agent: Set API Key\" (get keys at {}).",
+                    p.name, p.key_url
+                )
+            }
+            Some(401 | 403) => format!("{} refused the request ({msg}).", p.name),
+            Some(429) if p.id == "kilo" => format!(
+                "The free models' hourly limit was reached (200 requests per hour). Try again a bit later. ({msg})"
+            ),
+            Some(429) => format!(
+                "{} rate limit reached; wait a moment and try again. ({msg})",
+                p.name
+            ),
+            None if p.id == "ollama" => format!(
+                "Can't reach Ollama at {}. Start it with `ollama serve` (Termux: pkg install ollama). ({msg})",
+                self.base()
+            ),
+            None => format!(
+                "Could not reach {}. Check your internet connection and try again. ({msg})",
+                p.name
+            ),
+            Some(_) => format!("{}: {msg}", p.name),
+        }
+    }
+
     fn handle(&mut self, msg: Value) {
         let id = msg.get("id").cloned().unwrap_or(Value::Null);
         let p = msg.get("params").cloned().unwrap_or(Value::Null);
@@ -249,20 +543,19 @@ impl Worker {
                 json!({"protocolVersion":1,
                     "agentCapabilities":{"promptCapabilities":{"embeddedContext":true}},
                     "authMethods":[],
-                    "agentInfo":{"name":"termed","title":"termed AI","version":env!("CARGO_PKG_VERSION")}}),
+                    "agentInfo":{"name":"termed","title":if self.provider.id == "kilo" { "termed AI".to_string() } else { self.provider.name.to_string() },
+                        "version":env!("CARGO_PKG_VERSION")}}),
             ),
             "session/new" => {
                 if let Some(c) = p.get("cwd").and_then(Value::as_str) {
                     self.cwd = PathBuf::from(c);
                 }
                 self.history.clear();
-                if self.models.is_empty() {
-                    self.models = free_models(&self.http);
-                }
-                if !self.models.iter().any(|(v, _)| *v == self.model) {
-                    self.models.insert(0, (self.model.clone(), self.model.clone()));
-                }
+                let problem = if self.models.is_empty() { self.load_models() } else { None };
                 self.respond(&id, json!({"sessionId":"builtin","configOptions":self.config_options()}));
+                if let Some(problem) = problem {
+                    self.notice(&problem, true);
+                }
             }
             "session/set_config_option" => {
                 if let Some(v) = p.get("value").and_then(Value::as_str) {
@@ -298,8 +591,47 @@ impl Worker {
         )
     }
 
+    /// Append a user message, merging into a trailing user message (left
+    /// behind by a refusal) so roles keep alternating.
+    fn push_user(&mut self, content: Value) {
+        let anthropic = self.provider.api == Api::Anthropic;
+        if anthropic
+            && let Some(last) = self.history.last_mut()
+            && last["role"] == "user"
+        {
+            let as_blocks = |c: Value| match c {
+                Value::String(s) => vec![json!({"type":"text","text":s})],
+                Value::Array(a) => a,
+                other => vec![other],
+            };
+            let mut blocks = as_blocks(last["content"].take());
+            blocks.extend(as_blocks(content));
+            last["content"] = Value::Array(blocks);
+            return;
+        }
+        self.history.push(json!({"role":"user","content":content}));
+    }
+
     /// One user turn: loop model → tools until the model stops calling tools.
     fn turn(&mut self, p: &Value) -> &'static str {
+        if self.provider.needs_key && self.key.is_none() {
+            // A key may have been saved since this agent started.
+            self.key = self.provider.api_key();
+            if self.key.is_none() {
+                self.notice(&self.key_hint(), true);
+                return "end_turn";
+            }
+        }
+        if self.model.is_empty() || self.models.is_empty() {
+            if let Some(problem) = self.load_models() {
+                self.notice(&problem, true);
+                if self.model.is_empty() {
+                    return "end_turn";
+                }
+            }
+            self.send(json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"builtin",
+                "update":{"sessionUpdate":"config_option_update","configOptions":self.config_options()}}}));
+        }
         let mut text = String::new();
         for b in p
             .get("prompt")
@@ -330,27 +662,38 @@ impl Worker {
                 _ => {}
             }
         }
-        self.history
-            .push(json!({"role":"user","content":text.trim()}));
+        self.push_user(json!(text.trim()));
         let mut tried_models = vec![self.model.clone()];
         for _ in 0..MAX_STEPS {
             if self.cancel.load(Ordering::SeqCst) {
                 return "cancelled";
             }
-            match self.step() {
+            let r = match self.provider.api {
+                Api::OpenAi => self.openai_step(),
+                Api::Anthropic => self.anthropic_step(),
+            };
+            match r {
                 Ok(true) => continue,
                 Ok(false) => return "end_turn",
                 Err(Step::Cancelled) => return "cancelled",
+                Err(Step::Stopped(msg)) => {
+                    self.notice(&msg, false);
+                    return "end_turn";
+                }
                 Err(Step::Failed(msg, status)) => {
-                    // Busy or failing free model: move on to another free model.
+                    // A busy or failing free model: move on to another free one.
                     let busy = matches!(status, Some(429) | Some(500..=599)) || status.is_none();
                     let next = self
-                        .models
+                        .free_models
                         .iter()
-                        .map(|(v, _)| v.clone())
-                        .find(|v| !tried_models.contains(v));
+                        .find(|v| !tried_models.contains(v))
+                        .cloned();
                     match next {
-                        Some(n) if busy && tried_models.len() < 4 => {
+                        Some(n)
+                            if busy
+                                && self.free_models.contains(&self.model)
+                                && tried_models.len() < 4 =>
+                        {
                             let short = |s: &str| {
                                 s.split('/')
                                     .next_back()
@@ -372,12 +715,7 @@ impl Worker {
                                 "update":{"sessionUpdate":"config_option_update","configOptions":self.config_options()}}}));
                         }
                         _ => {
-                            let hint = if status == Some(429) {
-                                "The free models' hourly limit was reached (200 requests per hour). Try again a bit later."
-                            } else {
-                                "Could not reach the free model service. Check your internet connection and try again."
-                            };
-                            self.notice(&format!("{hint} ({msg})"), true);
+                            self.notice(&self.explain(&msg, status), true);
                             return "end_turn";
                         }
                     }
@@ -388,38 +726,60 @@ impl Worker {
         "max_turn_requests"
     }
 
-    /// One model call. Ok(true) = tools ran, call the model again.
-    fn step(&mut self) -> Result<bool, Step> {
-        let mut messages = vec![json!({"role":"system","content":self.system_prompt()})];
-        messages.extend(self.history.iter().cloned());
-        let body = json!({
-            "model": self.model,
-            "messages": messages,
-            "tools": tools_schema(),
-            "stream": true,
-            "stream_options": {"include_usage": true},
-        });
-        let resp = self
+    fn post(
+        &self,
+        url: &str,
+        body: &Value,
+        extra: &[(&str, &str)],
+    ) -> Result<ureq::http::Response<ureq::Body>, Step> {
+        let mut req = self
             .http
-            .post(format!("{}/chat/completions", gateway()))
-            .header("Content-Type", "application/json")
-            .header("HTTP-Referer", "https://github.com/Ziggyware/termed")
-            .header("X-Title", "termed")
+            .post(url)
+            .header("Content-Type", "application/json");
+        for (k, v) in self.auth_headers() {
+            req = req.header(k, v);
+        }
+        for (k, v) in extra {
+            req = req.header(*k, *v);
+        }
+        let resp = req
             .send(body.to_string())
             .map_err(|e| Step::Failed(e.to_string(), None))?;
         let status = resp.status().as_u16();
         if status != 200 {
             let text = resp.into_body().read_to_string().unwrap_or_default();
-            let msg = serde_json::from_str::<Value>(&text)
-                .ok()
-                .and_then(|v| {
-                    v.pointer("/error/message")
-                        .and_then(Value::as_str)
-                        .map(String::from)
-                })
-                .unwrap_or_else(|| format!("HTTP {status}"));
-            return Err(Step::Failed(msg, Some(status)));
+            return Err(Step::Failed(
+                providers::error_message(&text, status),
+                Some(status),
+            ));
         }
+        Ok(resp)
+    }
+
+    fn usage(&self, used: u64) {
+        // Only free models report a cost (zero); paid usage shows tokens only.
+        let mut u = json!({"sessionUpdate":"usage_update","used":used,"size":0});
+        if self.free_models.contains(&self.model) || self.provider.id == "ollama" {
+            u["cost"] = json!({"amount":0,"currency":"USD"});
+        }
+        self.update(u);
+    }
+
+    /// One OpenAI-compatible model call. Ok(true) = tools ran, call again.
+    fn openai_step(&mut self) -> Result<bool, Step> {
+        let mut messages = vec![json!({"role":"system","content":self.system_prompt()})];
+        messages.extend(self.history.iter().cloned());
+        let mut body = json!({
+            "model": self.model,
+            "messages": messages,
+            "tools": openai_tools(),
+            "stream": true,
+        });
+        // Not every OpenAI-compatible server knows stream_options.
+        if !matches!(self.provider.id, "ollama" | "custom") {
+            body["stream_options"] = json!({"include_usage": true});
+        }
+        let resp = self.post(&format!("{}/chat/completions", self.base()), &body, &[])?;
         let reader = BufReader::new(resp.into_body().into_reader());
         let mut content = String::new();
         // Tool calls arrive in pieces, keyed by index.
@@ -451,17 +811,13 @@ impl Worker {
                 return Err(Step::Failed(msg, code.or(Some(502))));
             }
             if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
-                let used = u.get("total_tokens").and_then(Value::as_u64).unwrap_or(0);
-                self.update(json!({"sessionUpdate":"usage_update","used":used,"size":0,"cost":{"amount":0,"currency":"USD"}}));
+                self.usage(u.get("total_tokens").and_then(Value::as_u64).unwrap_or(0));
             }
             let Some(delta) = v.pointer("/choices/0/delta") else {
                 continue;
             };
-            if let Some(r) = delta
-                .get("reasoning")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-            {
+            let reasoning = delta.get("reasoning").or(delta.get("reasoning_content"));
+            if let Some(r) = reasoning.and_then(Value::as_str).filter(|s| !s.is_empty()) {
                 self.update(json!({"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":r}}));
             }
             if let Some(c) = delta
@@ -478,7 +834,10 @@ impl Worker {
                 .into_iter()
                 .flatten()
             {
-                let i = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let i = tc
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(calls.len() as u64) as usize;
                 while calls.len() <= i {
                     calls.push(Default::default());
                 }
@@ -488,8 +847,11 @@ impl Worker {
                 if let Some(n) = tc.pointer("/function/name").and_then(Value::as_str) {
                     calls[i].1.push_str(n);
                 }
-                if let Some(a) = tc.pointer("/function/arguments").and_then(Value::as_str) {
-                    calls[i].2.push_str(a);
+                // Some servers (Ollama) send arguments as an object, not a string.
+                match tc.pointer("/function/arguments") {
+                    Some(Value::String(a)) => calls[i].2.push_str(a),
+                    Some(a @ Value::Object(_)) => calls[i].2 = a.to_string(),
+                    _ => {}
                 }
             }
         }
@@ -501,6 +863,7 @@ impl Worker {
                     c.0 = format!("call_{}_{k}", self.next_id);
                 }
             }
+            self.next_id += 1;
             assistant["tool_calls"] = Value::Array(
                 calls
                     .iter()
@@ -514,12 +877,244 @@ impl Worker {
         }
         for (id, name, args) in calls {
             if self.cancel.load(Ordering::SeqCst) {
-                return Err(Step::Cancelled);
+                // Keep the history valid: answer every call before stopping.
+                self.history.push(
+                    json!({"role":"tool","tool_call_id":id,"content":"Cancelled by the user."}),
+                );
+                continue;
             }
-            let args: Value = serde_json::from_str(&args).unwrap_or(json!({}));
+            let args: Value = if args.trim().is_empty() {
+                json!({})
+            } else {
+                serde_json::from_str(&args).unwrap_or(json!({}))
+            };
             let result = self.run_tool(&id, &name, &args);
             self.history
                 .push(json!({"role":"tool","tool_call_id":id,"content":result}));
+        }
+        if self.cancel.load(Ordering::SeqCst) {
+            return Err(Step::Cancelled);
+        }
+        Ok(true)
+    }
+
+    /// One call to Anthropic's Messages API (streamed). Ok(true) = tools ran.
+    fn anthropic_step(&mut self) -> Result<bool, Step> {
+        let caps = self
+            .claude_caps
+            .get(&self.model)
+            .copied()
+            .unwrap_or_else(|| ClaudeCaps::guess(&self.model));
+        let mut body = json!({
+            "model": self.model,
+            "max_tokens": caps.max_out.min(64_000),
+            "stream": true,
+            "system": self.system_prompt(),
+            "tools": anthropic_tools(),
+            "messages": self.history,
+        });
+        if caps.adaptive {
+            body["thinking"] = json!({"type":"adaptive","display":"summarized"});
+        }
+        if caps.effort_high {
+            body["output_config"] = json!({"effort":"high"});
+        }
+        let mut extra = Vec::new();
+        if supports_fallbacks(&self.model) {
+            body["fallbacks"] = json!("default");
+            extra.push(("anthropic-beta", FALLBACK_BETA));
+        }
+        let resp = self.post(&format!("{}/v1/messages", self.base()), &body, &extra)?;
+        let reader = BufReader::new(resp.into_body().into_reader());
+        // Content blocks by index; tool inputs accumulate as raw JSON text.
+        let mut blocks: Vec<Value> = Vec::new();
+        let mut inputs: Vec<String> = Vec::new();
+        let mut stop_reason = String::new();
+        let (mut input_tokens, mut output_tokens) = (0u64, 0u64);
+        for line in reader.lines() {
+            if self.cancel.load(Ordering::SeqCst) {
+                return Err(Step::Cancelled);
+            }
+            let Ok(line) = line else {
+                return Err(Step::Failed("connection lost".into(), None));
+            };
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<Value>(data.trim()) else {
+                continue;
+            };
+            let idx = v.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            match v.get("type").and_then(Value::as_str).unwrap_or("") {
+                "message_start" => {
+                    let u = v.pointer("/message/usage");
+                    let n = |k: &str| {
+                        u.and_then(|u| u.get(k))
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0)
+                    };
+                    input_tokens = n("input_tokens")
+                        + n("cache_read_input_tokens")
+                        + n("cache_creation_input_tokens");
+                }
+                "content_block_start" => {
+                    while blocks.len() <= idx {
+                        blocks.push(Value::Null);
+                        inputs.push(String::new());
+                    }
+                    let mut b = v.get("content_block").cloned().unwrap_or(Value::Null);
+                    if b["type"] == "tool_use" {
+                        // The input arrives as input_json_delta fragments.
+                        b["input"] = json!({});
+                    }
+                    blocks[idx] = b;
+                }
+                "content_block_delta" => {
+                    let Some(b) = blocks.get_mut(idx) else {
+                        continue;
+                    };
+                    let d = v.get("delta").cloned().unwrap_or(Value::Null);
+                    let s = |k: &str| d.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+                    match d.get("type").and_then(Value::as_str).unwrap_or("") {
+                        "text_delta" => {
+                            let t = s("text");
+                            let mut all = b["text"].as_str().unwrap_or("").to_string();
+                            all.push_str(&t);
+                            b["text"] = json!(all);
+                            if !t.is_empty() {
+                                self.update(json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":t}}));
+                            }
+                        }
+                        "thinking_delta" => {
+                            let t = s("thinking");
+                            let mut all = b["thinking"].as_str().unwrap_or("").to_string();
+                            all.push_str(&t);
+                            b["thinking"] = json!(all);
+                            if !t.is_empty() {
+                                self.update(json!({"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":t}}));
+                            }
+                        }
+                        "signature_delta" => {
+                            let mut all = b["signature"].as_str().unwrap_or("").to_string();
+                            all.push_str(&s("signature"));
+                            b["signature"] = json!(all);
+                        }
+                        "input_json_delta" => inputs[idx].push_str(&s("partial_json")),
+                        _ => {}
+                    }
+                }
+                "message_delta" => {
+                    if let Some(r) = v.pointer("/delta/stop_reason").and_then(Value::as_str) {
+                        stop_reason = r.to_string();
+                    }
+                    if let Some(n) = v.pointer("/usage/output_tokens").and_then(Value::as_u64) {
+                        output_tokens = n;
+                    }
+                }
+                "error" => {
+                    let msg = v
+                        .pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("model error")
+                        .to_string();
+                    let status = match v.pointer("/error/type").and_then(Value::as_str) {
+                        Some("overloaded_error") => 529,
+                        Some("rate_limit_error") => 429,
+                        _ => 500,
+                    };
+                    return Err(Step::Failed(msg, Some(status)));
+                }
+                "message_stop" => break,
+                _ => {}
+            }
+        }
+        if input_tokens + output_tokens > 0 {
+            self.usage(input_tokens + output_tokens);
+        }
+        if stop_reason == "refusal" {
+            // Never run tools from a declined turn, and drop its partial reply.
+            return Err(Step::Stopped(
+                "Claude declined this request (and no fallback model took it). Try rephrasing."
+                    .into(),
+            ));
+        }
+        // Parse each tool input strictly; invalid ones get an error result.
+        let mut parsed: Vec<Option<Result<Value, String>>> = Vec::new();
+        for (i, b) in blocks.iter_mut().enumerate() {
+            if b["type"] != "tool_use" {
+                parsed.push(None);
+                continue;
+            }
+            let raw = inputs[i].trim();
+            let r = if raw.is_empty() {
+                Ok(json!({}))
+            } else {
+                serde_json::from_str::<Value>(raw)
+            };
+            parsed.push(Some(match r {
+                Ok(input) => {
+                    b["input"] = input.clone();
+                    let name = b["name"].as_str().unwrap_or("");
+                    validate_input(name, &input)
+                        .map(|_| input)
+                        .map_err(|_| raw.to_string())
+                }
+                Err(_) => Err(raw.to_string()),
+            }));
+        }
+        // Echo the turn back unchanged (thinking blocks keep their signatures),
+        // minus what a mid-output fallback made stale.
+        let had_fallback = blocks.iter().any(|b| b["type"] == "fallback");
+        let mut content: Vec<Value> = blocks.iter().filter(|b| !b.is_null()).cloned().collect();
+        if had_fallback {
+            content = strip_before_fallback(content);
+        }
+        if stop_reason == "max_tokens" {
+            // A cut-off tool input can't be trusted: keep the text, run nothing.
+            content.retain(|b| b["type"] != "tool_use");
+            if !content.is_empty() {
+                self.history
+                    .push(json!({"role":"assistant","content":content}));
+            }
+            return Err(Step::Stopped(
+                "The reply hit the output limit. Ask again to continue.".into(),
+            ));
+        }
+        let live: Vec<String> = content
+            .iter()
+            .filter(|b| b["type"] == "tool_use")
+            .filter_map(|b| b["id"].as_str().map(String::from))
+            .collect();
+        if !content.is_empty() {
+            self.history
+                .push(json!({"role":"assistant","content":content}));
+        }
+        if live.is_empty() {
+            return Ok(false);
+        }
+        // Run the surviving tool calls; every result goes in one user message.
+        let mut results = Vec::new();
+        for (b, p) in blocks.iter().zip(parsed) {
+            let Some(p) = p else { continue };
+            let id = b["id"].as_str().unwrap_or("").to_string();
+            if !live.contains(&id) {
+                continue;
+            }
+            if self.cancel.load(Ordering::SeqCst) {
+                // Keep the history valid: answer every call before stopping.
+                results.push(json!({"type":"tool_result","tool_use_id":id,"is_error":true,"content":"Cancelled by the user."}));
+                continue;
+            }
+            let name = b["name"].as_str().unwrap_or("").to_string();
+            results.push(match p {
+                Ok(input) => json!({"type":"tool_result","tool_use_id":id,"content":self.run_tool(&id, &name, &input)}),
+                Err(raw) => json!({"type":"tool_result","tool_use_id":id,"is_error":true,
+                    "content":json!({"INVALID_JSON": raw}).to_string()}),
+            });
+        }
+        self.history.push(json!({"role":"user","content":results}));
+        if self.cancel.load(Ordering::SeqCst) {
+            return Err(Step::Cancelled);
         }
         Ok(true)
     }
@@ -863,10 +1458,43 @@ mod tests {
         let (_tx, rx) = channel();
         Worker::new(
             dir.to_path_buf(),
+            &providers::PROVIDERS[0],
             Arc::new(|_| {}),
             rx,
             Arc::new(AtomicBool::new(false)),
         )
+    }
+
+    #[test]
+    fn fallback_echo_drops_stale_blocks_before_the_last_marker() {
+        let blocks = vec![
+            json!({"type":"thinking","thinking":"a","signature":"s"}),
+            json!({"type":"text","text":"partial"}),
+            json!({"type":"tool_use","id":"x","name":"read_file","input":{}}),
+            json!({"type":"fallback"}),
+            json!({"type":"thinking","thinking":"b","signature":"t"}),
+            json!({"type":"tool_use","id":"y","name":"read_file","input":{}}),
+        ];
+        let kept: Vec<String> = strip_before_fallback(blocks)
+            .iter()
+            .map(|b| b["type"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(kept, ["text", "fallback", "thinking", "tool_use"]);
+    }
+
+    #[test]
+    fn tool_inputs_are_validated_against_the_schema() {
+        assert!(
+            validate_input(
+                "edit_file",
+                &json!({"path":"a","old_text":"b","new_text":"c"})
+            )
+            .is_ok()
+        );
+        assert!(validate_input("edit_file", &json!({"path":"a","old_text":"b"})).is_err());
+        assert!(validate_input("read_file", &json!({"path":"a","start_line":"1"})).is_err());
+        assert!(validate_input("list_files", &json!({})).is_ok());
+        assert!(validate_input("list_files", &json!([])).is_err());
     }
 
     #[test]

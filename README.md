@@ -17,11 +17,26 @@ Press `Ctrl+K A`, click **✦ Agent** in the title bar, or tap **✦** on a phon
 - **Free by default, nothing to install.** termed has a built-in agent, **termed AI**, written in Rust. It uses the free models of [Kilo Gateway](https://kilo.ai/docs/gateway/authentication), which allows anonymous use of its `:free` models with no account and no API key. Because it needs nothing else installed, it also works in **Termux on Android**. It can list, read, search, edit and create files, and run commands; every command asks for your approval first.
 - **OpenCode, if you have it.** On desktop, if [OpenCode](https://opencode.ai) is installed, termed uses it by default through the [Agent Client Protocol](https://agentclientprotocol.com); its free models also need no account. You can switch between agents with *Agent: Choose Agent*. On Android, OpenCode's npm package doesn't install, so termed AI is the default there.
 - **Free models are busy sometimes.** Free models are shared and rate-limited (Kilo allows 200 requests per hour per IP address, and one reply can take several requests). If a model reports it is busy, or stays silent for 25 seconds, termed switches to another free model and asks again automatically, telling you in the chat. Tap the model name to choose one yourself; free models are listed first. Set `TERMED_FREE_MODEL` to change the built-in agent's starting model.
-- **Privacy.** Your prompt, the open file and the files the agent reads are sent to the free model's provider. Free models may log or train on what they receive, so don't use them with secrets or confidential code.
+- **Privacy.** Your prompt, the open file and the files the agent reads are sent to the model's provider (with Ollama they stay on your device). Free models may log or train on what they receive, so don't use them with secrets or confidential code.
 - **You stay in control.** The agent's edits appear in your open files as normal edits with change bars, and one Ctrl+Z (↶) reverts an edit. Diffs show inline in the chat, and tapping a change opens the file at that spot. If the agent asks permission to run a tool, you tap Allow or Reject (or press 1–3).
 - **Context is automatic.** The open file, and your selection if there is one, are attached to every message (shown as `@ file.py:12-20` above the prompt). Unsaved files are saved first so the agent sees your latest code.
 - **Esc or ■ stops the agent.** + New starts a fresh chat.
-- **Other agents work too.** Gemini CLI (`gemini --acp`), Claude Code (`claude-agent-acp`) and Codex (`codex-acp`) are detected automatically if installed; pick one with *Agent: Choose Agent*. Note that these generally need a sign-in or paid plan. Any other ACP agent works with `TERMED_AGENT="command args"`, and `TERMED_AGENT=builtin` forces the built-in agent.
+- **More providers, same agent.** *Agent: Choose Agent* lists termed AI on other model providers too. All of them are plain HTTPS from Rust, so they work on desktop and in Termux alike:
+
+  | Provider | Cost | Setup |
+  |---|---|---|
+  | Kilo Gateway (default) | free | none |
+  | [Ollama](https://ollama.com) | free, runs on your device | install Ollama (`pkg install ollama` on Termux), `ollama pull qwen2.5-coder`; `OLLAMA_HOST` is honored |
+  | [OpenRouter](https://openrouter.ai/keys) | free models with a free key (`openrouter/free`) | API key |
+  | [Google Gemini](https://aistudio.google.com/apikey), [Groq](https://console.groq.com/keys), [Cerebras](https://cloud.cerebras.ai), [Mistral](https://console.mistral.ai/api-keys) | free tiers | API key |
+  | [Anthropic Claude](https://platform.claude.com/settings/keys) | paid | API key; uses Claude Opus 5.5 through Anthropic's native Messages API, with adaptive thinking and server-side refusal fallbacks turned on |
+  | [OpenAI](https://platform.openai.com/api-keys), [DeepSeek](https://platform.deepseek.com/api_keys), [xAI](https://console.x.ai) | paid | API key |
+  | Any OpenAI-compatible server (LM Studio, llama.cpp, vLLM, LiteLLM…) | — | `TERMED_OPENAI_BASE_URL` (+ `TERMED_OPENAI_API_KEY`) |
+
+  Picking a provider that needs a key asks for it once (the field is masked). The key is saved to `~/.config/termed/config.json`, readable only by you; the usual environment variables (`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, …) work too and take precedence. *Agent: Set API Key* changes it later. termed remembers the agent you picked last. Paid usage shows token counts only, never "free". Set `TERMED_MODEL` to choose the starting model of a keyed provider.
+- **Other agents work too.** termed detects about 20 [ACP](https://agentclientprotocol.com) agents when installed: OpenCode, Gemini CLI, Qwen Code, Claude Code, Codex, GitHub Copilot, Cline, Kilo Code, Goose, Cursor, Auggie, Grok, Factory Droid, Kimi, Devin, Mistral Vibe, Junie, Qoder, Stakpak and VT Code. If Node.js is installed, Gemini CLI, Qwen Code, Claude Code, Codex and GitHub Copilot can also start straight from npm through `npx` without installing them first (on Termux only the pure-JavaScript ones, Gemini CLI and Qwen Code, are offered). When an agent needs you to sign in, the panel shows its sign-in options as buttons. Keys you saved in termed are passed on to them (for example a Gemini key as `GEMINI_API_KEY`). Any other ACP agent works with `TERMED_AGENT="command args"`; `TERMED_AGENT=builtin` (or `builtin:ollama`, `builtin:anthropic`, …) forces the built-in agent on a provider.
+
+  ![Choosing an agent or provider](docs/agent-picker.png)
 - **On a phone** the panel is a full-screen sheet above the touch keyboard ([screenshot](docs/agent-phone.png)).
 
 ## On a phone
@@ -132,7 +147,7 @@ Some combinations (Ctrl+Shift+…, Ctrl+Enter, Ctrl+[) can only be told apart in
 | File tree | [ignore](https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore) | ripgrep's walker; respects `.gitignore`. |
 | Change margin | [similar](https://github.com/mitsuhiko/similar) | Fast line diff against the saved file. |
 | Find / replace | [regex](https://github.com/rust-lang/regex) | Linear-time regex with capture-group replacement. |
-| AI agents | [Agent Client Protocol](https://agentclientprotocol.com) + [serde_json](https://github.com/serde-rs/json) + [ureq](https://github.com/algesten/ureq) | ACP is the open standard Zed and JetBrains use for coding agents. ureq (with rustls and bundled root certificates) lets the built-in agent reach free models from anywhere, including Android. |
+| AI agents | [Agent Client Protocol](https://agentclientprotocol.com) + [serde_json](https://github.com/serde-rs/json) + [ureq](https://github.com/algesten/ureq) | ACP is the open standard Zed and JetBrains use for coding agents. ureq (with rustls and bundled root certificates) lets the built-in agent reach every provider from anywhere, including Android. |
 | Text width | [unicode-width](https://github.com/unicode-rs/unicode-width) | Correct columns for CJK and wide characters. |
 
 Source layout:
@@ -144,7 +159,8 @@ src/
   highlight.rs    incremental, time-budgeted highlighting + string-aware bracket analysis
   theme.rs        Visual Studio Dark / Termed Neon + derived palettes for bundled themes
   agent.rs        Agent Client Protocol client: launches the agent, JSON-RPC, chat model, free-model failover
-  builtin_agent.rs  built-in agent: free models over an OpenAI-compatible API, file/search/command tools
+  builtin_agent.rs  built-in agent: OpenAI-compatible and Anthropic Messages streaming, file/search/command tools
+  providers.rs    model providers, API key store (~/.config/termed)
   app.rs          state, key/mouse handling, palette, find/replace, dialogs
   ui/             title bar, explorer/drawer, tabs, code view, minimap, toolbar, overlays
 examples/

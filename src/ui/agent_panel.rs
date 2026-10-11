@@ -308,12 +308,40 @@ fn build_rows(app: &App, w: usize, panel_bg: Color) -> Vec<Row> {
                 }
             }
             rows.push(Row::blank());
+            if a.needs_auth {
+                // One button per sign-in method the agent offers.
+                for (i, (_, mname, desc)) in a.auth_methods.iter().enumerate() {
+                    let label = format!(" › {mname} ");
+                    rows.push(Row {
+                        spans: vec![(label.clone(), bold(fgbg(pal.accent_fg, pal.accent)))],
+                        buttons: vec![(0, width(&label), AgentTarget::Auth(i))],
+                        ..Default::default()
+                    });
+                    for l in wrap_text(desc, w) {
+                        rows.push(Row::text(l, dim));
+                    }
+                }
+                rows.push(Row::blank());
+            }
             let label = " ⟳ Retry ";
-            rows.push(Row {
+            let mut row = Row {
                 spans: vec![(label.into(), bold(fgbg(pal.accent_fg, pal.accent)))],
                 buttons: vec![(0, width(label), AgentTarget::Retry)],
                 ..Default::default()
-            });
+            };
+            if a.spec
+                .as_ref()
+                .and_then(|s| s.provider())
+                .is_some_and(|p| p.needs_key)
+            {
+                let key = " API key ";
+                let x = width(label) + 1;
+                row.spans.push((" ".into(), Style::default()));
+                row.spans
+                    .push((key.into(), bold(fgbg(pal.fg, pal.popup_bg))));
+                row.buttons.push((x, width(key), AgentTarget::SetKey));
+            }
+            rows.push(row);
             if !a.entries.is_empty() {
                 rows.push(Row::blank());
             }
@@ -334,13 +362,25 @@ fn build_rows(app: &App, w: usize, panel_bg: Color) -> Vec<Row> {
         ) {
             rows.push(Row::text(l, dim));
         }
-        if a.spec.as_ref().is_some_and(|s| s.builtin) {
+        if let Some(p) = a.spec.as_ref().and_then(|s| s.provider()) {
+            let note = match p.id {
+                "kilo" => "Free models via Kilo Gateway: no account or key. What you send may be logged by the model provider, so avoid secrets.".to_string(),
+                "ollama" => "Models run on this device through Ollama: nothing leaves it.".to_string(),
+                "custom" => format!("Uses the OpenAI-compatible server at {}.", p.base_url()),
+                _ => format!("Uses your {} API key; requests go to {}.", p.name, p.name),
+            };
             rows.push(Row::blank());
-            for l in wrap_text(
-                "Free models via Kilo Gateway: no account or key. What you send may be logged by the model provider, so avoid secrets.",
-                w,
-            ) {
+            for l in wrap_text(&note, w) {
                 rows.push(Row::text(l, dim));
+            }
+            if p.needs_key && p.api_key().is_none() {
+                rows.push(Row::blank());
+                let label = " Enter API key ";
+                rows.push(Row {
+                    spans: vec![(label.into(), bold(fgbg(pal.accent_fg, pal.accent)))],
+                    buttons: vec![(0, width(label), AgentTarget::SetKey)],
+                    ..Default::default()
+                });
             }
         }
         rows.push(Row::blank());
@@ -598,17 +638,17 @@ fn build_rows(app: &App, w: usize, panel_bg: Color) -> Vec<Row> {
             Style::default().fg(pal.accent),
         ));
     } else if let Some((used, _, cost)) = a.usage {
-        let price = if cost == 0.0 {
-            "free".to_string()
-        } else {
-            format!("${cost:.4}")
+        let price = match cost {
+            Some(0.0) => "free · ".to_string(),
+            Some(c) => format!("${c:.4} · "),
+            None => String::new(),
         };
         let k = if used >= 1000 {
             format!("{:.1}k", used as f64 / 1000.0)
         } else {
             used.to_string()
         };
-        rows.push(Row::text(format!("— {price} · {k} tokens in context"), dim));
+        rows.push(Row::text(format!("— {price}{k} tokens in context"), dim));
     }
     rows
 }
@@ -656,7 +696,7 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
         buf,
         x,
         inner.y,
-        &ellipsize(&agent_name, 14),
+        &ellipsize(&agent_name, 18),
         bold(fgbg(pal.fg, head_bg)),
         head.right(),
     );

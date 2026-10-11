@@ -19,6 +19,7 @@ def recv():
 cwd = os.getcwd()
 model = "opencode/big-pickle"
 stalled_prompt = None
+signed_in = not os.environ.get("FAKE_AUTH")
 while True:
     m = recv()
     meth, mid, p = m.get("method"), m.get("id"), m.get("params", {})
@@ -26,7 +27,13 @@ while True:
         send({"jsonrpc": "2.0", "id": mid, "result": {
             "protocolVersion": 1,
             "agentCapabilities": {"promptCapabilities": {"embeddedContext": True}},
-            "authMethods": [], "agentInfo": {"name": "fake", "title": "Test Agent"}}})
+            "authMethods": [{"id": "login", "name": "Log in with Test", "description": "Opens a browser"}] if not signed_in else [],
+            "agentInfo": {"name": "fake", "title": "Test Agent"}}})
+    elif meth == "authenticate":
+        signed_in = p.get("methodId") == "login"
+        send({"jsonrpc": "2.0", "id": mid, "result": {}})
+    elif meth == "session/new" and not signed_in:
+        send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32000, "message": "Authentication required"}})
     elif meth == "session/new":
         cwd = p["cwd"]
         send({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "s1", "configOptions": [

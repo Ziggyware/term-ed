@@ -47,13 +47,20 @@ pub fn rank<T: AsRef<str>>(query: &str, items: &[T], paths: bool) -> Vec<Scored>
             })
         })
         .collect();
+    // Words match independently, so "agent choose agent" ties between
+    // "Choose Agent" and "Choose Model"; the one containing the whole query wins.
+    let whole = query.trim().to_lowercase();
+    let contains = |i: usize| items[i].as_ref().to_lowercase().contains(&whole);
     out.sort_by(|a, b| {
-        b.score.cmp(&a.score).then(
-            items[a.index]
-                .as_ref()
-                .len()
-                .cmp(&items[b.index].as_ref().len()),
-        )
+        contains(b.index)
+            .cmp(&contains(a.index))
+            .then(b.score.cmp(&a.score))
+            .then(
+                items[a.index]
+                    .as_ref()
+                    .len()
+                    .cmp(&items[b.index].as_ref().len()),
+            )
     });
     out
 }
@@ -66,5 +73,12 @@ mod tests {
         let r = super::rank("edrs", &items, true);
         assert_eq!(items[r[0].index], "src/editor.rs");
         assert!(!r[0].positions.is_empty());
+    }
+
+    #[test]
+    fn whole_query_match_beats_word_by_word_ties() {
+        let items = ["Agent: Choose Model", "Agent: Choose Agent"];
+        let r = super::rank("Agent: Choose Agent", &items, false);
+        assert_eq!(items[r[0].index], "Agent: Choose Agent");
     }
 }

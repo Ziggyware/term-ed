@@ -38,6 +38,8 @@ pub enum PaletteMode {
     SaveAs,
     AgentModels,
     AgentPicker,
+    /// Masked entry of an API key for a built-in agent provider.
+    ApiKey(&'static str),
 }
 
 pub struct Palette {
@@ -296,6 +298,10 @@ pub enum AgentTarget {
     Close,
     Model,
     PickAgent,
+    /// Sign in with the agent's n-th auth method.
+    Auth(usize),
+    /// Enter the API key for the built-in agent's provider.
+    SetKey,
     Stop,
     Send,
     /// A one-tap starter prompt.
@@ -877,6 +883,11 @@ impl App {
 
     pub fn run(&mut self, cmd: Command) {
         use Command::*;
+        if cmd == Paste && self.palette.is_some() {
+            let text = self.clipboard.get();
+            self.on_paste(&text);
+            return;
+        }
         match cmd {
             QuickOpen => self.open_palette(PaletteMode::Files),
             CommandPalette | ShowKeybindings => self.open_palette(PaletteMode::Commands),
@@ -990,6 +1001,19 @@ impl App {
                     self.open_palette(PaletteMode::AgentPicker);
                 }
             }
+            AgentSetKey => match self.agent.spec.as_ref().and_then(|s| s.provider()) {
+                Some(p) if p.needs_key || !p.key_envs.is_empty() => {
+                    self.open_palette(PaletteMode::ApiKey(p.id))
+                }
+                _ => {
+                    self.toast(
+                        "Pick a built-in provider that uses a key (Agent: Choose Agent)",
+                        ToastKind::Info,
+                    );
+                    self.agent.available = agent::detect_agents();
+                    self.open_palette(PaletteMode::AgentPicker);
+                }
+            },
             ToggleWordWrap => {
                 let on = !self.word_wrap();
                 self.settings.word_wrap = Some(on);
@@ -1371,15 +1395,19 @@ impl App {
                 .available
                 .iter()
                 .map(|a| {
-                    let hint = if a.free {
-                        "free, no account"
-                    } else {
-                        "may need sign-in"
+                    let hint = match a.provider() {
+                        Some(p) if p.needs_key && p.api_key().is_none() => {
+                            format!("needs key · {}", a.note)
+                        }
+                        Some(p) if p.needs_key => format!("✓ key · {}", a.note),
+                        _ => a.note.clone(),
                     };
-                    (a.name.clone(), hint.to_string())
+                    (a.name.clone(), hint)
                 })
                 .unzip(),
-            PaletteMode::GotoLine | PaletteMode::SaveAs => (Vec::new(), Vec::new()),
+            PaletteMode::GotoLine | PaletteMode::SaveAs | PaletteMode::ApiKey(_) => {
+                (Vec::new(), Vec::new())
+            }
         };
         let mut input = String::new();
         if mode == PaletteMode::SaveAs
@@ -1550,8 +1578,39 @@ impl App {
                 self.focus = Focus::Agent;
             }
             PaletteMode::AgentPicker => {
-                if let Some(s) = p.filtered.get(p.selected) {
-                    self.agent.use_agent(s.index);
+                self.show_agent = true;
+                self.focus = Focus::Agent;
+                let Some(s) = p.filtered.get(p.selected) else {
+                    return;
+                };
+                // A provider without its key asks for the key first.
+                if let Some(pr) = self.agent.available[s.index].provider()
+                    && pr.needs_key
+                    && pr.api_key().is_none()
+                {
+                    self.open_palette(PaletteMode::ApiKey(pr.id));
+                    return;
+                }
+                self.agent.use_agent(s.index);
+            }
+            PaletteMode::ApiKey(id) => {
+                let key = p.input.trim().to_string();
+                if key.is_empty() {
+                    return;
+                }
+                if let Err(e) = crate::providers::save_key(id, &key) {
+                    self.toast(format!("Could not save the key: {e}"), ToastKind::Error);
+                    return;
+                }
+                self.toast("API key saved", ToastKind::Info);
+                self.agent.available = agent::detect_agents();
+                if let Some(i) = self
+                    .agent
+                    .available
+                    .iter()
+                    .position(|a| a.builtin == Some(id))
+                {
+                    self.agent.use_agent(i);
                 }
                 self.show_agent = true;
                 self.focus = Focus::Agent;
@@ -2418,6 +2477,8 @@ impl App {
             }
             AgentTarget::Permission(i, opt) => self.agent.choose(i, Some(&opt)),
             AgentTarget::Install => self.agent.install(),
+            AgentTarget::Auth(i) => self.agent.authenticate(i),
+            AgentTarget::SetKey => self.run(Command::AgentSetKey),
             AgentTarget::Retry => {
                 self.agent.available = agent::detect_agents();
                 if self.agent.spec.is_none() {

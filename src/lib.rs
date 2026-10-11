@@ -11,5 +11,6 @@ pub mod explorer;
 pub mod fuzzy;
 pub mod highlight;
 pub mod icons;
+pub mod providers;
 pub mod theme;
 pub mod ui;
