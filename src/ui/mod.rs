@@ -7,10 +7,11 @@ pub mod util;
 
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
+use ratatui::crossterm::event::KeyCode;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 
-use crate::app::{App, Focus, Layout, TOOLBAR, Tool};
+use crate::app::{App, Focus, Latch, Layout, TOOLBAR_PAGES, Tool};
 use crate::commands::Command;
 use crate::icons;
 use crate::theme::mix;
@@ -36,7 +37,11 @@ pub fn draw(frame: &mut Frame, app: &mut App, truecolor: bool) {
     }
 
     let compact = app.compact;
-    let toolbar_h = u16::from(app.toolbar_visible() && area.height >= 10);
+    let toolbar_h = if app.toolbar_visible() && area.height >= 10 {
+        2
+    } else {
+        0
+    };
     let title = Rect::new(area.x, area.y, area.width, 1);
     let status = Rect::new(area.x, area.bottom() - 1, area.width, 1);
     let toolbar = Rect::new(area.x, status.y - toolbar_h, area.width, toolbar_h);
@@ -271,66 +276,78 @@ fn render_title_compact(buf: &mut Buffer, area: Rect, app: &mut App) {
     ));
 }
 
-/// Touch toolbar: keys a soft keyboard lacks, paginated to the screen width.
+/// Touch keyboard: a 2×9 grid of keys a soft keyboard lacks. Every cell has
+/// a fixed position (muscle memory), cells share the width evenly, and the
+/// modifier keys show their latch state.
 fn render_toolbar(buf: &mut Buffer, area: Rect, app: &mut App) {
     let pal = app.theme.palette.clone();
     let bg = pal.titlebar_bg;
     fill(buf, area, bg);
-    // Split the buttons into pages that fit, keeping room for the » pager.
-    let pager_w = 3;
-    let mut pages: Vec<Vec<usize>> = vec![Vec::new()];
-    let mut used = 0u16;
-    for (i, (label, _)) in TOOLBAR.iter().enumerate() {
-        let w = width(label) + 3;
-        if used + w > area.width.saturating_sub(pager_w) && !pages.last().unwrap().is_empty() {
-            pages.push(Vec::new());
-            used = 0;
+    let page = &TOOLBAR_PAGES[app.toolbar_page % TOOLBAR_PAGES.len()];
+    let gap: u16 = if area.width >= 45 { 1 } else { 0 };
+    for (r, keys) in page.iter().enumerate() {
+        let y = area.y + r as u16;
+        if y >= area.bottom() {
+            break;
         }
-        pages.last_mut().unwrap().push(i);
-        used += w;
-    }
-    let page = app.toolbar_page % pages.len();
-    app.toolbar_page = page;
-    let mut x = area.x;
-    let slots = pages[page].len().max(1) as u16;
-    let natural: u16 = pages[page].iter().map(|&i| width(TOOLBAR[i].0) + 3).sum();
-    // Spread spare width across buttons so tap targets are as big as possible.
-    let room = if pages.len() > 1 {
-        area.width - pager_w
-    } else {
-        area.width
-    };
-    let extra = room.saturating_sub(natural) / slots;
-    for &i in &pages[page] {
-        let (label, tool) = TOOLBAR[i];
-        let on = matches!(tool, Tool::Cmd(Command::ToggleSelectMode)) && app.select_mode
-            || matches!(tool, Tool::Cmd(Command::ToggleSidebar)) && app.show_sidebar
-            || matches!(tool, Tool::Cmd(Command::ToggleWordWrap)) && app.word_wrap();
-        let w = width(label) + 2 + extra;
-        let (bbg, bfg) = if on {
-            (pal.accent, pal.accent_fg)
-        } else {
-            (mix(bg, pal.fg, 0.12), pal.fg)
-        };
-        let r = Rect::new(x, area.y, w.min(area.right().saturating_sub(x)), 1);
-        fill(buf, r, bbg);
-        let lx = x + (w - width(label)) / 2;
-        put(buf, lx, area.y, label, bold(fgbg(bfg, bbg)), r.right());
-        app.layout.toolbar.push((r, tool));
-        x += w + 1;
-    }
-    if pages.len() > 1 {
-        let r = Rect::new(area.right() - pager_w, area.y, pager_w, 1);
-        fill(buf, r, mix(bg, pal.accent, 0.35));
-        put(
-            buf,
-            r.x + 1,
-            area.y,
-            "»",
-            bold(fgbg(pal.fg, mix(bg, pal.accent, 0.35))),
-            r.right(),
-        );
-        app.layout.toolbar_next = r;
+        let n = keys.len() as u16;
+        let avail = area.width.saturating_sub(gap * (n - 1));
+        let (base, extra) = (avail / n, avail % n);
+        let mut x = area.x;
+        for (i, k) in keys.iter().enumerate() {
+            let w = base + u16::from((i as u16) < extra);
+            let (state_bg, state_fg, underline) = match k.tool {
+                Tool::Mod(m) => match app.mods.get(m) {
+                    Latch::Off => (None, None, false),
+                    // One-shot: tinted + underlined, "applies to the next key".
+                    Latch::Once => (Some(mix(bg, pal.accent, 0.45)), Some(pal.fg), true),
+                    // Locked: solid.
+                    Latch::Locked => (Some(pal.accent), Some(pal.accent_fg), false),
+                },
+                Tool::BoxMode if app.mods.box_mode() => {
+                    (Some(pal.warning), Some(pal.accent_fg), false)
+                }
+                Tool::Cmd(crate::commands::Command::ToggleSidebar) if app.show_sidebar => {
+                    (Some(pal.accent), Some(pal.accent_fg), false)
+                }
+                Tool::Cmd(crate::commands::Command::ToggleWordWrap) if app.word_wrap() => {
+                    (Some(mix(bg, pal.accent, 0.45)), Some(pal.fg), false)
+                }
+                Tool::Page => (Some(mix(bg, pal.accent, 0.25)), Some(pal.fg), false),
+                _ => (None, None, false),
+            };
+            // Shade modifiers and arrows differently so the grid reads at a glance.
+            let base_bg = match k.tool {
+                Tool::Mod(_) | Tool::BoxMode => mix(bg, pal.fg, 0.16),
+                Tool::Key(KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right) => {
+                    mix(bg, pal.fg, 0.2)
+                }
+                _ => mix(bg, pal.fg, 0.1),
+            };
+            // Without gaps, alternate shades keep neighbouring keys distinct.
+            let base_bg = if gap == 0 && (i + r) % 2 == 1 {
+                mix(base_bg, pal.fg, 0.06)
+            } else {
+                base_bg
+            };
+            let bbg = state_bg.unwrap_or(base_bg);
+            let bfg = state_fg.unwrap_or(pal.fg);
+            let cell = Rect::new(x, y, w.min(area.right().saturating_sub(x)), 1);
+            fill(buf, cell, bbg);
+            let label = if width(k.label) <= w {
+                k.label
+            } else {
+                k.short
+            };
+            let lx = x + w.saturating_sub(width(label)) / 2;
+            let mut st = bold(fgbg(bfg, bbg));
+            if underline {
+                st = st.add_modifier(Modifier::UNDERLINED);
+            }
+            put(buf, lx, y, label, st, cell.right());
+            app.layout.toolbar.push((cell, k.tool));
+            x += w + gap;
+        }
     }
 }
 
@@ -730,7 +747,35 @@ fn render_status(buf: &mut Buffer, area: Rect, app: &mut App) {
         bold(fgbg(fgc, dark)),
         area.right(),
     );
-    if app.select_mode {
+    // Latched modifiers and modes, so it is always clear what the next key does.
+    let m = app.mods;
+    if let Some(b) = app.editor().and_then(|e| e.block) {
+        let (t, bt) = b.lines();
+        let (l, r) = b.cols();
+        let label = if b.is_carets() {
+            format!(" BOX {}× ", bt - t + 1)
+        } else {
+            format!(" BOX {}×{} ", bt - t + 1, r - l)
+        };
+        x = put(
+            buf,
+            x,
+            area.y,
+            &label,
+            bold(fgbg(pal.accent_fg, pal.warning)),
+            area.right(),
+        );
+    } else if m.box_mode() {
+        x = put(
+            buf,
+            x,
+            area.y,
+            " BOX ",
+            bold(fgbg(pal.accent_fg, pal.warning)),
+            area.right(),
+        );
+    }
+    if m.select_mode() {
         x = put(
             buf,
             x,
@@ -739,6 +784,26 @@ fn render_status(buf: &mut Buffer, area: Rect, app: &mut App) {
             bold(fgbg(pal.accent_fg, pal.warning)),
             area.right(),
         );
+    }
+    if !m.box_mode() {
+        for (name, latch) in [("CTRL", m.ctrl), ("ALT", m.alt), ("SHIFT", m.shift)] {
+            let label = match latch {
+                Latch::Once => format!(" {name}+ "),
+                Latch::Locked if name != "SHIFT" => format!(" {name}■ "),
+                _ => continue,
+            };
+            x = put(
+                buf,
+                x,
+                area.y,
+                &label,
+                bold(fgbg(
+                    pal.accent_fg,
+                    mix(bg, ratatui::style::Color::Black, 0.45),
+                )),
+                area.right(),
+            );
+        }
     }
     x += 1;
     if let Some(b) = app.git_branch.as_ref().filter(|_| !compact) {

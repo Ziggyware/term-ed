@@ -48,42 +48,164 @@ pub struct Palette {
     pub restore_theme: Option<String>,
 }
 
+/// A sticky modifier for touch screens: soft keyboards cannot hold Ctrl,
+/// Alt or Shift while pressing another key, so a tap latches the modifier.
+/// Tap once: applies to the next key. Tap again: locked until tapped off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Latch {
+    #[default]
+    Off,
+    Once,
+    Locked,
+}
+
+impl Latch {
+    pub fn on(self) -> bool {
+        self != Latch::Off
+    }
+    fn tapped(self) -> Self {
+        match self {
+            Latch::Off => Latch::Once,
+            Latch::Once => Latch::Locked,
+            Latch::Locked => Latch::Off,
+        }
+    }
+    fn spent(self) -> Self {
+        if self == Latch::Once {
+            Latch::Off
+        } else {
+            self
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mod {
+    Ctrl,
+    Alt,
+    Shift,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StickyMods {
+    pub ctrl: Latch,
+    pub alt: Latch,
+    pub shift: Latch,
+}
+
+impl StickyMods {
+    pub fn get(&self, m: Mod) -> Latch {
+        match m {
+            Mod::Ctrl => self.ctrl,
+            Mod::Alt => self.alt,
+            Mod::Shift => self.shift,
+        }
+    }
+    pub fn tap(&mut self, m: Mod) {
+        let l = match m {
+            Mod::Ctrl => &mut self.ctrl,
+            Mod::Alt => &mut self.alt,
+            Mod::Shift => &mut self.shift,
+        };
+        *l = l.tapped();
+    }
+    pub fn any(&self) -> bool {
+        self.ctrl.on() || self.alt.on() || self.shift.on()
+    }
+    /// Alt+Shift locked: box (column) selection mode.
+    pub fn box_mode(&self) -> bool {
+        self.alt == Latch::Locked && self.shift == Latch::Locked
+    }
+    /// Shift locked on its own: selection mode.
+    pub fn select_mode(&self) -> bool {
+        self.shift == Latch::Locked && !self.box_mode()
+    }
+    fn spend(&mut self) {
+        self.ctrl = self.ctrl.spent();
+        self.alt = self.alt.spent();
+        self.shift = self.shift.spent();
+    }
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// What a touch-toolbar button does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
     Cmd(Command),
     Key(KeyCode),
+    Mod(Mod),
+    /// Toggle box-selection mode (Alt+Shift locked).
+    BoxMode,
+    /// Switch between the keys page and the actions page.
+    Page,
 }
 
-/// The on-screen toolbar for phones (no Ctrl/Alt/Esc/arrow keys on soft
-/// keyboards). Buttons are paginated to fit the screen width.
-pub const TOOLBAR: &[(&str, Tool)] = &[
-    ("☰", Tool::Cmd(Command::ToggleSidebar)),
-    ("Esc", Tool::Key(KeyCode::Esc)),
-    ("Tab", Tool::Key(KeyCode::Tab)),
-    ("◀", Tool::Key(KeyCode::Left)),
-    ("▲", Tool::Key(KeyCode::Up)),
-    ("▼", Tool::Key(KeyCode::Down)),
-    ("▶", Tool::Key(KeyCode::Right)),
-    ("Sel", Tool::Cmd(Command::ToggleSelectMode)),
-    ("↶", Tool::Cmd(Command::Undo)),
-    ("↷", Tool::Cmd(Command::Redo)),
-    ("Copy", Tool::Cmd(Command::Copy)),
-    ("Cut", Tool::Cmd(Command::Cut)),
-    ("Paste", Tool::Cmd(Command::Paste)),
-    ("Save", Tool::Cmd(Command::Save)),
-    ("Find", Tool::Cmd(Command::Find)),
-    ("Home", Tool::Key(KeyCode::Home)),
-    ("End", Tool::Key(KeyCode::End)),
-    ("PgUp", Tool::Key(KeyCode::PageUp)),
-    ("PgDn", Tool::Key(KeyCode::PageDown)),
-    ("All", Tool::Cmd(Command::SelectAll)),
-    ("Line", Tool::Cmd(Command::SelectLine)),
-    ("//", Tool::Cmd(Command::ToggleComment)),
-    ("⇤", Tool::Key(KeyCode::BackTab)),
-    ("Wrap", Tool::Cmd(Command::ToggleWordWrap)),
-    ("Go", Tool::Cmd(Command::GotoLine)),
-    ("⋯", Tool::Cmd(Command::CommandPalette)),
+#[derive(Clone, Copy, Debug)]
+pub struct ToolKey {
+    pub label: &'static str,
+    /// Used when the button is too narrow for `label`.
+    pub short: &'static str,
+    pub tool: Tool,
+}
+
+const fn key(label: &'static str, short: &'static str, tool: Tool) -> ToolKey {
+    ToolKey { label, short, tool }
+}
+
+/// The touch keyboard: a fixed 2×9 grid with a laptop-style arrow cluster
+/// (↑ sits above ↓, with ← → beside it) and the modifiers on the left, like
+/// Termux's extra keys. The second page holds editing actions.
+pub const TOOLBAR_PAGES: [[[ToolKey; 9]; 2]; 2] = [
+    [
+        [
+            key("Esc", "Esc", Tool::Key(KeyCode::Esc)),
+            key("Ctrl", "Ctl", Tool::Mod(Mod::Ctrl)),
+            key("Alt", "Alt", Tool::Mod(Mod::Alt)),
+            key("Shift", "⇧", Tool::Mod(Mod::Shift)),
+            key("Home", "⇱", Tool::Key(KeyCode::Home)),
+            key("↑", "↑", Tool::Key(KeyCode::Up)),
+            key("End", "⇲", Tool::Key(KeyCode::End)),
+            key("PgUp", "⇞", Tool::Key(KeyCode::PageUp)),
+            key("Fn", "Fn", Tool::Page),
+        ],
+        [
+            key("Tab", "⇥", Tool::Key(KeyCode::Tab)),
+            key("Box", "▦", Tool::BoxMode),
+            key("Undo", "↶", Tool::Cmd(Command::Undo)),
+            key("Redo", "↷", Tool::Cmd(Command::Redo)),
+            key("←", "←", Tool::Key(KeyCode::Left)),
+            key("↓", "↓", Tool::Key(KeyCode::Down)),
+            key("→", "→", Tool::Key(KeyCode::Right)),
+            key("PgDn", "⇟", Tool::Key(KeyCode::PageDown)),
+            key("☰", "☰", Tool::Cmd(Command::ToggleSidebar)),
+        ],
+    ],
+    [
+        [
+            key("Copy", "Cpy", Tool::Cmd(Command::Copy)),
+            key("Cut", "Cut", Tool::Cmd(Command::Cut)),
+            key("Paste", "Pst", Tool::Cmd(Command::Paste)),
+            key("Save", "Sav", Tool::Cmd(Command::Save)),
+            key("Find", "⌕", Tool::Cmd(Command::Find)),
+            key("Repl", "⇄", Tool::Cmd(Command::Replace)),
+            key("Line#", "#", Tool::Cmd(Command::GotoLine)),
+            key("Cmds", "⋯", Tool::Cmd(Command::CommandPalette)),
+            key("Keys", "⌨", Tool::Page),
+        ],
+        [
+            key("All", "All", Tool::Cmd(Command::SelectAll)),
+            key("Line", "Ln", Tool::Cmd(Command::SelectLine)),
+            key("Word", "W", Tool::Cmd(Command::SelectNextOccurrence)),
+            key("//", "//", Tool::Cmd(Command::ToggleComment)),
+            key("Dup", "Dup", Tool::Cmd(Command::DuplicateLineDown)),
+            key("Ln↑", "⇡", Tool::Cmd(Command::MoveLineUp)),
+            key("Ln↓", "⇣", Tool::Cmd(Command::MoveLineDown)),
+            key("Wrap", "↩", Tool::Cmd(Command::ToggleWordWrap)),
+            key("☰", "☰", Tool::Cmd(Command::ToggleSidebar)),
+        ],
+    ],
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,7 +273,6 @@ pub struct Layout {
     pub dialog_buttons: Vec<(Rect, usize)>,
     pub click_items: Vec<(Rect, Command)>,
     pub toolbar: Vec<(Rect, Tool)>,
-    pub toolbar_next: Rect,
     /// Explorer shown as a slide-over drawer (compact layout).
     pub drawer: Rect,
 }
@@ -159,6 +280,7 @@ pub struct Layout {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Drag {
     Text,
+    Box,
     Scrollbar,
     Minimap,
     SidebarResize,
@@ -196,8 +318,8 @@ pub struct App {
     pub quit: bool,
     /// Phone-sized screen: single-column layout (set by the renderer each frame).
     pub compact: bool,
-    /// Touch selection mode: arrows and taps extend the selection (no Shift on phones).
-    pub select_mode: bool,
+    /// Latched modifiers from the touch toolbar.
+    pub mods: StickyMods,
     pub toolbar_page: usize,
     drawer_init: bool,
     clipboard: Clipboard,
@@ -237,7 +359,7 @@ impl App {
                 force_compact: false,
             },
             compact: false,
-            select_mode: false,
+            mods: StickyMods::default(),
             toolbar_page: 0,
             drawer_init: false,
             git_branch: git_branch(&root),
@@ -375,24 +497,82 @@ impl App {
         }
     }
 
+    /// Fold latched toolbar modifiers into a key event, then spend the
+    /// one-shot ones. Locked Shift is "selection mode" and locked Alt+Shift
+    /// is "box mode": they steer movement keys but let typing through, so
+    /// you can type into a box selection or replace a selection normally.
+    fn apply_sticky(&self, mut k: KeyEvent) -> KeyEvent {
+        let m = self.mods;
+        let typing = matches!(
+            k.code,
+            KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete | KeyCode::Enter
+        );
+        let applies = |latch: Latch, is_shift_or_alt: bool, is_shift: bool| match latch {
+            Latch::Off => false,
+            Latch::Once => true,
+            Latch::Locked => {
+                if m.box_mode() && is_shift_or_alt || is_shift {
+                    !typing
+                } else {
+                    true
+                }
+            }
+        };
+        if applies(m.ctrl, false, false) {
+            k.modifiers |= KeyModifiers::CONTROL;
+        }
+        if applies(m.alt, true, false) {
+            k.modifiers |= KeyModifiers::ALT;
+        }
+        if applies(m.shift, true, true) {
+            k.modifiers |= KeyModifiers::SHIFT;
+            if let KeyCode::Char(c) = k.code
+                && !k
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
+                k.code = KeyCode::Char(c.to_uppercase().next().unwrap_or(c));
+            }
+        }
+        k
+    }
+
     /// Synthesize a key press (touch toolbar).
     pub fn press(&mut self, code: KeyCode) {
         self.on_key(KeyEvent::new(code, KeyModifiers::NONE));
     }
 
-    fn on_key(&mut self, mut k: KeyEvent) {
+    fn on_key(&mut self, k: KeyEvent) {
+        let typing = matches!(
+            k.code,
+            KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete | KeyCode::Enter
+        );
+        let esc = k.code == KeyCode::Esc;
+        self.on_key_inner(k);
+        self.mods.spend();
+        if esc {
+            // Esc always releases latched/locked modifiers.
+            self.mods.clear();
+        } else if typing && self.mods.select_mode() && self.focus == Focus::Editor {
+            // Typing over a selection ends selection mode.
+            self.mods.shift = Latch::Off;
+        }
+    }
+
+    fn on_key_inner(&mut self, mut k: KeyEvent) {
         // Some phone keyboards send LF for Return, which arrives as Ctrl+J.
         if k.code == KeyCode::Char('j') && k.modifiers == KeyModifiers::CONTROL {
             k = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         }
+        if self.mods.any() {
+            k = self.apply_sticky(k);
+        }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
-        // Touch selection mode stands in for a held Shift key.
-        let shift = k.modifiers.contains(KeyModifiers::SHIFT)
-            || (self.select_mode
-                && is_movement(k.code)
-                && self.focus == Focus::Editor
-                && self.palette.is_none());
+        let shift = k.modifiers.contains(KeyModifiers::SHIFT);
+        if k.code == KeyCode::Tab && shift {
+            k.code = KeyCode::BackTab;
+        }
         // Normalize Ctrl+Shift+<letter>, which may arrive upper- or lower-case.
         let code = match k.code {
             KeyCode::Char(c) if ctrl || alt => KeyCode::Char(c.to_ascii_lowercase()),
@@ -504,6 +684,7 @@ impl App {
             (KeyCode::Char('v'), true, ..) | (KeyCode::Insert, _, true, _) => Some(Command::Paste),
             (KeyCode::Char('a'), true, ..) => Some(Command::SelectAll),
             (KeyCode::Char('l'), true, ..) => Some(Command::SelectLine),
+            (KeyCode::Char('d'), true, true, _) => Some(Command::DuplicateLineDown),
             (KeyCode::Char('d'), true, ..) => Some(Command::SelectNextOccurrence),
             (KeyCode::Char('/'), true, ..) | (KeyCode::Char('7'), true, ..) => {
                 Some(Command::ToggleComment)
@@ -513,8 +694,6 @@ impl App {
             (KeyCode::Char(']' | '5'), true, ..) => Some(Command::Indent),
             (KeyCode::Char('['), true, ..) => Some(Command::Outdent),
             (KeyCode::Char('k'), true, true, _) => Some(Command::DeleteLine),
-            (KeyCode::Up, false, true, true) => Some(Command::DuplicateLineUp),
-            (KeyCode::Down, false, true, true) => Some(Command::DuplicateLineDown),
             (KeyCode::Up, false, false, true) => Some(Command::MoveLineUp),
             (KeyCode::Down, false, false, true) => Some(Command::MoveLineDown),
             (KeyCode::Enter, true, true, _) => Some(Command::InsertLineAbove),
@@ -526,16 +705,60 @@ impl App {
             return;
         }
         let find_visible = self.find.visible;
-        if !is_movement(code) && self.select_mode {
-            // Any edit or Esc ends touch selection mode.
-            self.select_mode = false;
-            if code == KeyCode::Esc {
-                return;
-            }
-        }
         let Some(e) = self.editors.get_mut(self.active) else {
             return;
         };
+        // Visual Studio box selection: Alt+Shift+arrows.
+        if alt && shift && !ctrl {
+            let (dl, dc) = match code {
+                KeyCode::Up => (-1, 0),
+                KeyCode::Down => (1, 0),
+                KeyCode::Left => (0, -1),
+                KeyCode::Right => (0, 1),
+                KeyCode::PageUp => (-(e.view_height.max(2) as isize - 1), 0),
+                KeyCode::PageDown => (e.view_height.max(2) as isize - 1, 0),
+                _ => (0, 0),
+            };
+            if (dl, dc) != (0, 0) {
+                e.box_extend(dl, dc);
+                e.scroll_into_view();
+                return;
+            }
+        }
+        if e.block.is_some() {
+            let handled = match code {
+                KeyCode::Char(c) if !ctrl && !alt => {
+                    e.box_type(&c.to_string());
+                    true
+                }
+                KeyCode::Tab => {
+                    let unit = e.doc.indent.unit();
+                    e.box_type(&unit);
+                    true
+                }
+                KeyCode::Backspace => {
+                    e.box_backspace();
+                    true
+                }
+                KeyCode::Delete => {
+                    e.box_delete();
+                    true
+                }
+                KeyCode::Esc => {
+                    e.box_clear();
+                    true
+                }
+                _ => {
+                    // Any other key leaves box mode and acts normally.
+                    e.box_clear();
+                    false
+                }
+            };
+            if handled {
+                e.scroll_into_view();
+                return;
+            }
+        }
         match code {
             KeyCode::Esc => {
                 if find_visible {
@@ -697,7 +920,11 @@ impl App {
             }
             ToggleToolbar => self.settings.toolbar = Some(!self.toolbar_visible()),
             ToggleSelectMode => {
-                self.select_mode = !self.select_mode;
+                self.mods.shift = if self.mods.select_mode() {
+                    Latch::Off
+                } else {
+                    Latch::Locked
+                };
                 if !self.editors.is_empty() {
                     self.focus = Focus::Editor;
                 }
@@ -778,6 +1005,29 @@ impl App {
         if self.editors.is_empty() {
             return;
         }
+        // Clipboard on a box selection works per line.
+        if self.editors[self.active].block.is_some() {
+            match cmd {
+                Copy | Cut => {
+                    let e = &mut self.editors[self.active];
+                    let text = e.box_text();
+                    if cmd == Cut && !e.block.is_some_and(|b| b.is_carets()) {
+                        e.box_delete();
+                    }
+                    self.clipboard.set(text, false);
+                    return;
+                }
+                Paste => {
+                    let text = self.clipboard.get();
+                    let e = &mut self.editors[self.active];
+                    e.box_paste(&text);
+                    e.scroll_into_view();
+                    return;
+                }
+                Undo | Redo => {}
+                _ => self.editors[self.active].box_clear(),
+            }
+        }
         if cmd == Paste {
             let whole = self.clipboard.whole_line;
             let text = self.clipboard.get();
@@ -818,7 +1068,9 @@ impl App {
         }
         e.scroll_into_view();
         if let Some((text, whole)) = clip {
-            self.select_mode = false;
+            if self.mods.select_mode() {
+                self.mods.shift = Latch::Off;
+            }
             self.clipboard.set(text, whole);
         }
     }
@@ -1541,19 +1793,36 @@ impl App {
         count
     }
 
+    pub fn run_tool(&mut self, tool: Tool) {
+        match tool {
+            Tool::Cmd(c) => {
+                self.run(c);
+                self.mods.spend();
+            }
+            Tool::Key(k) => self.press(k),
+            Tool::Mod(m) => self.mods.tap(m),
+            Tool::BoxMode => {
+                if self.mods.box_mode() {
+                    self.mods.alt = Latch::Off;
+                    self.mods.shift = Latch::Off;
+                } else {
+                    self.mods.alt = Latch::Locked;
+                    self.mods.shift = Latch::Locked;
+                    if !self.editors.is_empty() {
+                        self.focus = Focus::Editor;
+                    }
+                }
+            }
+            Tool::Page => self.toolbar_page ^= 1,
+        }
+    }
+
     fn mouse_down(&mut self, pos: Position, mods: KeyModifiers) {
         let l = self.layout.clone();
         // The touch toolbar works on top of everything (it is how you press
         // Esc or arrows in a dialog or palette on a phone).
-        if l.toolbar_next.contains(pos) {
-            self.toolbar_page += 1;
-            return;
-        }
         if let Some((_, tool)) = l.toolbar.iter().find(|(r, _)| r.contains(pos)) {
-            match *tool {
-                Tool::Cmd(c) => self.run(c),
-                Tool::Key(k) => self.press(k),
-            }
+            self.run_tool(*tool);
             return;
         }
         if let Some(d) = &self.dialog {
@@ -1682,8 +1951,26 @@ impl App {
             let count = self.click_count(pos);
             let in_gutter = l.gutter.contains(pos);
             let Some(idx) = self.idx_at(pos) else { return };
-            let shift = mods.contains(KeyModifiers::SHIFT) || self.select_mode;
+            let shift = mods.contains(KeyModifiers::SHIFT) || self.mods.shift.on();
+            let alt = mods.contains(KeyModifiers::ALT) || self.mods.alt.on();
+            let point = self.point_at(pos);
+            self.mods.spend();
             let Some(e) = self.editor_mut() else { return };
+            if alt && !in_gutter {
+                // Alt+click / Alt+drag (or a tap in box mode): box selection
+                // from the existing box anchor, or from the caret.
+                if let Some((line, col)) = point {
+                    let _ = (shift, count);
+                    let (al, ac) = match e.block {
+                        Some(b) => (b.anchor_line, b.anchor_col),
+                        None => (e.cursor().0, e.cursor_display_col()),
+                    };
+                    e.box_to(al, ac, line, col);
+                }
+                self.drag = Some(Drag::Box);
+                return;
+            }
+            e.box_clear();
             if in_gutter {
                 let (line, _) = e.doc.pos(idx);
                 let start = e.doc.line_start(line);
@@ -1738,6 +2025,20 @@ impl App {
                     e.sel = Selection::new(e.sel.anchor, idx);
                 }
             }
+            Some(Drag::Box) => {
+                let clamped = Position::new(
+                    pos.x
+                        .clamp(l.text.x, l.text.x + l.text.width.saturating_sub(1)),
+                    pos.y
+                        .clamp(l.text.y, l.text.y + l.text.height.saturating_sub(1)),
+                );
+                if let Some((line, col)) = self.point_at(clamped)
+                    && let Some(e) = self.editor_mut()
+                    && let Some(b) = e.block
+                {
+                    e.box_to(b.anchor_line, b.anchor_col, line, col);
+                }
+            }
             Some(Drag::Scrollbar) | Some(Drag::Minimap) => {
                 let area = if self.drag == Some(Drag::Scrollbar) {
                     l.scrollbar
@@ -1759,6 +2060,18 @@ impl App {
         }
     }
 
+    /// (line, display column) under a screen position; the column may lie
+    /// past the end of the line (virtual space, for box selection).
+    fn point_at(&self, pos: Position) -> Option<(usize, usize)> {
+        let l = &self.layout;
+        let e = self.editor()?;
+        let row = pos.y.checked_sub(l.text.y)? as usize;
+        let x = pos.x.saturating_sub(l.text.x) as usize + e.scroll_col;
+        let rows = e.visual_rows(row + 1);
+        let &(line, _, seg, _) = rows.get(row).or(rows.last())?;
+        Some((line, seg.dstart + x.saturating_sub(seg.indent)))
+    }
+
     /// Document char index under a screen position in the text area.
     fn idx_at(&self, pos: Position) -> Option<usize> {
         let l = &self.layout;
@@ -1773,20 +2086,6 @@ impl App {
         let col = e.col_at_x(line, &seg, last, x);
         Some(e.doc.idx(line, col))
     }
-}
-
-fn is_movement(code: KeyCode) -> bool {
-    matches!(
-        code,
-        KeyCode::Left
-            | KeyCode::Right
-            | KeyCode::Up
-            | KeyCode::Down
-            | KeyCode::Home
-            | KeyCode::End
-            | KeyCode::PageUp
-            | KeyCode::PageDown
-    )
 }
 
 fn byte_at(s: &str, char_idx: usize) -> usize {

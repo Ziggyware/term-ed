@@ -27,6 +27,37 @@ pub struct Editor {
     pub wrap_width: Option<usize>,
     /// First visible wrapped row of `scroll_line`.
     pub scroll_seg: usize,
+    /// Box (column) selection, Visual Studio's Alt+Shift+arrows / Alt+drag.
+    pub block: Option<BoxSel>,
+}
+
+/// A rectangular selection in display columns. Columns may lie past the end
+/// of short lines ("virtual space"); typing pads those lines with spaces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BoxSel {
+    pub anchor_line: usize,
+    pub anchor_col: usize,
+    pub head_line: usize,
+    pub head_col: usize,
+}
+
+impl BoxSel {
+    pub fn lines(&self) -> (usize, usize) {
+        (
+            self.anchor_line.min(self.head_line),
+            self.anchor_line.max(self.head_line),
+        )
+    }
+    pub fn cols(&self) -> (usize, usize) {
+        (
+            self.anchor_col.min(self.head_col),
+            self.anchor_col.max(self.head_col),
+        )
+    }
+    /// Zero width: a column of carets (multi-line typing).
+    pub fn is_carets(&self) -> bool {
+        self.anchor_col == self.head_col
+    }
 }
 
 /// One visual row of a (possibly soft-wrapped) line.
@@ -246,6 +277,7 @@ impl Editor {
             hl_pending: false,
             wrap_width: None,
             scroll_seg: 0,
+            block: None,
         }
     }
 
@@ -1178,6 +1210,7 @@ impl Editor {
     }
 
     pub fn undo(&mut self) {
+        self.block = None;
         if let Some(sel) = self.doc.undo() {
             self.sel = clamp_sel(sel, self.doc.rope.len_chars());
         }
@@ -1186,6 +1219,7 @@ impl Editor {
     }
 
     pub fn redo(&mut self) {
+        self.block = None;
         if let Some(sel) = self.doc.redo() {
             self.sel = clamp_sel(sel, self.doc.rope.len_chars());
         }
@@ -1214,6 +1248,179 @@ impl Editor {
         }
         self.sel = Selection::caret(self.sel.head.min(self.doc.rope.len_chars()));
         self.finish();
+    }
+
+    // ------------------------------------------------------------ box selection
+
+    /// Grow or start a box selection by whole rows/columns (Alt+Shift+arrows).
+    pub fn box_extend(&mut self, dl: isize, dc: isize) {
+        let b = self.block.unwrap_or_else(|| {
+            let (line, _) = self.cursor();
+            let col = self.cursor_display_col();
+            BoxSel {
+                anchor_line: line,
+                anchor_col: col,
+                head_line: line,
+                head_col: col,
+            }
+        });
+        let last = self.doc.len_lines().saturating_sub(1) as isize;
+        let line = (b.head_line as isize + dl).clamp(0, last) as usize;
+        let col = (b.head_col as isize + dc).max(0) as usize;
+        self.box_to(b.anchor_line, b.anchor_col, line, col);
+    }
+
+    /// Set the box explicitly (mouse/tap); also moves the caret to the head.
+    pub fn box_to(&mut self, anchor_line: usize, anchor_col: usize, line: usize, col: usize) {
+        self.block = Some(BoxSel {
+            anchor_line,
+            anchor_col,
+            head_line: line,
+            head_col: col,
+        });
+        let c = char_col_at(&self.doc.line_str(line), col, self.tab());
+        self.sel = Selection::caret(self.doc.idx(line, c));
+        self.preferred_col = Some(col);
+    }
+
+    /// Leave box mode, keeping the caret at the head.
+    pub fn box_clear(&mut self) {
+        self.block = None;
+    }
+
+    fn display_width(&self, line: usize) -> usize {
+        let t = self.doc.line_str(line);
+        display_col(&t, t.chars().count(), self.tab())
+    }
+
+    /// Char ranges covered on each line of the box.
+    pub fn box_ranges(&self) -> Vec<(usize, usize, usize)> {
+        let Some(b) = self.block else {
+            return Vec::new();
+        };
+        let (top, bottom) = b.lines();
+        let (left, right) = b.cols();
+        (top..=bottom)
+            .map(|l| {
+                let t = self.doc.line_str(l);
+                (
+                    l,
+                    char_col_at(&t, left, self.tab()),
+                    char_col_at(&t, right, self.tab()),
+                )
+            })
+            .collect()
+    }
+
+    pub fn box_text(&self) -> String {
+        self.box_ranges()
+            .iter()
+            .map(|&(l, s, e)| {
+                self.doc
+                    .line_str(l)
+                    .chars()
+                    .skip(s)
+                    .take(e - s)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Replace the box on every line with `pieces[i]` (or `pieces[0]` everywhere).
+    fn box_replace(&mut self, pieces: &[&str]) {
+        let Some(b) = self.block else { return };
+        let (top, bottom) = b.lines();
+        let (left, right) = b.cols();
+        self.doc.begin(EditKind::Typing, self.sel);
+        let mut new_col = left;
+        for (i, line) in (top..=bottom).enumerate() {
+            let piece = pieces.get(i).or(pieces.first()).copied().unwrap_or("");
+            let width = self.display_width(line);
+            let start = self.doc.line_start(line);
+            if width < left {
+                if piece.is_empty() {
+                    continue;
+                }
+                // Virtual space: pad short lines out to the box column.
+                let pad = " ".repeat(left - width);
+                self.doc
+                    .insert(start + self.doc.line_len(line), &format!("{pad}{piece}"));
+            } else {
+                let t = self.doc.line_str(line);
+                let (s, e) = (
+                    char_col_at(&t, left, self.tab()),
+                    char_col_at(&t, right, self.tab()),
+                );
+                self.doc.remove(start + s, start + e);
+                self.doc.insert(start + s, piece);
+            }
+            if i == 0 {
+                new_col = left + display_col(piece, piece.chars().count(), self.tab());
+            }
+        }
+        self.block = Some(BoxSel {
+            anchor_line: b.anchor_line,
+            anchor_col: new_col,
+            head_line: b.head_line,
+            head_col: new_col,
+        });
+        let c = char_col_at(&self.doc.line_str(b.head_line), new_col, self.tab());
+        self.sel = Selection::caret(self.doc.idx(b.head_line, c));
+        self.doc.end(self.sel);
+        self.preferred_col = Some(new_col);
+        self.sync();
+    }
+
+    /// Type into every line of the box (column editing).
+    pub fn box_type(&mut self, text: &str) {
+        self.box_replace(&[text]);
+    }
+
+    /// Backspace: delete the box, or the char before each caret.
+    pub fn box_backspace(&mut self) {
+        let Some(b) = self.block else { return };
+        if !b.is_carets() {
+            self.box_replace(&[""]);
+            return;
+        }
+        let col = b.anchor_col;
+        if col == 0 {
+            return;
+        }
+        // Widen the box one column to the left, then delete it.
+        let prev = col - 1;
+        self.block = Some(BoxSel {
+            anchor_col: prev,
+            ..b
+        });
+        self.box_replace(&[""]);
+    }
+
+    /// Delete: delete the box, or the char after each caret.
+    pub fn box_delete(&mut self) {
+        let Some(b) = self.block else { return };
+        if b.is_carets() {
+            self.block = Some(BoxSel {
+                head_col: b.head_col + 1,
+                ..b
+            });
+        }
+        self.box_replace(&[""]);
+    }
+
+    /// Paste: one clipboard line per box line when the counts match.
+    pub fn box_paste(&mut self, text: &str) {
+        let Some(b) = self.block else { return };
+        let (top, bottom) = b.lines();
+        let text = text.strip_suffix('\n').unwrap_or(text);
+        let pieces: Vec<&str> = text.split('\n').collect();
+        if pieces.len() == bottom - top + 1 || pieces.len() == 1 {
+            self.box_replace(&pieces);
+        } else {
+            self.block = None;
+            self.insert_text(text);
+        }
     }
 
     // ------------------------------------------------------------ viewport
@@ -1477,5 +1684,37 @@ mod tests {
         e.scroll_into_view();
         let rows = e.visual_rows(3);
         assert!(rows.iter().any(|r| r.0 == 1));
+    }
+
+    #[test]
+    fn box_selection_types_on_every_line_with_virtual_space() {
+        let mut e = ed("abc\nx\nabcdef", "txt");
+        e.move_to(0, 2, false);
+        e.box_extend(2, 0);
+        assert_eq!(e.block.unwrap().lines(), (0, 2));
+        e.box_type("|");
+        // Line 1 is shorter than the box column: padded with a space.
+        assert_eq!(text(&e), "ab|c\nx |\nab|cdef");
+        e.box_type("!");
+        assert_eq!(text(&e), "ab|!c\nx |!\nab|!cdef");
+        e.box_backspace();
+        assert_eq!(text(&e), "ab|c\nx |\nab|cdef");
+        e.undo();
+        assert_eq!(text(&e), "abc\nx\nabcdef");
+    }
+
+    #[test]
+    fn box_copy_delete_and_paste() {
+        let mut e = ed("abcd\nefgh\nijkl", "txt");
+        e.move_to(0, 1, false);
+        e.box_extend(1, 2);
+        assert_eq!(e.box_text(), "bc\nfg");
+        e.box_delete();
+        assert_eq!(text(&e), "ad\neh\nijkl");
+        e.box_paste("12\n34\n");
+        assert_eq!(text(&e), "a12d\ne34h\nijkl");
+        assert!(e.block.unwrap().is_carets());
+        e.box_delete();
+        assert_eq!(text(&e), "a12\ne34\nijkl");
     }
 }
