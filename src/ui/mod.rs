@@ -8,9 +8,9 @@ pub mod util;
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Modifier;
 
-use crate::app::{App, Focus, Layout};
+use crate::app::{App, Focus, Layout, TOOLBAR, Tool};
 use crate::commands::Command;
 use crate::icons;
 use crate::theme::mix;
@@ -21,6 +21,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, truecolor: bool) {
     app.layout = Layout::default();
     let buf = frame.buffer_mut();
     let pal = app.theme.palette.clone();
+    app.set_compact(area.width < 80);
     fill(buf, area, pal.bg);
     if area.height < 4 || area.width < 20 {
         put(
@@ -34,11 +35,15 @@ pub fn draw(frame: &mut Frame, app: &mut App, truecolor: bool) {
         return;
     }
 
+    let compact = app.compact;
+    let toolbar_h = u16::from(app.toolbar_visible() && area.height >= 10);
     let title = Rect::new(area.x, area.y, area.width, 1);
     let status = Rect::new(area.x, area.bottom() - 1, area.width, 1);
-    let body = Rect::new(area.x, area.y + 1, area.width, area.height - 2);
+    let toolbar = Rect::new(area.x, status.y - toolbar_h, area.width, toolbar_h);
+    let body = Rect::new(area.x, area.y + 1, area.width, area.height - 2 - toolbar_h);
 
-    let sidebar_w = if app.show_sidebar {
+    // Wide screens dock the explorer; phones slide it over the editor.
+    let sidebar_w = if app.show_sidebar && !compact {
         app.sidebar_width.min(body.width / 2)
     } else {
         0
@@ -51,7 +56,11 @@ pub fn draw(frame: &mut Frame, app: &mut App, truecolor: bool) {
         body.height,
     );
 
-    render_title(buf, title, app);
+    if compact {
+        render_title_compact(buf, title, app);
+    } else {
+        render_title(buf, title, app);
+    }
     if sidebar_w > 0 {
         render_sidebar(buf, sidebar, app);
     }
@@ -60,22 +69,43 @@ pub fn draw(frame: &mut Frame, app: &mut App, truecolor: bool) {
     if app.editors.is_empty() {
         render_welcome(buf, main, app);
     } else {
-        let tabs = Rect::new(main.x, main.y, main.width, 1);
-        let crumbs = Rect::new(main.x, main.y + 1, main.width, 1);
+        // On a phone the title bar already names the file: skip the tab row
+        // for a single file, and always skip breadcrumbs.
+        let tabs_h = u16::from(!compact || app.editors.len() > 1);
+        let crumbs_h = u16::from(!compact);
+        let tabs = Rect::new(main.x, main.y, main.width, tabs_h);
+        let crumbs = Rect::new(main.x, main.y + tabs_h, main.width, crumbs_h);
         let editor = Rect::new(
             main.x,
-            main.y + 2,
+            main.y + tabs_h + crumbs_h,
             main.width,
-            main.height.saturating_sub(2),
+            main.height.saturating_sub(tabs_h + crumbs_h),
         );
-        render_tabs(buf, tabs, app);
-        render_breadcrumbs(buf, crumbs, app);
+        if tabs_h > 0 {
+            render_tabs(buf, tabs, app);
+        }
+        if crumbs_h > 0 {
+            render_breadcrumbs(buf, crumbs, app);
+        }
         cursor = editor_view::render(buf, editor, app);
         if app.find.visible
             && let Some(c) = overlay::render_find(buf, editor, app)
         {
             cursor = Some(c);
         }
+    }
+    if compact && app.show_sidebar {
+        let w = body.width.saturating_sub(6).clamp(20.min(body.width), 40);
+        let drawer = Rect::new(body.x, body.y, w, body.height);
+        util::shadow(buf, Rect::new(drawer.right(), body.y, 1, body.height));
+        render_sidebar(buf, drawer, app);
+        app.layout.drawer = drawer;
+        if app.focus == Focus::Explorer {
+            cursor = None;
+        }
+    }
+    if toolbar_h > 0 {
+        render_toolbar(buf, toolbar, app);
     }
     render_status(buf, status, app);
     overlay::render_toasts(buf, Rect::new(main.x, main.y, main.width, main.height), app);
@@ -165,6 +195,142 @@ fn render_title(buf: &mut Buffer, area: Rect, app: &mut App) {
             fgbg(pal.sidebar_dim, pal.titlebar_bg),
             area.right(),
         );
+    }
+}
+
+/// Phone title bar: big tap targets for the drawer, quick open and commands.
+fn render_title_compact(buf: &mut Buffer, area: Rect, app: &mut App) {
+    let pal = app.theme.palette.clone();
+    fill(buf, area, pal.titlebar_bg);
+    let btn = |buf: &mut Buffer, x: u16, label: &str, on: bool| {
+        let bg = if on { pal.accent } else { pal.input_bg };
+        let fgc = if on { pal.accent_fg } else { pal.fg };
+        put(
+            buf,
+            x,
+            area.y,
+            &format!(" {label} "),
+            bold(fgbg(fgc, bg)),
+            area.right(),
+        )
+    };
+    let x0 = area.x;
+    let x = btn(buf, x0, "☰", app.show_sidebar);
+    app.layout
+        .click_items
+        .push((Rect::new(x0, area.y, x - x0, 1), Command::ToggleSidebar));
+    let right_w = 7;
+    let rx = area.right().saturating_sub(right_w);
+    // File name (tap = quick open), with a dirty dot.
+    let (name, dirty) = match app.editor() {
+        Some(e) => (e.doc.name(), e.doc.is_dirty()),
+        None => (app.explorer.root_name(), false),
+    };
+    let nx = x + 1;
+    let logo_w = if rx > nx + 20 { 9 } else { 0 };
+    if logo_w > 0 {
+        put(
+            buf,
+            nx,
+            area.y,
+            "◆ termed",
+            bold(fgbg(pal.logo[0], pal.titlebar_bg)),
+            rx,
+        );
+    }
+    let fx = nx + logo_w;
+    let room = rx.saturating_sub(fx + 2) as usize;
+    let label = ellipsize(&name, room.saturating_sub(2));
+    let end = put(
+        buf,
+        fx,
+        area.y,
+        &label,
+        bold(fgbg(pal.tab_active_fg, pal.titlebar_bg)),
+        rx,
+    );
+    if dirty {
+        put(
+            buf,
+            end + 1,
+            area.y,
+            "●",
+            fgbg(pal.warning, pal.titlebar_bg),
+            rx,
+        );
+    }
+    app.layout.title_search = Rect::new(fx, area.y, rx.saturating_sub(fx), 1);
+    let sx = btn(buf, rx, "⌕", false);
+    app.layout
+        .click_items
+        .push((Rect::new(rx, area.y, sx - rx, 1), Command::QuickOpen));
+    let ex = btn(buf, sx + 1, "⋯", false);
+    app.layout.click_items.push((
+        Rect::new(sx + 1, area.y, ex - sx - 1, 1),
+        Command::CommandPalette,
+    ));
+}
+
+/// Touch toolbar: keys a soft keyboard lacks, paginated to the screen width.
+fn render_toolbar(buf: &mut Buffer, area: Rect, app: &mut App) {
+    let pal = app.theme.palette.clone();
+    let bg = pal.titlebar_bg;
+    fill(buf, area, bg);
+    // Split the buttons into pages that fit, keeping room for the » pager.
+    let pager_w = 3;
+    let mut pages: Vec<Vec<usize>> = vec![Vec::new()];
+    let mut used = 0u16;
+    for (i, (label, _)) in TOOLBAR.iter().enumerate() {
+        let w = width(label) + 3;
+        if used + w > area.width.saturating_sub(pager_w) && !pages.last().unwrap().is_empty() {
+            pages.push(Vec::new());
+            used = 0;
+        }
+        pages.last_mut().unwrap().push(i);
+        used += w;
+    }
+    let page = app.toolbar_page % pages.len();
+    app.toolbar_page = page;
+    let mut x = area.x;
+    let slots = pages[page].len().max(1) as u16;
+    let natural: u16 = pages[page].iter().map(|&i| width(TOOLBAR[i].0) + 3).sum();
+    // Spread spare width across buttons so tap targets are as big as possible.
+    let room = if pages.len() > 1 {
+        area.width - pager_w
+    } else {
+        area.width
+    };
+    let extra = room.saturating_sub(natural) / slots;
+    for &i in &pages[page] {
+        let (label, tool) = TOOLBAR[i];
+        let on = matches!(tool, Tool::Cmd(Command::ToggleSelectMode)) && app.select_mode
+            || matches!(tool, Tool::Cmd(Command::ToggleSidebar)) && app.show_sidebar
+            || matches!(tool, Tool::Cmd(Command::ToggleWordWrap)) && app.word_wrap();
+        let w = width(label) + 2 + extra;
+        let (bbg, bfg) = if on {
+            (pal.accent, pal.accent_fg)
+        } else {
+            (mix(bg, pal.fg, 0.12), pal.fg)
+        };
+        let r = Rect::new(x, area.y, w.min(area.right().saturating_sub(x)), 1);
+        fill(buf, r, bbg);
+        let lx = x + (w - width(label)) / 2;
+        put(buf, lx, area.y, label, bold(fgbg(bfg, bbg)), r.right());
+        app.layout.toolbar.push((r, tool));
+        x += w + 1;
+    }
+    if pages.len() > 1 {
+        let r = Rect::new(area.right() - pager_w, area.y, pager_w, 1);
+        fill(buf, r, mix(bg, pal.accent, 0.35));
+        put(
+            buf,
+            r.x + 1,
+            area.y,
+            "»",
+            bold(fgbg(pal.fg, mix(bg, pal.accent, 0.35))),
+            r.right(),
+        );
+        app.layout.toolbar_next = r;
     }
 }
 
@@ -429,9 +595,12 @@ fn render_tabs(buf: &mut Buffer, area: Rect, app: &mut App) {
                 area.right(),
             );
         }
-        app.layout
-            .tabs
-            .push((r, Rect::new(close_x, area.y, 1, 1), i));
+        let close = if app.compact {
+            Rect::new(close_x.saturating_sub(1), area.y, 3, 1)
+        } else {
+            Rect::new(close_x, area.y, 1, 1)
+        };
+        app.layout.tabs.push((r, close, i));
         x += w;
     }
 }
@@ -551,6 +720,7 @@ fn render_status(buf: &mut Buffer, area: Rect, app: &mut App) {
     let st = fgbg(fgc, bg);
     let dark = mix(bg, ratatui::style::Color::Black, 0.25);
 
+    let compact = app.compact;
     // Left.
     let mut x = put(
         buf,
@@ -560,53 +730,88 @@ fn render_status(buf: &mut Buffer, area: Rect, app: &mut App) {
         bold(fgbg(fgc, dark)),
         area.right(),
     );
+    if app.select_mode {
+        x = put(
+            buf,
+            x,
+            area.y,
+            " SELECT ",
+            bold(fgbg(pal.accent_fg, pal.warning)),
+            area.right(),
+        );
+    }
     x += 1;
-    if let Some(b) = &app.git_branch {
+    if let Some(b) = app.git_branch.as_ref().filter(|_| !compact) {
         x = put(buf, x, area.y, &format!("⎇ {b}"), st, area.right()) + 2;
     }
     let dirty = app.editors.iter().filter(|e| e.doc.is_dirty()).count();
     let state = if app.chord {
         "(Ctrl+K) was pressed. Waiting for second key of chord...".to_string()
     } else if dirty > 0 {
-        format!("● {dirty} unsaved")
+        if compact {
+            format!("● {dirty}")
+        } else {
+            format!("● {dirty} unsaved")
+        }
+    } else if compact {
+        "✓".to_string()
     } else {
         "✓ Ready".to_string()
     };
-    put(buf, x, area.y, &state, st, area.right());
+    let left_end = x + width(&state);
 
-    // Right: clickable segments.
-    let Some(e) = app.editor() else { return };
-    let (line, col) = e.cursor();
-    let sel_len = e.sel.end() - e.sel.start();
-    let mut segs: Vec<(String, Option<Command>)> = Vec::new();
-    let pos = if sel_len > 0 {
-        format!(
-            "Ln {}, Col {} ({} selected)",
-            line + 1,
-            e.cursor_display_col() + 1,
-            sel_len
-        )
-    } else {
-        format!("Ln {}, Col {}", line + 1, e.cursor_display_col() + 1)
-    };
-    let _ = col;
-    segs.push((pos, Some(Command::GotoLine)));
-    segs.push((e.doc.indent.label(), Some(Command::ConvertIndentToSpaces)));
-    segs.push(("UTF-8".into(), None));
+    // Right: clickable segments; low-priority ones drop out on narrow screens.
+    let mut segs: Vec<(String, Option<Command>, u8)> = Vec::new();
+    if let Some(e) = app.editor() {
+        let (line, _) = e.cursor();
+        let col = e.cursor_display_col() + 1;
+        let sel_len = e.sel.end() - e.sel.start();
+        let pos = match (compact, sel_len) {
+            (true, 0) => format!("{}:{col}", line + 1),
+            (true, n) => format!("{}:{col} ({n})", line + 1),
+            (false, 0) => format!("Ln {}, Col {col}", line + 1),
+            (false, n) => format!("Ln {}, Col {col} ({n} selected)", line + 1),
+        };
+        segs.push((pos, Some(Command::GotoLine), 9));
+        segs.push((
+            e.doc.indent.label(),
+            Some(Command::ConvertIndentToSpaces),
+            3,
+        ));
+        segs.push(("UTF-8".into(), None, 1));
+        segs.push((
+            e.doc.line_ending.label().into(),
+            Some(Command::ToggleLineEnding),
+            4,
+        ));
+        let lang = if compact {
+            e.language().to_string()
+        } else {
+            format!("{{ }} {}", e.language())
+        };
+        segs.push((lang, Some(Command::SelectLanguage), 8));
+    }
     segs.push((
-        e.doc.line_ending.label().into(),
-        Some(Command::ToggleLineEnding),
+        format!("◐ {}", app.theme.name),
+        Some(Command::SelectTheme),
+        2,
     ));
-    segs.push((
-        format!("{{ }} {}", e.language()),
-        Some(Command::SelectLanguage),
-    ));
-    segs.push((format!("◐ {}", app.theme.name), Some(Command::SelectTheme)));
-    let total: u16 = segs.iter().map(|(s, _)| width(s) + 3).sum();
+    let budget = area.right().saturating_sub(left_end + 1);
+    while segs.iter().map(|(s, _, _)| width(s) + 2).sum::<u16>() > budget && !segs.is_empty() {
+        let min = segs
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, s)| s.2)
+            .map(|(i, _)| i)
+            .unwrap();
+        segs.remove(min);
+    }
+    put(buf, x, area.y, &state, st, area.right());
+    let total: u16 = segs.iter().map(|(s, _, _)| width(s) + 2).sum();
     let mut rx = area.right().saturating_sub(total);
-    for (s, cmd) in segs {
+    for (s, cmd, _) in segs {
         let start = rx;
-        rx = put(buf, rx + 1, area.y, &s, st, area.right()) + 2;
+        rx = put(buf, rx + 1, area.y, &s, st, area.right()) + 1;
         if let Some(c) = cmd {
             app.layout
                 .click_items
@@ -624,29 +829,54 @@ const LOGO: [&str; 6] = [
     "   ╚═╝   ╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝╚══════╝╚═════╝ ",
 ];
 
+const SMALL_LOGO: [&str; 2] = ["▀█▀ █▀▀ █▀█ █▀▄▀█ █▀▀ █▀▄", " █  ██▄ █▀▄ █ ▀ █ ██▄ █▄▀"];
+
 fn render_welcome(buf: &mut Buffer, area: Rect, app: &mut App) {
-    let pal = &app.theme.palette;
+    let pal = app.theme.palette.clone();
     fill(buf, area, pal.bg);
-    let shortcuts = [
-        ("Open File", "Ctrl+P"),
-        ("Command Palette", "Ctrl+Shift+P · F1"),
-        ("New File", "Ctrl+N"),
-        ("Toggle Explorer", "Ctrl+B"),
-        ("Find / Replace", "Ctrl+F · Ctrl+H"),
-        ("Go to Line", "Ctrl+G"),
-        ("Color Theme", "Ctrl+K T · F8"),
-        ("Quit", "Ctrl+Q"),
-    ];
-    let logo_w = width(LOGO[0]);
-    let block_h = LOGO.len() as u16 + 4 + shortcuts.len() as u16;
+    let compact = app.compact;
+    // Every row is also a tap target.
+    let shortcuts: &[(&str, &str, Command)] = if compact {
+        &[
+            ("Browse files", "☰", Command::ToggleSidebar),
+            ("Open file…", "⌕", Command::QuickOpen),
+            ("All commands…", "⋯", Command::CommandPalette),
+            ("New file", "+", Command::NewFile),
+            ("Color theme", "◐", Command::SelectTheme),
+            ("Quit", "✕", Command::Quit),
+        ]
+    } else {
+        &[
+            ("Open File", "Ctrl+P", Command::QuickOpen),
+            (
+                "Command Palette",
+                "Ctrl+Shift+P · F1",
+                Command::CommandPalette,
+            ),
+            ("New File", "Ctrl+N", Command::NewFile),
+            ("Toggle Explorer", "Ctrl+B", Command::ToggleSidebar),
+            ("Go to Line", "Ctrl+G", Command::GotoLine),
+            ("Color Theme", "Ctrl+K T · F8", Command::SelectTheme),
+            ("Quit", "Ctrl+Q", Command::Quit),
+        ]
+    };
+    let big = area.width >= width(LOGO[0]) + 4 && area.height >= 20;
+    let logo: &[&str] = if big { &LOGO } else { &SMALL_LOGO };
+    let logo_w = width(logo[0]);
+    let gap = if compact { 1 } else { 2 };
+    let block_h = logo.len() as u16 + 2 + gap + shortcuts.len() as u16 * gap;
     let top = area.y + area.height.saturating_sub(block_h) / 2;
-    if area.width >= logo_w + 4 {
+    if area.width >= logo_w + 2 {
         let lx = area.x + (area.width - logo_w) / 2;
-        for (row, line) in LOGO.iter().enumerate() {
+        for (row, line) in logo.iter().enumerate() {
             for (i, ch) in line.chars().enumerate() {
                 let t = (i as f32 / logo_w as f32 + row as f32 * 0.04).min(1.0);
                 let c = mix(pal.logo[0], pal.logo[1], t);
-                let c = if ch == '█' { c } else { mix(c, pal.bg, 0.45) };
+                let c = if ch == '█' || !big {
+                    c
+                } else {
+                    mix(c, pal.bg, 0.45)
+                };
                 put(
                     buf,
                     lx + i as u16,
@@ -657,19 +887,13 @@ fn render_welcome(buf: &mut Buffer, area: Rect, app: &mut App) {
                 );
             }
         }
-    } else {
-        let t = "termed";
-        put(
-            buf,
-            area.x + (area.width.saturating_sub(6)) / 2,
-            top + 3,
-            t,
-            bold(fgbg(pal.logo[0], pal.bg)),
-            area.right(),
-        );
     }
-    let tag = "the elite terminal code editor  ·  every language, one look";
-    let ty = top + LOGO.len() as u16 + 1;
+    let tag = if area.width < 62 {
+        "elite terminal code editor"
+    } else {
+        "the elite terminal code editor  ·  every language, one look"
+    };
+    let ty = top + logo.len() as u16 + 1;
     put(
         buf,
         area.x + area.width.saturating_sub(width(tag)) / 2,
@@ -678,28 +902,52 @@ fn render_welcome(buf: &mut Buffer, area: Rect, app: &mut App) {
         fgbg(pal.sidebar_dim, pal.bg),
         area.right(),
     );
-    let col_w = 44u16.min(area.width);
+    let col_w = 44u16.min(area.width.saturating_sub(4));
     let sx = area.x + area.width.saturating_sub(col_w) / 2;
-    for (i, (label, keys)) in shortcuts.iter().enumerate() {
-        let y = ty + 2 + i as u16;
+    for (i, (label, keys, cmd)) in shortcuts.iter().enumerate() {
+        let y = ty + 1 + gap + i as u16 * gap;
         if y >= area.bottom() {
             break;
         }
-        put(buf, sx, y, label, fgbg(pal.fg, pal.bg), sx + col_w);
-        let kx = sx + col_w - width(keys);
-        put(buf, kx, y, keys, fgbg(pal.match_fg, pal.bg), sx + col_w);
-        let dots_from = sx + width(label) + 1;
-        if kx > dots_from + 1 {
-            let dots = "·".repeat((kx - dots_from - 1) as usize);
+        let row = Rect::new(sx, y, col_w, 1);
+        if compact {
+            // Button-like rows for fingers.
+            let bbg = mix(pal.bg, pal.fg, 0.07);
+            fill(buf, row, bbg);
             put(
                 buf,
-                dots_from,
+                sx + 1,
                 y,
-                &dots,
-                fgbg(mix(pal.bg, pal.fg, 0.2), pal.bg),
-                kx,
+                keys,
+                bold(fgbg(pal.match_fg, bbg)),
+                row.right(),
             );
+            put(buf, sx + 4, y, label, fgbg(pal.fg, bbg), row.right());
+            put(
+                buf,
+                row.right().saturating_sub(2),
+                y,
+                "›",
+                fgbg(pal.sidebar_dim, bbg),
+                row.right(),
+            );
+        } else {
+            put(buf, sx, y, label, fgbg(pal.fg, pal.bg), sx + col_w);
+            let kx = sx + col_w - width(keys);
+            put(buf, kx, y, keys, fgbg(pal.match_fg, pal.bg), sx + col_w);
+            let dots_from = sx + width(label) + 1;
+            if kx > dots_from + 1 {
+                let dots = "·".repeat((kx - dots_from - 1) as usize);
+                put(
+                    buf,
+                    dots_from,
+                    y,
+                    &dots,
+                    fgbg(mix(pal.bg, pal.fg, 0.2), pal.bg),
+                    kx,
+                );
+            }
         }
+        app.layout.click_items.push((row, *cmd));
     }
-    let _ = Style::default();
 }

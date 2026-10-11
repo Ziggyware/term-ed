@@ -7,7 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, BorderType, Borders, Widget};
 use unicode_width::UnicodeWidthChar;
 
-use super::util::{bold, ellipsize, fg, fgbg, fill, put, shadow, width};
+use super::util::{bold, ellipsize, fg, fgbg, fill, put, shadow, width, wrap_text};
 use crate::app::{App, Focus, PaletteMode, ToastKind};
 use crate::icons;
 use crate::theme::mix;
@@ -82,17 +82,28 @@ pub fn render_palette(buf: &mut Buffer, screen: Rect, app: &mut App) -> Option<P
         .editor()
         .map(|e| (e.cursor().0 + 1, e.doc.len_lines()))
         .unwrap_or((0, 0));
+    let compact = app.compact;
+    // Rows taken at the bottom by the toolbar and status bar.
+    let reserved = 1 + u16::from(app.toolbar_visible());
     let p = app.palette.as_mut()?;
-    let w = (screen.width.saturating_sub(8)).clamp(30, 90);
-    let x = screen.x + (screen.width - w.min(screen.width)) / 2;
+    // Phones: edge-to-edge sheet just under the title bar.
+    let (w, x, top) = if compact {
+        let w = screen.width.saturating_sub(2).max(10);
+        (w, screen.x + 1, screen.y + 1)
+    } else {
+        let w = (screen.width.saturating_sub(8))
+            .clamp(30, 90)
+            .min(screen.width);
+        (w, screen.x + (screen.width - w) / 2, screen.y + 2)
+    };
     let list_rows = match p.mode {
         PaletteMode::GotoLine | PaletteMode::SaveAs => 1,
         _ => (p.filtered.len() as u16)
             .clamp(1, 14)
-            .min(screen.height.saturating_sub(7)),
+            .min(screen.height.saturating_sub(top + 4 + reserved).max(1)),
     };
     let h = list_rows + 4;
-    let r = Rect::new(x, screen.y + 2, w.min(screen.width), h);
+    let r = Rect::new(x, top, w, h);
     let title = match p.mode {
         PaletteMode::Commands => "Command Palette",
         PaletteMode::Files => "Go to File",
@@ -216,6 +227,8 @@ pub fn render_palette(buf: &mut Buffer, screen: Rect, app: &mut App) -> Option<P
         } else {
             label.clone()
         };
+        // Keyboard hints are noise on a phone and steal width from the label.
+        let hint = if compact { String::new() } else { hint };
         let hint_w = if hint.is_empty() { 0 } else { width(&hint) + 3 };
         let max_x = list.right().saturating_sub(hint_w + 1);
         for (ci, ch) in display.chars().enumerate() {
@@ -256,13 +269,22 @@ pub fn render_palette(buf: &mut Buffer, screen: Rect, app: &mut App) -> Option<P
 pub fn render_find(buf: &mut Buffer, editor: Rect, app: &mut App) -> Option<Position> {
     let pal = app.theme.palette.clone();
     let f = &app.find;
-    let w = 64u16.min(editor.width.saturating_sub(4));
-    if w < 30 {
+    let compact = app.compact;
+    let w = if compact {
+        editor.width
+    } else {
+        64u16.min(editor.width.saturating_sub(4))
+    };
+    if w < 24 {
         return None;
     }
     let h = if f.show_replace { 4 } else { 3 };
     let minimap_pad = if app.settings.minimap { 16 } else { 3 };
-    let x = editor.right().saturating_sub(w + minimap_pad).max(editor.x);
+    let x = if compact {
+        editor.x
+    } else {
+        editor.right().saturating_sub(w + minimap_pad).max(editor.x)
+    };
     let r = Rect::new(x, editor.y, w, h);
     let focused = app.focus == Focus::Find;
     panel(
@@ -413,8 +435,25 @@ pub fn render_dialog(buf: &mut Buffer, screen: Rect, app: &mut App) {
     let Some(d) = &app.dialog else { return };
     // Dim everything behind the modal.
     shadow(buf, screen);
-    let w = 64u16.min(screen.width.saturating_sub(4));
-    let h = 8u16;
+    let w = 64u16.min(screen.width.saturating_sub(2));
+    let text_w = w.saturating_sub(9) as usize;
+    let mut lines = wrap_text(&d.message, text_w);
+    let first_detail = lines.len();
+    lines.extend(wrap_text(
+        "Your changes will be lost if you don't save them.",
+        text_w,
+    ));
+    let narrow = w < 40;
+    let labels: [&str; 3] = if narrow {
+        [" Save ", " Don't Save ", " Cancel "]
+    } else {
+        ["  Save  ", "  Don't Save  ", "  Cancel  "]
+    };
+    let total: u16 = labels.iter().map(|l| width(l) + 2).sum();
+    // Stack the buttons when they don't fit on one row.
+    let stacked = total + 4 > w;
+    let button_rows = if stacked { 3 * 2 - 1 } else { 1 };
+    let h = 5 + lines.len() as u16 + button_rows;
     let r = Rect::new(
         screen.x + (screen.width - w) / 2,
         screen.y + screen.height.saturating_sub(h) / 2,
@@ -430,26 +469,16 @@ pub fn render_dialog(buf: &mut Buffer, screen: Rect, app: &mut App) {
         fgbg(pal.warning, pal.popup_bg),
         r.right(),
     );
-    put(
-        buf,
-        r.x + 6,
-        r.y + 2,
-        &ellipsize(&d.message, w as usize - 9),
-        bold(fgbg(pal.popup_fg, pal.popup_bg)),
-        r.right() - 2,
-    );
-    put(
-        buf,
-        r.x + 6,
-        r.y + 3,
-        "Your changes will be lost if you don't save them.",
-        fgbg(pal.popup_dim, pal.popup_bg),
-        r.right() - 2,
-    );
-    let labels = ["  Save  ", "  Don't Save  ", "  Cancel  "];
-    let total: u16 = labels.iter().map(|l| width(l) + 2).sum();
+    for (i, l) in lines.iter().enumerate() {
+        let st = if i < first_detail {
+            bold(fgbg(pal.popup_fg, pal.popup_bg))
+        } else {
+            fgbg(pal.popup_dim, pal.popup_bg)
+        };
+        put(buf, r.x + 6, r.y + 2 + i as u16, l, st, r.right() - 2);
+    }
     let mut x = r.right().saturating_sub(total + 2);
-    let y = r.y + 5;
+    let mut y = r.y + 3 + lines.len() as u16;
     let mut buttons = Vec::new();
     for (i, l) in labels.iter().enumerate() {
         let selected = i == d.selected;
@@ -458,9 +487,24 @@ pub fn render_dialog(buf: &mut Buffer, screen: Rect, app: &mut App) {
         } else {
             fgbg(pal.popup_fg, pal.input_bg)
         };
-        let nx = put(buf, x, y, l, st, r.right());
-        buttons.push((Rect::new(x, y, nx - x, 1), i));
-        x = nx + 2;
+        if stacked {
+            let br = Rect::new(r.x + 3, y, w.saturating_sub(6), 1);
+            fill(buf, br, st.bg.unwrap_or(pal.input_bg));
+            put(
+                buf,
+                br.x + (br.width.saturating_sub(width(l.trim()))) / 2,
+                y,
+                l.trim(),
+                st,
+                br.right(),
+            );
+            buttons.push((br, i));
+            y += 2;
+        } else {
+            let nx = put(buf, x, y, l, st, r.right());
+            buttons.push((Rect::new(x, y, nx - x, 1), i));
+            x = nx + 2;
+        }
     }
     app.layout.dialog_buttons = buttons;
 }
@@ -474,7 +518,7 @@ pub fn render_toasts(buf: &mut Buffer, area: Rect, app: &App) {
             ToastKind::Success => ("✔", pal.success),
             ToastKind::Error => ("✖", pal.error),
         };
-        let text = ellipsize(&t.text, (area.width as usize).saturating_sub(12).min(70));
+        let text = ellipsize(&t.text, (area.width as usize).saturating_sub(10).min(70));
         let w = width(&text) + 7;
         if y < area.y + 4 || w > area.width {
             break;
@@ -482,7 +526,7 @@ pub fn render_toasts(buf: &mut Buffer, area: Rect, app: &App) {
         y -= 3;
         let x = area
             .right()
-            .saturating_sub(w + 2 + if app.settings.minimap { 15 } else { 1 });
+            .saturating_sub(w + 1 + app.layout.minimap.width + app.layout.scrollbar.width);
         let r = Rect::new(x, y, w, 3);
         panel(buf, r, mix(pal.popup_bg, color, 0.6), pal.popup_bg, None);
         put(

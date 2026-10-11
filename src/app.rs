@@ -12,7 +12,7 @@ use regex::{Regex, RegexBuilder};
 use crate::clipboard::Clipboard;
 use crate::commands::{COMMANDS, Command};
 use crate::document::{Document, Indent, LineEnding, Selection};
-use crate::editor::{Editor, char_col_at};
+use crate::editor::Editor;
 use crate::explorer::{self, Explorer};
 use crate::fuzzy;
 use crate::highlight;
@@ -47,6 +47,44 @@ pub struct Palette {
     /// Theme active before a live-preview picker opened (restored on Esc).
     pub restore_theme: Option<String>,
 }
+
+/// What a touch-toolbar button does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tool {
+    Cmd(Command),
+    Key(KeyCode),
+}
+
+/// The on-screen toolbar for phones (no Ctrl/Alt/Esc/arrow keys on soft
+/// keyboards). Buttons are paginated to fit the screen width.
+pub const TOOLBAR: &[(&str, Tool)] = &[
+    ("☰", Tool::Cmd(Command::ToggleSidebar)),
+    ("Esc", Tool::Key(KeyCode::Esc)),
+    ("Tab", Tool::Key(KeyCode::Tab)),
+    ("◀", Tool::Key(KeyCode::Left)),
+    ("▲", Tool::Key(KeyCode::Up)),
+    ("▼", Tool::Key(KeyCode::Down)),
+    ("▶", Tool::Key(KeyCode::Right)),
+    ("Sel", Tool::Cmd(Command::ToggleSelectMode)),
+    ("↶", Tool::Cmd(Command::Undo)),
+    ("↷", Tool::Cmd(Command::Redo)),
+    ("Copy", Tool::Cmd(Command::Copy)),
+    ("Cut", Tool::Cmd(Command::Cut)),
+    ("Paste", Tool::Cmd(Command::Paste)),
+    ("Save", Tool::Cmd(Command::Save)),
+    ("Find", Tool::Cmd(Command::Find)),
+    ("Home", Tool::Key(KeyCode::Home)),
+    ("End", Tool::Key(KeyCode::End)),
+    ("PgUp", Tool::Key(KeyCode::PageUp)),
+    ("PgDn", Tool::Key(KeyCode::PageDown)),
+    ("All", Tool::Cmd(Command::SelectAll)),
+    ("Line", Tool::Cmd(Command::SelectLine)),
+    ("//", Tool::Cmd(Command::ToggleComment)),
+    ("⇤", Tool::Key(KeyCode::BackTab)),
+    ("Wrap", Tool::Cmd(Command::ToggleWordWrap)),
+    ("Go", Tool::Cmd(Command::GotoLine)),
+    ("⋯", Tool::Cmd(Command::CommandPalette)),
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PendingClose {
@@ -112,6 +150,10 @@ pub struct Layout {
     pub find_buttons: Vec<(Rect, u8)>,
     pub dialog_buttons: Vec<(Rect, usize)>,
     pub click_items: Vec<(Rect, Command)>,
+    pub toolbar: Vec<(Rect, Tool)>,
+    pub toolbar_next: Rect,
+    /// Explorer shown as a slide-over drawer (compact layout).
+    pub drawer: Rect,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -128,6 +170,12 @@ pub struct Settings {
     pub indent_guides: bool,
     pub line_numbers: bool,
     pub nerd_font: bool,
+    /// Soft wrap; `None` = automatic (on in the compact/phone layout).
+    pub word_wrap: Option<bool>,
+    /// Touch toolbar; `None` = automatic (on in the compact/phone layout).
+    pub toolbar: Option<bool>,
+    /// Always use the compact layout (`--mobile`).
+    pub force_compact: bool,
 }
 
 pub struct App {
@@ -146,6 +194,12 @@ pub struct App {
     pub git_branch: Option<String>,
     pub layout: Layout,
     pub quit: bool,
+    /// Phone-sized screen: single-column layout (set by the renderer each frame).
+    pub compact: bool,
+    /// Touch selection mode: arrows and taps extend the selection (no Shift on phones).
+    pub select_mode: bool,
+    pub toolbar_page: usize,
+    drawer_init: bool,
     clipboard: Clipboard,
     pub chord: bool,
     drag: Option<Drag>,
@@ -178,7 +232,14 @@ impl App {
                 indent_guides: true,
                 line_numbers: true,
                 nerd_font,
+                word_wrap: None,
+                toolbar: None,
+                force_compact: false,
             },
+            compact: false,
+            select_mode: false,
+            toolbar_page: 0,
+            drawer_init: false,
             git_branch: git_branch(&root),
             layout: Layout::default(),
             quit: false,
@@ -214,6 +275,25 @@ impl App {
         if self.toasts.len() > 4 {
             self.toasts.remove(0);
         }
+    }
+
+    pub fn word_wrap(&self) -> bool {
+        self.settings.word_wrap.unwrap_or(self.compact)
+    }
+
+    pub fn toolbar_visible(&self) -> bool {
+        self.settings.toolbar.unwrap_or(self.compact)
+    }
+
+    /// Called by the renderer with the screen width; switches the layout mode.
+    pub fn set_compact(&mut self, compact: bool) {
+        let compact = compact || self.settings.force_compact;
+        if compact && !self.drawer_init {
+            // On a phone the explorer is a drawer: start closed when a file is open.
+            self.show_sidebar = self.editors.is_empty();
+            self.drawer_init = true;
+        }
+        self.compact = compact;
     }
 
     /// Background work (highlighting) wants another frame.
@@ -295,10 +375,24 @@ impl App {
         }
     }
 
-    fn on_key(&mut self, k: KeyEvent) {
+    /// Synthesize a key press (touch toolbar).
+    pub fn press(&mut self, code: KeyCode) {
+        self.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn on_key(&mut self, mut k: KeyEvent) {
+        // Some phone keyboards send LF for Return, which arrives as Ctrl+J.
+        if k.code == KeyCode::Char('j') && k.modifiers == KeyModifiers::CONTROL {
+            k = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
-        let shift = k.modifiers.contains(KeyModifiers::SHIFT);
+        // Touch selection mode stands in for a held Shift key.
+        let shift = k.modifiers.contains(KeyModifiers::SHIFT)
+            || (self.select_mode
+                && is_movement(k.code)
+                && self.focus == Focus::Editor
+                && self.palette.is_none());
         // Normalize Ctrl+Shift+<letter>, which may arrive upper- or lower-case.
         let code = match k.code {
             KeyCode::Char(c) if ctrl || alt => KeyCode::Char(c.to_ascii_lowercase()),
@@ -377,6 +471,10 @@ impl App {
             self.chord = true;
             return;
         }
+        if alt && !ctrl && code == KeyCode::Char('z') {
+            self.run(Command::ToggleWordWrap);
+            return;
+        }
         if alt
             && !ctrl
             && let KeyCode::Char(c @ '1'..='9') = code
@@ -428,6 +526,13 @@ impl App {
             return;
         }
         let find_visible = self.find.visible;
+        if !is_movement(code) && self.select_mode {
+            // Any edit or Esc ends touch selection mode.
+            self.select_mode = false;
+            if code == KeyCode::Esc {
+                return;
+            }
+        }
         let Some(e) = self.editors.get_mut(self.active) else {
             return;
         };
@@ -500,6 +605,10 @@ impl App {
                 self.explorer.toggle(self.explorer.selected);
             } else {
                 self.open_file(&e.path);
+                if self.compact {
+                    // The drawer gets out of the way once a file is picked.
+                    self.show_sidebar = false;
+                }
             }
         }
     }
@@ -580,6 +689,19 @@ impl App {
                 }
             }
             ToggleMinimap => self.settings.minimap = !self.settings.minimap,
+            ToggleWordWrap => {
+                let on = !self.word_wrap();
+                self.settings.word_wrap = Some(on);
+                let state = if on { "on" } else { "off" };
+                self.toast(format!("Word wrap {state}"), ToastKind::Info);
+            }
+            ToggleToolbar => self.settings.toolbar = Some(!self.toolbar_visible()),
+            ToggleSelectMode => {
+                self.select_mode = !self.select_mode;
+                if !self.editors.is_empty() {
+                    self.focus = Focus::Editor;
+                }
+            }
             ToggleWhitespace => self.settings.whitespace = !self.settings.whitespace,
             ToggleIndentGuides => self.settings.indent_guides = !self.settings.indent_guides,
             ToggleLineNumbers => self.settings.line_numbers = !self.settings.line_numbers,
@@ -696,6 +818,7 @@ impl App {
         }
         e.scroll_into_view();
         if let Some((text, whole)) = clip {
+            self.select_mode = false;
             self.clipboard.set(text, whole);
         }
     }
@@ -1420,6 +1543,19 @@ impl App {
 
     fn mouse_down(&mut self, pos: Position, mods: KeyModifiers) {
         let l = self.layout.clone();
+        // The touch toolbar works on top of everything (it is how you press
+        // Esc or arrows in a dialog or palette on a phone).
+        if l.toolbar_next.contains(pos) {
+            self.toolbar_page += 1;
+            return;
+        }
+        if let Some((_, tool)) = l.toolbar.iter().find(|(r, _)| r.contains(pos)) {
+            match *tool {
+                Tool::Cmd(c) => self.run(c),
+                Tool::Key(k) => self.press(k),
+            }
+            return;
+        }
         if let Some(d) = &self.dialog {
             let _ = d;
             if let Some((_, i)) = l.dialog_buttons.iter().find(|(r, _)| r.contains(pos)) {
@@ -1442,6 +1578,17 @@ impl App {
                     self.set_theme(&t);
                 }
                 self.palette = None;
+            }
+            return;
+        }
+        // Tapping outside the explorer drawer closes it.
+        if l.drawer.width > 0
+            && !l.drawer.contains(pos)
+            && !l.click_items.iter().any(|(r, _)| r.contains(pos))
+        {
+            self.show_sidebar = false;
+            if self.focus == Focus::Explorer && !self.editors.is_empty() {
+                self.focus = Focus::Editor;
             }
             return;
         }
@@ -1535,7 +1682,7 @@ impl App {
             let count = self.click_count(pos);
             let in_gutter = l.gutter.contains(pos);
             let Some(idx) = self.idx_at(pos) else { return };
-            let shift = mods.contains(KeyModifiers::SHIFT);
+            let shift = mods.contains(KeyModifiers::SHIFT) || self.select_mode;
             let Some(e) = self.editor_mut() else { return };
             if in_gutter {
                 let (line, _) = e.doc.pos(idx);
@@ -1601,9 +1748,8 @@ impl App {
                     let total = e.doc.len_lines();
                     let rel = (pos.y.saturating_sub(area.y)) as f32 / area.height.max(1) as f32;
                     let target = (rel * total as f32) as usize;
-                    e.scroll_line = target
-                        .saturating_sub(e.view_height / 2)
-                        .min(total.saturating_sub(1));
+                    let half = e.view_height / 2;
+                    e.scroll_to_line(target.saturating_sub(half));
                 }
             }
             Some(Drag::SidebarResize) => {
@@ -1618,11 +1764,29 @@ impl App {
         let l = &self.layout;
         let e = self.editor()?;
         let row = pos.y.checked_sub(l.text.y)? as usize;
-        let line = (e.scroll_line + row).min(e.doc.len_lines().saturating_sub(1));
         let x = pos.x.saturating_sub(l.text.x) as usize + e.scroll_col;
-        let col = char_col_at(&e.doc.line_str(line), x, e.tab());
+        let rows = e.visual_rows(row + 1);
+        // Below the last line: end of document.
+        let Some(&(line, _, seg, last)) = rows.get(row) else {
+            return Some(e.doc.rope.len_chars());
+        };
+        let col = e.col_at_x(line, &seg, last, x);
         Some(e.doc.idx(line, col))
     }
+}
+
+fn is_movement(code: KeyCode) -> bool {
+    matches!(
+        code,
+        KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Home
+            | KeyCode::End
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+    )
 }
 
 fn byte_at(s: &str, char_idx: usize) -> usize {

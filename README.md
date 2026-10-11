@@ -8,6 +8,20 @@ A terminal code editor that looks and feels like the Visual Studio C# editor, fo
 |---|---|
 | ![Command palette](docs/command-palette.png) | ![Find and replace](docs/find-neon.png) |
 
+## On a phone
+
+![termed on a 46-column phone screen: explorer drawer, wrapped C#, find, command palette](docs/mobile.png)
+
+termed adapts to phone terminals such as Termux, Blink, Termius and iSH. Below 80 columns it switches to a compact layout automatically; `--mobile` (or `TERMED_MOBILE=1`) forces it at any size. Rotating the device or resizing the window re-lays out the screen immediately.
+
+- **Word wrap.** Long lines wrap, so you never scroll sideways. Wrapped rows keep the line's indent and get a `↪` marker in the gutter, and long expressions break at spaces, commas, brackets or before a `.`. `Alt+Z` or the **Wrap** button toggles it.
+- **Touch toolbar.** A row of tappable keys that phone keyboards lack: ☰, Esc, Tab, arrows, **Sel**, undo/redo, Copy/Cut/Paste, Save, Find, Home/End, PgUp/PgDn, select all/line, comment, outdent, Wrap, Go to line and ⋯ (all commands). Buttons stretch to fill the width, and **»** shows the next page. The toolbar stays on in Termux, Blink and a-Shell even in landscape; `--no-toolbar` hides it.
+- **Selection without Shift.** Tap **Sel**, then use the arrow buttons or tap in the text to extend the selection. Copy, Cut, Esc or typing ends selection mode. Double-tap selects a word, and a triple-tap selects a line.
+- **Explorer drawer.** ☰ slides the file tree over the editor. Tapping a file opens it and closes the drawer, and tapping outside dismisses it.
+- **Compact chrome.** The title bar has large ☰, ⌕ (open file) and ⋯ (commands) buttons, and tapping the file name opens quick open. The tab row appears only when more than one file is open. Breadcrumbs, the minimap and keyboard hints are hidden. The status bar drops lower-priority items first.
+- **Phone-sized overlays.** The command palette is edge to edge, the find/replace bar spans the full width, and dialog text wraps; dialog buttons stack when they don't fit side by side. The welcome screen is a list of large buttons.
+- **Gestures and keyboards.** Swipes scroll, a tap moves the cursor (including on wrapped rows), and you can drag the scrollbar. Keyboards that send LF for Return work as Enter.
+
 ## Features
 
 **Visual Studio look**
@@ -40,7 +54,10 @@ cargo install --path .
 termed                      # open the current folder
 termed src/Program.cs       # open a file
 termed ~/code/project -t "Termed Neon"
+termed --mobile src/main.rs # force the phone layout
 ```
+
+On Android, install [Termux](https://termux.dev), run `pkg install rust git`, then `cargo install --path .`.
 
 You need a terminal with truecolor support to get the full look (Windows Terminal, iTerm2, WezTerm, kitty, Alacritty, GNOME Terminal and others). termed detects `COLORTERM=truecolor` and falls back to 256 colors when it isn't set; set `TERMED_TRUECOLOR=1` to force truecolor. Pass `--nerd-font` (or set `TERMED_NERD_FONT=1`) to use Nerd Font file icons.
 
@@ -71,6 +88,7 @@ You need a terminal with truecolor support to get the full look (Windows Termina
 | Color theme picker / next theme | `Ctrl+K T` / `F8` |
 | Language mode | `Ctrl+K Ctrl+M` |
 | Toggle minimap / whitespace / indent guides / line numbers | `Ctrl+K M` / `W` / `I` / `L` |
+| Toggle word wrap | `Alt+Z` |
 
 Some combinations (Ctrl+Shift+…, Ctrl+Enter, Ctrl+[) can only be told apart in terminals that support the kitty keyboard protocol, which termed turns on when it is available. In other terminals, Ctrl+Backspace arrives as Ctrl+H (Replace), so use Alt+Backspace to delete a word. Every command can also be run from the command palette.
 
@@ -93,11 +111,11 @@ Source layout:
 ```
 src/
   document.rs     rope buffer, undo/redo transactions, line endings, indent detection
-  editor.rs       caret/selection model and VS-style editing commands
+  editor.rs       caret/selection model, soft wrap and VS-style editing commands
   highlight.rs    incremental, time-budgeted highlighting + string-aware bracket analysis
   theme.rs        Visual Studio Dark / Termed Neon + derived palettes for bundled themes
   app.rs          state, key/mouse handling, palette, find/replace, dialogs
-  ui/             title bar, explorer, tabs, breadcrumbs, code view, minimap, overlays
+  ui/             title bar, explorer/drawer, tabs, code view, minimap, toolbar, overlays
 examples/
   snapshot.rs     renders frames to HTML headlessly (used for the screenshots)
 ```
@@ -105,8 +123,9 @@ examples/
 ## Development
 
 ```sh
-cargo test
+cargo test                  # includes tests/mobile.rs: phone layout, taps, toolbar, rotation
 cargo clippy --all-targets
-# Render a frame to HTML, replaying keystrokes:
+# Render a frame to HTML, replaying keystrokes, taps and swipes:
 cargo run --example snapshot -- out.html 150x42 "Visual Studio Dark" . src/main.rs -- ctrl+p text:editor
+cargo run --example snapshot -- phone.html 46x30 "Visual Studio Dark" . src/main.rs -- tap:1,0 swipeup:20,10 resize:100x24
 ```

@@ -51,6 +51,9 @@ pub enum Command {
     RefreshExplorer,
     RevealInExplorer,
     ShowKeybindings,
+    ToggleWordWrap,
+    ToggleToolbar,
+    ToggleSelectMode,
 }
 
 pub struct CommandInfo {
@@ -115,4 +118,7 @@ cmds! {
     RefreshExplorer, "Explorer: Refresh", "";
     RevealInExplorer, "Explorer: Reveal Active File", "";
     ShowKeybindings, "Help: Keyboard Shortcuts", "Ctrl+K Ctrl+S";
+    ToggleWordWrap, "View: Toggle Word Wrap", "Alt+Z";
+    ToggleToolbar, "View: Toggle Touch Toolbar", "";
+    ToggleSelectMode, "Selection: Toggle Touch Selection Mode", "";
 }

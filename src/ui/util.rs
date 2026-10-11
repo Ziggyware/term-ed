@@ -68,6 +68,43 @@ pub fn shadow(buf: &mut Buffer, area: Rect) {
     }
 }
 
+/// Greedy word wrap to `max` columns (long words are hard-broken).
+pub fn wrap_text(s: &str, max: usize) -> Vec<String> {
+    let max = max.max(1);
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    for word in s.split_whitespace() {
+        let mut word = word.to_string();
+        loop {
+            let cw = UnicodeWidthStr::width(cur.as_str());
+            let ww = UnicodeWidthStr::width(word.as_str());
+            let need = if cur.is_empty() { ww } else { cw + 1 + ww };
+            if need <= max {
+                if !cur.is_empty() {
+                    cur.push(' ');
+                }
+                cur.push_str(&word);
+                break;
+            }
+            if !cur.is_empty() {
+                lines.push(std::mem::take(&mut cur));
+                continue;
+            }
+            // Word longer than a whole line.
+            let cut: String = word.chars().take(max).collect();
+            word = word.chars().skip(max).collect();
+            lines.push(cut);
+            if word.is_empty() {
+                break;
+            }
+        }
+    }
+    if !cur.is_empty() || lines.is_empty() {
+        lines.push(cur);
+    }
+    lines
+}
+
 /// Text truncated to `max` columns with an ellipsis.
 pub fn ellipsize(s: &str, max: usize) -> String {
     if UnicodeWidthStr::width(s) <= max {

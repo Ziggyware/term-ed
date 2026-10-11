@@ -37,6 +37,13 @@ struct Args {
     /// Use Nerd Font file icons.
     #[arg(long, env = "TERMED_NERD_FONT")]
     nerd_font: bool,
+    /// Phone mode: compact layout, word wrap and the touch toolbar at any size.
+    /// (These turn on automatically below 80 columns.)
+    #[arg(long, env = "TERMED_MOBILE")]
+    mobile: bool,
+    /// Never show the touch toolbar.
+    #[arg(long)]
+    no_toolbar: bool,
     /// Print the available themes and exit.
     #[arg(long)]
     list_themes: bool,
@@ -100,6 +107,20 @@ fn main() -> Result<()> {
     // Warm up the grammar set so the first frame is instant.
     let _ = highlight::syntax_set();
     let mut app = App::new(root, files, &args.theme, args.nerd_font);
+    // Termux, iSH and similar run on touch screens even when the window is wide
+    // (landscape, tablets, DeX): keep the toolbar there.
+    let touch_terminal = std::env::var_os("TERMUX_VERSION").is_some()
+        || std::env::var("PREFIX").is_ok_and(|p| p.contains("com.termux"))
+        || std::env::var("TERM_PROGRAM").is_ok_and(|t| matches!(t.as_str(), "Blink" | "a-Shell"));
+    if args.mobile {
+        app.settings.force_compact = true;
+        app.settings.toolbar = Some(true);
+    } else if touch_terminal {
+        app.settings.toolbar = Some(true);
+    }
+    if args.no_toolbar {
+        app.settings.toolbar = Some(false);
+    }
 
     let mut terminal = ratatui::init();
     let enhanced = supports_keyboard_enhancement().unwrap_or(false);

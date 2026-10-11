@@ -9,7 +9,7 @@ use ratatui::style::{Color, Modifier, Style};
 use super::util::{fill, put};
 use crate::app::{App, Focus};
 use crate::document::Indent;
-use crate::editor::{Editor, LineChange, char_width};
+use crate::editor::{Editor, LineChange, Seg, char_width};
 use crate::highlight::LineHighlight;
 use crate::theme::{Palette, mix};
 
@@ -30,14 +30,22 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
     let find_current = app.find.current;
     let indent_guides = app.settings.indent_guides;
     let render_ws = app.settings.whitespace;
+    let compact = app.compact;
+    let wrap = app.word_wrap();
     let bg = pal.bg;
     let e = app.editors.get_mut(app.active)?;
 
     // ---------------------------------------------------------------- layout
     let total = e.doc.len_lines();
-    let digits = total.to_string().len().max(3) as u16;
-    let gutter_w = if show_numbers { digits + 4 } else { 3 };
-    let minimap_w = if settings_minimap && area.width > 60 {
+    // Phones get a tight gutter: number, change bar, one space.
+    let digits = total.to_string().len().max(if compact { 2 } else { 3 }) as u16;
+    let pad = if compact { 0 } else { 1 };
+    let gutter_w = if show_numbers {
+        digits + 2 + 2 * pad
+    } else {
+        2 + pad
+    };
+    let minimap_w = if settings_minimap && !compact && area.width > 90 {
         MINIMAP_WIDTH
     } else {
         0
@@ -70,6 +78,14 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
     e.view_height = text.height as usize;
     e.view_width = text.width.saturating_sub(1) as usize;
     e.scroll_line = e.scroll_line.min(total.saturating_sub(1));
+    let new_wrap = wrap.then(|| text.width.saturating_sub(1).max(8) as usize);
+    if e.wrap_width != new_wrap {
+        // Width changed (rotation, sidebar, toggle): keep the caret in view.
+        e.wrap_width = new_wrap;
+        e.scroll_seg = 0;
+        e.scroll_col = 0;
+        e.scroll_into_view();
+    }
 
     let h = text.height as usize;
     let mm_lines = minimap.height as usize * 4;
@@ -93,7 +109,6 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
     fill(buf, area, bg);
     fill(buf, gutter, bg);
 
-    let (cur_line, _) = e.cursor();
     let sel = e.sel;
     let changes: Vec<LineChange> = e.line_changes().to_vec();
     let bracket_pair = e.bracket_pair();
@@ -105,17 +120,15 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
     .max(1);
     let tab = e.tab();
 
-    // Indent levels for guides (blank lines inherit from neighbours).
-    let levels = indent_levels(e, e.scroll_line, h, unit);
+    let rows = e.visual_rows(h);
+    let mut levels = std::collections::HashMap::new();
     let active_guide = active_guide(e, unit);
+    let (cur_line, cur_col) = e.cursor();
+    let (cur_row, cur_x) = e.visual_x(cur_line, cur_col);
+    let mut caret = None;
 
-    for row in 0..h {
-        let line = e.scroll_line + row;
+    for (row, &(line, k, seg, last)) in rows.iter().enumerate() {
         let y = text.y + row as u16;
-        if line >= total {
-            // Empty area below the document.
-            continue;
-        }
         let is_cur = line == cur_line;
         let line_bg = if is_cur && sel.is_empty() {
             pal.line_highlight
@@ -126,44 +139,43 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
             fill(buf, Rect::new(text.x, y, text.width, 1), line_bg);
         }
 
-        // Gutter.
-        if show_numbers {
+        // Gutter: the number goes on the first row of a wrapped line.
+        if show_numbers && k == 0 {
             let num = format!("{:>w$}", line + 1, w = digits as usize);
             let st = if is_cur {
                 Style::default().fg(pal.gutter_fg_active)
             } else {
                 Style::default().fg(pal.gutter_fg)
             };
-            put(buf, gutter.x + 1, y, &num, st.bg(bg), gutter.right());
+            put(buf, gutter.x + pad, y, &num, st.bg(bg), gutter.right());
+        } else if show_numbers && k > 0 {
+            let x = gutter.right().saturating_sub(3 + pad);
+            put(
+                buf,
+                x,
+                y,
+                "↪",
+                Style::default().fg(pal.indent_guide).bg(bg),
+                gutter.right(),
+            );
         }
-        let marker_x = gutter.right().saturating_sub(2);
-        match changes.get(line).copied().unwrap_or(LineChange::None) {
-            LineChange::Added => put(
-                buf,
-                marker_x,
-                y,
-                "▎",
-                Style::default().fg(pal.diff_added),
-                gutter.right(),
-            ),
-            LineChange::Modified => put(
-                buf,
-                marker_x,
-                y,
-                "▎",
-                Style::default().fg(pal.diff_modified),
-                gutter.right(),
-            ),
-            LineChange::DeletedAbove => put(
-                buf,
-                marker_x,
-                y,
-                "▔",
-                Style::default().fg(pal.diff_deleted),
-                gutter.right(),
-            ),
-            LineChange::None => 0,
+        let marker_x = gutter.right().saturating_sub(1 + pad);
+        let marker = match changes.get(line).copied().unwrap_or(LineChange::None) {
+            LineChange::Added => Some(("▎", pal.diff_added)),
+            LineChange::Modified => Some(("▎", pal.diff_modified)),
+            LineChange::DeletedAbove if k == 0 => Some(("▔", pal.diff_deleted)),
+            _ => None,
         };
+        if let Some((sym, c)) = marker {
+            put(
+                buf,
+                marker_x,
+                y,
+                sym,
+                Style::default().fg(c),
+                gutter.right(),
+            );
+        }
 
         // Code.
         let line_text = e.doc.line_str(line);
@@ -182,15 +194,16 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
             line_bg,
             render_ws,
         };
-        draw_line(buf, text, y, &line_text, e.scroll_col, tab, &ctx);
+        let origin = seg.dstart + e.scroll_col;
+        draw_line(buf, text, y, &line_text, seg, origin, tab, &ctx);
 
         // Selection includes the newline: show one cell past EOL like VS.
         if let Some((s, en)) = ctx.sel_range {
             let eol = line_start + line_text.chars().count();
-            if s <= eol && en > eol && line + 1 < total {
+            if last && s <= eol && en > eol && line + 1 < total {
                 let dc = crate::editor::display_col(&line_text, line_text.chars().count(), tab);
-                if dc >= e.scroll_col {
-                    let x = text.x + (dc - e.scroll_col) as u16;
+                if dc >= origin {
+                    let x = text.x + (seg.indent + dc - origin) as u16;
                     if x < text.right() {
                         super::util::set_bg(buf, x, y, pal.selection);
                     }
@@ -198,11 +211,13 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
             }
         }
 
-        // Indent guides.
+        // Indent guides (drawn through wrapped rows too).
         if indent_guides {
-            let lvl = levels[row];
-            for k in 0..lvl {
-                let dc = k * unit;
+            let lvl = *levels
+                .entry(line)
+                .or_insert_with(|| level_of(e, line, unit));
+            for g in 0..lvl {
+                let dc = g * unit;
                 if dc < e.scroll_col {
                     continue;
                 }
@@ -210,7 +225,8 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
                 if x >= text.right() {
                     break;
                 }
-                let active = active_guide.is_some_and(|(g, a, b)| g == k && line >= a && line <= b);
+                let active =
+                    active_guide.is_some_and(|(ag, a, b)| ag == g && line >= a && line <= b);
                 if let Some(cell) = buf.cell_mut((x, y))
                     && (cell.symbol() == " " || cell.symbol() == "·")
                 {
@@ -223,6 +239,13 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
                 }
             }
         }
+
+        if line == cur_line && k == cur_row && cur_x >= e.scroll_col {
+            let x = text.x + (cur_x - e.scroll_col) as u16;
+            if x < text.right() {
+                caret = Some(Position::new(x, y));
+            }
+        }
     }
 
     if minimap_w > 0 {
@@ -230,17 +253,7 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
     }
     render_scrollbar(buf, scrollbar, e, &pal, &find_matches, &changes);
 
-    // Caret.
-    let (cl, _) = e.cursor();
-    let dc = e.cursor_display_col();
-    if focus_editor && cl >= e.scroll_line && cl < e.scroll_line + h && dc >= e.scroll_col {
-        let x = text.x + (dc - e.scroll_col) as u16;
-        let y = text.y + (cl - e.scroll_line) as u16;
-        if x < text.right() {
-            return Some(Position::new(x, y));
-        }
-    }
-    None
+    caret.filter(|_| focus_editor)
 }
 
 struct LineCtx<'a> {
@@ -257,15 +270,20 @@ struct LineCtx<'a> {
     render_ws: bool,
 }
 
+/// Draw one visual row: the chars of `seg`, with display column `origin`
+/// at the left edge (after the row's indent).
+#[allow(clippy::too_many_arguments)]
 fn draw_line(
     buf: &mut Buffer,
     area: Rect,
     y: u16,
     text: &str,
-    scroll_col: usize,
+    seg: Seg,
+    origin: usize,
     tab: usize,
     ctx: &LineCtx,
 ) {
+    let left = area.x as usize + seg.indent;
     let pal = ctx.pal;
     let spans = ctx.lh.map(|l| l.spans.as_slice()).unwrap_or(&[]);
     let brackets = ctx.lh.map(|l| l.brackets.as_slice()).unwrap_or(&[]);
@@ -278,7 +296,11 @@ fn draw_line(
 
     for (col, ch) in text.chars().enumerate() {
         let w = char_width(ch, dcol, tab);
-        if dcol >= scroll_col + area.width as usize {
+        if col < seg.start {
+            dcol += w;
+            continue;
+        }
+        if col >= seg.end || left + dcol >= origin + area.right() as usize {
             break;
         }
         let idx = ctx.line_start + col;
@@ -356,14 +378,27 @@ fn draw_line(
         }
 
         // Clip against horizontal scroll.
-        if dcol + w > scroll_col {
-            let x = area.x as usize + dcol.saturating_sub(scroll_col);
-            if dcol >= scroll_col {
-                put(buf, x as u16, y, &glyph, style, area.right());
+        if dcol + w > origin {
+            if dcol >= origin {
+                put(
+                    buf,
+                    (left + dcol - origin) as u16,
+                    y,
+                    &glyph,
+                    style,
+                    area.right(),
+                );
             } else {
                 // Partially scrolled-off wide char / tab: paint the visible part blank.
-                let visible = dcol + w - scroll_col;
-                put(buf, area.x, y, &" ".repeat(visible), style, area.right());
+                let visible = dcol + w - origin;
+                put(
+                    buf,
+                    left as u16,
+                    y,
+                    &" ".repeat(visible),
+                    style,
+                    area.right(),
+                );
             }
         }
         dcol += w;
@@ -443,18 +478,6 @@ fn level_of(e: &Editor, line: usize, unit: usize) -> usize {
         (Some(a), Some(b)) => a.min(b) / unit,
         _ => 0,
     }
-}
-
-fn indent_levels(e: &Editor, from: usize, h: usize, unit: usize) -> Vec<usize> {
-    (from..from + h)
-        .map(|l| {
-            if l < e.doc.len_lines() {
-                level_of(e, l, unit)
-            } else {
-                0
-            }
-        })
-        .collect()
 }
 
 /// The guide for the block that contains the caret: (level, first line, last line).

@@ -23,6 +23,90 @@ pub struct Editor {
     pub diff_cache: Option<(u64, Vec<LineChange>)>,
     /// Exact highlighting has not caught up with the viewport yet.
     pub hl_pending: bool,
+    /// Soft-wrap width in columns (set by the renderer when word wrap is on).
+    pub wrap_width: Option<usize>,
+    /// First visible wrapped row of `scroll_line`.
+    pub scroll_seg: usize,
+}
+
+/// One visual row of a (possibly soft-wrapped) line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Seg {
+    /// Char range of the line shown on this row.
+    pub start: usize,
+    pub end: usize,
+    /// Display column within the whole line where this row starts.
+    pub dstart: usize,
+    /// Blank columns before the text (wrapped rows keep the line's indent).
+    pub indent: usize,
+}
+
+/// Split a line into rows of at most `width` columns, breaking after
+/// whitespace where possible (VS Code's "wordWrap" with "same" indent).
+pub fn wrap_line(text: &str, width: usize, tab: usize) -> Vec<Seg> {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    let mut cols = Vec::with_capacity(n + 1);
+    let mut d = 0;
+    for &c in &chars {
+        cols.push(d);
+        d += char_width(c, d, tab);
+    }
+    cols.push(d);
+    let width = width.max(4);
+    let lead = chars
+        .iter()
+        .take_while(|c| **c == ' ' || **c == '\t')
+        .count();
+    let cont_indent = if cols[lead] <= width / 2 {
+        cols[lead]
+    } else {
+        0
+    };
+    let mut segs = Vec::new();
+    let mut s = 0;
+    loop {
+        let indent = if segs.is_empty() { 0 } else { cont_indent };
+        let avail = width.saturating_sub(indent).max(1);
+        let ds = cols[s];
+        let mut e = s;
+        while e < n && cols[e + 1] - ds <= avail {
+            e += 1;
+        }
+        if e >= n {
+            segs.push(Seg {
+                start: s,
+                end: n,
+                dstart: ds,
+                indent,
+            });
+            return segs;
+        }
+        if e == s {
+            // A single char wider than the row.
+            e = s + 1;
+        } else if let Some(b) = (s + 1..=e)
+            .rev()
+            .find(|&j| {
+                matches!(chars[j - 1], ' ' | '\t' | ',' | '(' | '[' | '{' | ';')
+                    || (j < n && chars[j] == '.')
+            })
+            .filter(|&j| cols[j] - ds >= avail / 3)
+        {
+            e = b;
+        }
+        segs.push(Seg {
+            start: s,
+            end: e,
+            dstart: ds,
+            indent,
+        });
+        s = e;
+    }
+}
+
+fn seg_index(segs: &[Seg], col: usize) -> usize {
+    segs.iter().rposition(|s| s.start <= col).unwrap_or(0)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -160,6 +244,8 @@ impl Editor {
             view_width: 80,
             diff_cache: None,
             hl_pending: false,
+            wrap_width: None,
+            scroll_seg: 0,
         }
     }
 
@@ -234,20 +320,25 @@ impl Editor {
     }
 
     pub fn move_vertical(&mut self, delta: isize, extend: bool) {
-        let (line, _) = self.cursor();
+        let (line, col) = self.cursor();
+        let segs = self.segments(line);
+        let k = seg_index(&segs, col);
         let want = self
             .preferred_col
-            .unwrap_or_else(|| self.cursor_display_col());
-        let last = self.doc.len_lines().saturating_sub(1) as isize;
-        let target = line as isize + delta;
-        if target < 0 {
-            self.set_head(0, extend);
-        } else if target > last {
-            self.set_head(self.doc.rope.len_chars(), extend);
+            .unwrap_or_else(|| self.visual_x(line, col).1);
+        let (target, hit_edge) = self.step_rows((line, k), delta);
+        if hit_edge {
+            // Ran into the first/last row: go to the document edge.
+            if delta < 0 {
+                self.set_head(0, extend);
+            } else if delta > 0 {
+                self.set_head(self.doc.rope.len_chars(), extend);
+            }
         } else {
-            let t = target as usize;
-            let col = char_col_at(&self.doc.line_str(t), want, self.tab());
-            let idx = self.doc.idx(t, col);
+            let tsegs = self.segments(target.0);
+            let last = target.1 + 1 == tsegs.len();
+            let c = self.col_at_x(target.0, &tsegs[target.1], last, want);
+            let idx = self.doc.idx(target.0, c);
             self.set_head(idx, extend);
         }
         self.preferred_col = Some(want);
@@ -256,12 +347,137 @@ impl Editor {
     pub fn page(&mut self, down: bool, extend: bool) {
         let h = self.view_height.max(2) as isize - 1;
         self.move_vertical(if down { h } else { -h }, extend);
-        if down {
-            self.scroll_line =
-                (self.scroll_line + h as usize).min(self.doc.len_lines().saturating_sub(1));
-        } else {
-            self.scroll_line = self.scroll_line.saturating_sub(h as usize);
+        self.scroll_by(if down { h } else { -h });
+    }
+
+    // ------------------------------------------------------------ soft wrap
+
+    /// Visual rows of a line (a single row when word wrap is off).
+    pub fn segments(&self, line: usize) -> Vec<Seg> {
+        match self.wrap_width {
+            Some(w) => wrap_line(&self.doc.line_str(line), w, self.tab()),
+            None => vec![Seg {
+                start: 0,
+                end: self.doc.line_len(line),
+                dstart: 0,
+                indent: 0,
+            }],
         }
+    }
+
+    /// (row within the line, visual x before horizontal scroll) of a char column.
+    pub fn visual_x(&self, line: usize, col: usize) -> (usize, usize) {
+        let segs = self.segments(line);
+        let k = seg_index(&segs, col);
+        let d = display_col(&self.doc.line_str(line), col, self.tab());
+        (k, segs[k].indent + d - segs[k].dstart)
+    }
+
+    /// Char column on row `seg` closest to visual x.
+    pub fn col_at_x(&self, line: usize, seg: &Seg, last: bool, x: usize) -> usize {
+        let target = x.saturating_sub(seg.indent) + seg.dstart;
+        let c = char_col_at(&self.doc.line_str(line), target, self.tab());
+        let max = if last {
+            seg.end
+        } else {
+            seg.end.saturating_sub(1).max(seg.start)
+        };
+        c.clamp(seg.start, max)
+    }
+
+    fn row_count(&self, line: usize) -> usize {
+        if self.wrap_width.is_some() {
+            self.segments(line).len()
+        } else {
+            1
+        }
+    }
+
+    /// Move `delta` visual rows; also reports whether the document edge cut the move short.
+    fn step_rows(&self, pos: (usize, usize), delta: isize) -> ((usize, usize), bool) {
+        let n = delta.unsigned_abs();
+        let t = if delta < 0 {
+            self.row_back(pos, n)
+        } else {
+            self.row_fwd(pos, n)
+        };
+        let moved = if delta < 0 {
+            self.rows_between(t, pos, n + 1)
+        } else {
+            self.rows_between(pos, t, n + 1)
+        };
+        (t, moved < n)
+    }
+
+    /// Step `n` visual rows back from (line, row).
+    pub fn row_back(&self, (mut l, mut k): (usize, usize), n: usize) -> (usize, usize) {
+        for _ in 0..n {
+            if k > 0 {
+                k -= 1;
+            } else if l > 0 {
+                l -= 1;
+                k = self.row_count(l) - 1;
+            } else {
+                break;
+            }
+        }
+        (l, k)
+    }
+
+    /// Step `n` visual rows forward from (line, row), stopping at the last row.
+    pub fn row_fwd(&self, (mut l, mut k): (usize, usize), n: usize) -> (usize, usize) {
+        let total = self.doc.len_lines();
+        for _ in 0..n {
+            if k + 1 < self.row_count(l) {
+                k += 1;
+            } else if l + 1 < total {
+                l += 1;
+                k = 0;
+            } else {
+                break;
+            }
+        }
+        (l, k)
+    }
+
+    fn scroll_pos(&self) -> (usize, usize) {
+        let l = self.scroll_line.min(self.doc.len_lines().saturating_sub(1));
+        (l, self.scroll_seg.min(self.row_count(l) - 1))
+    }
+
+    /// The rows visible from the scroll position: (line, row index, segment, is last row of line).
+    pub fn visual_rows(&self, h: usize) -> Vec<(usize, usize, Seg, bool)> {
+        let total = self.doc.len_lines();
+        let (mut l, mut k) = self.scroll_pos();
+        let mut out = Vec::with_capacity(h);
+        while out.len() < h && l < total {
+            let segs = self.segments(l);
+            while k < segs.len() && out.len() < h {
+                out.push((l, k, segs[k], k + 1 == segs.len()));
+                k += 1;
+            }
+            l += 1;
+            k = 0;
+        }
+        out
+    }
+
+    /// Visual rows from `a` to `b` (capped at `cap`).
+    fn rows_between(&self, a: (usize, usize), b: (usize, usize), cap: usize) -> usize {
+        if b <= a {
+            return 0;
+        }
+        if b.0 - a.0 > cap {
+            return cap;
+        }
+        let mut n = self.row_count(a.0) - a.1;
+        for l in a.0 + 1..b.0 {
+            n += self.row_count(l);
+            if n >= cap {
+                return cap;
+            }
+        }
+        if b.0 > a.0 { n + b.1 } else { b.1 - a.1 }
     }
 
     /// Visual Studio smart Home: toggle between first non-blank and column 0.
@@ -422,8 +638,9 @@ impl Editor {
     }
 
     pub fn center_on_cursor(&mut self) {
-        let (line, _) = self.cursor();
-        self.scroll_line = line.saturating_sub(self.view_height / 2);
+        let (line, col) = self.cursor();
+        let k = self.visual_x(line, col).0;
+        (self.scroll_line, self.scroll_seg) = self.row_back((line, k), self.view_height / 2);
     }
 
     pub fn jump_to_bracket(&mut self) {
@@ -1002,27 +1219,45 @@ impl Editor {
     // ------------------------------------------------------------ viewport
 
     pub fn scroll_into_view(&mut self) {
-        let (line, _) = self.cursor();
+        let (line, col) = self.cursor();
+        let (k, x) = self.visual_x(line, col);
+        let cur = (line, k);
         let h = self.view_height.max(1);
         let margin = 3.min(h / 3);
-        if line < self.scroll_line + margin {
-            self.scroll_line = line.saturating_sub(margin);
-        } else if line + margin >= self.scroll_line + h {
-            self.scroll_line = line + margin + 1 - h;
+        let top = self.scroll_pos();
+        if cur < top || self.rows_between(top, cur, h + 1) < margin {
+            (self.scroll_line, self.scroll_seg) = self.row_back(cur, margin);
+        } else if self.rows_between(top, cur, h + 1) + margin >= h {
+            (self.scroll_line, self.scroll_seg) = self.row_back(cur, h.saturating_sub(margin + 1));
         }
-        let col = self.cursor_display_col();
+        if self.wrap_width.is_some() {
+            self.scroll_col = 0;
+            return;
+        }
         let w = self.view_width.max(1);
         let hmargin = 4.min(w / 4);
-        if col < self.scroll_col + hmargin {
-            self.scroll_col = col.saturating_sub(hmargin);
-        } else if col + hmargin >= self.scroll_col + w {
-            self.scroll_col = col + hmargin + 1 - w;
+        if x < self.scroll_col + hmargin {
+            self.scroll_col = x.saturating_sub(hmargin);
+        } else if x + hmargin >= self.scroll_col + w {
+            self.scroll_col = x + hmargin + 1 - w;
         }
     }
 
+    /// Scroll by visual rows.
     pub fn scroll_by(&mut self, delta: isize) {
-        let max = self.doc.len_lines().saturating_sub(1) as isize;
-        self.scroll_line = (self.scroll_line as isize + delta).clamp(0, max) as usize;
+        let pos = self.scroll_pos();
+        let n = delta.unsigned_abs();
+        (self.scroll_line, self.scroll_seg) = if delta < 0 {
+            self.row_back(pos, n)
+        } else {
+            self.row_fwd(pos, n)
+        };
+    }
+
+    /// Jump the viewport so `line` is the top row (scrollbar/minimap drags).
+    pub fn scroll_to_line(&mut self, line: usize) {
+        self.scroll_line = line.min(self.doc.len_lines().saturating_sub(1));
+        self.scroll_seg = 0;
     }
 
     /// Per-line change markers versus the saved file (like VS's change tracking margin).
@@ -1188,5 +1423,59 @@ mod tests {
         e.type_char('!');
         assert_eq!(e.line_changes()[1], LineChange::Modified);
         assert_eq!(e.line_changes()[0], LineChange::None);
+    }
+
+    #[test]
+    fn wrap_breaks_after_whitespace_and_keeps_indent() {
+        let segs = wrap_line("    let total = order.lines.sum();", 24, 4);
+        assert_eq!(segs.len(), 2);
+        // Breaks before `.` so member chains wrap cleanly.
+        assert_eq!(
+            segs[0],
+            Seg {
+                start: 0,
+                end: 21,
+                dstart: 0,
+                indent: 0
+            }
+        );
+        assert_eq!(segs[1].start, 21);
+        assert_eq!(segs[1].indent, 4);
+        // Rows never exceed the width.
+        for w in 5..40 {
+            let text = "fn main() { let x = some_function_name(argument_one, argument_two); }";
+            for seg in wrap_line(text, w, 4) {
+                assert!(
+                    seg.indent + display_col(text, seg.end, 4) - seg.dstart <= w.max(4)
+                        || seg.end - seg.start == 1
+                );
+            }
+        }
+        assert_eq!(wrap_line("", 10, 4).len(), 1);
+    }
+
+    #[test]
+    fn vertical_movement_follows_wrapped_rows() {
+        let mut e = ed("aaaa bbbb cccc dddd\nx", "txt");
+        e.wrap_width = Some(10);
+        e.view_height = 3;
+        assert_eq!(e.segments(0).len(), 2);
+        e.move_to(0, 2, false);
+        e.move_vertical(1, false);
+        // Second row of line 0, same visual column.
+        assert_eq!(e.cursor(), (0, 12));
+        e.move_vertical(1, false);
+        assert_eq!(e.cursor(), (1, 1));
+        e.move_vertical(-2, false);
+        assert_eq!(e.cursor(), (0, 2));
+        e.move_vertical(-1, false);
+        assert_eq!(e.sel.head, 0);
+        // Scrolling counts rows, not lines.
+        e.scroll_by(1);
+        assert_eq!((e.scroll_line, e.scroll_seg), (0, 1));
+        e.doc_end(false);
+        e.scroll_into_view();
+        let rows = e.visual_rows(3);
+        assert!(rows.iter().any(|r| r.0 == 1));
     }
 }
