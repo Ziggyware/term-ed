@@ -283,6 +283,8 @@ pub struct Agent {
     stall_noted: bool,
     /// How long a turn may stay completely silent before we act.
     pub stall_after: Duration,
+    /// Real-time AG-UI streaming hub.
+    pub agui: crate::agui::AGUIHub,
 }
 
 impl Agent {
@@ -329,6 +331,7 @@ impl Agent {
             retry_after_cancel: false,
             stall_noted: false,
             stall_after: Duration::from_secs(25),
+            agui: crate::agui::AGUIHub::new(),
         }
     }
 
@@ -696,15 +699,37 @@ impl Agent {
         let current = self.model.clone().unwrap_or_default();
         let next = if crate::app::is_free_model(&current) {
             self.busy_models.insert(current.clone());
-            self.models
+            let free_candidates: Vec<(String, String)> = self
+                .models
                 .iter()
-                .find(|(v, _)| crate::app::is_free_model(v) && !self.busy_models.contains(v))
+                .filter(|(v, _)| crate::app::is_free_model(v))
                 .cloned()
+                .collect();
+            let selector = crate::decisions::ModelSelector::new(crate::decisions::default_engine());
+            selector
+                .select_fallback(&current, &free_candidates, &self.busy_models)
+                .and_then(|sel| self.models.iter().find(|(v, _)| *v == sel).cloned())
+                .or_else(|| {
+                    self.models
+                        .iter()
+                        .find(|(v, _)| crate::app::is_free_model(v) && !self.busy_models.contains(v))
+                        .cloned()
+                })
         } else {
             None
         };
         match next {
             Some((value, label)) => {
+                self.agui.emit(
+                    "decision:evaluated",
+                    self.session_id.as_deref().unwrap_or("agent"),
+                    json!({
+                        "query": "model_failover_choice",
+                        "previous_model": current,
+                        "selected_model": value,
+                        "label": label,
+                    }),
+                );
                 let old = self.model_label().unwrap_or(current);
                 let short = |s: &str| s.rsplit('/').next().unwrap_or(s).to_string();
                 self.entries.push(Entry::Notice {

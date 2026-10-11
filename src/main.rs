@@ -50,6 +50,9 @@ struct Args {
     /// Print the supported languages and exit.
     #[arg(long)]
     list_languages: bool,
+    /// Start the AG-UI streaming server & visual editor on the specified port.
+    #[arg(long, env = "TERMED_AGUI_PORT")]
+    agui_port: Option<u16>,
 }
 
 fn main() -> Result<()> {
@@ -107,6 +110,11 @@ fn main() -> Result<()> {
     // Warm up the grammar set so the first frame is instant.
     let _ = highlight::syntax_set();
     let mut app = App::new(root, files, &args.theme, args.nerd_font);
+
+    if let Some(port) = args.agui_port {
+        let _ = termed::agui::spawn_agui_server(port, app.agent.agui.clone());
+    }
+
     // Termux, iSH and similar run on touch screens even when the window is wide
     // (landscape, tablets, DeX): keep the toolbar there.
     let touch_terminal = std::env::var_os("TERMUX_VERSION").is_some()
