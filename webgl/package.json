@@ -1,0 +1,10 @@
+{
+  "name": "term-ed-webgl",
+  "private": true,
+  "type": "module",
+  "description": "Static WebGL2 page for the webgl demo. No build step; node_modules exists only for tools/validate.mjs.",
+  "devDependencies": {
+    "@shaderfrog/glsl-parser": "^3.0.0",
+    "jsdom": "^30.1.2"
+  }
+}

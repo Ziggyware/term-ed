@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SUBSTRATA — an interactive WebGL atlas of things that remember</title>
+<meta name="description" content="WebGL visualiser: liquid-crystal phase retardation, conoscopy, holography, and the clay/tree :: sand/shell substrate analogy — with an unreasonable number of knobs.">
+<link rel="stylesheet" href="css/app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23161a20'/><path d='M6 22c3-8 6-12 10-12s7 4 10 12' stroke='%23e0a45e' stroke-width='2.4' fill='none'/><circle cx='16' cy='24' r='2.4' fill='%2369c1e0'/></svg>">
+</head>
+<body>
+<div id="app">
+
+  <header id="topbar">
+    <div class="brand" id="brand" title="Substrata — click for the about panel">
+      <span class="glyph">▚</span><span class="word">SUBSTRATA</span>
+      <span class="sub">clay → trees :: shells → sand · feldspar → clay · light → phase → image</span>
+    </div>
+
+    <nav id="modeTabs" aria-label="Visualisation mode"></nav>
+
+    <div class="spacer"></div>
+
+    <div class="tbtn-group">
+      <button class="tbtn" id="btnPresets" title="Presets (P)"><span class="ico">✦</span><span class="lbl">Presets</span></button>
+      <button class="tbtn" id="btnRandom" title="Randomise (R)"><span class="ico">⚄</span><span class="lbl">Randomise</span></button>
+      <button class="tbtn" id="btnPalette" title="Command palette (Ctrl+K)"><span class="ico">⌘</span><span class="lbl">Find</span></button>
+      <button class="tbtn" id="btnPause" title="Pause / resume (Space)"><span class="ico">❚❚</span></button>
+      <button class="tbtn" id="btnPng" title="Save PNG (S)"><span class="ico">⤓</span></button>
+      <button class="tbtn" id="btnShare" title="Copy a share link with your whole configuration"><span class="ico">⧉</span><span class="lbl">Share</span></button>
+      <button class="tbtn" id="btnFull" title="Fullscreen (F)"><span class="ico">⛶</span></button>
+      <button class="tbtn" id="btnPanel" title="Show/hide controls (Tab)"><span class="ico">⚙</span></button>
+      <button class="tbtn" id="btnHelp" title="Keyboard shortcuts (?)"><span class="ico">?</span></button>
+    </div>
+  </header>
+
+  <main id="main">
+    <section id="stage">
+      <canvas id="gl" width="1280" height="720"></canvas>
+
+      <div id="hud" class="overlay"></div>
+      <div id="stats" class="overlay"></div>
+      <div id="legend" class="overlay"></div>
+      <div id="err" class="overlay hidden"></div>
+      <div id="toast" class="overlay"></div>
+      <div id="help" class="overlay hidden"></div>
+      <div id="dropHint" class="overlay hidden">drop a .json config to load it</div>
+      <div id="presetMenu" class="floating hidden"></div>
+      <div id="palette" class="floating hidden">
+        <input id="paletteInput" type="text" placeholder="Type a parameter, preset or mode…" spellcheck="false" autocomplete="off">
+        <div id="paletteList" class="list"></div>
+        <div class="hint"><kbd>↑</kbd><kbd>↓</kbd> move · <kbd>Enter</kbd> apply · <kbd>Esc</kbd> close</div>
+      </div>
+    </section>
+
+    <aside id="panel" aria-label="Controls">
+      <div id="resizer" title="Drag to resize"></div>
+      <div class="panel-head">
+        <div class="searchrow">
+          <span class="ico">⌕</span>
+          <input id="search" type="search" placeholder="Filter parameters…" spellcheck="false">
+          <button id="btnPanelClose" class="tbtn mini" title="Hide (Tab)">✕</button>
+        </div>
+        <div class="tabrow" id="panelTabs">
+          <button class="ptab active" data-tab="params">Parameters <span id="paramCount" class="badge"></span></button>
+          <button class="ptab" data-tab="presets">Presets</button>
+          <button class="ptab" data-tab="notes">Field notes</button>
+          <button class="ptab" data-tab="shader">Shader</button>
+          <button class="ptab" data-tab="share">Load / save</button>
+          <button class="ptab" data-tab="about">About</button>
+        </div>
+      </div>
+      <div id="panelBody">
+        <div class="tabpane" data-pane="params"></div>
+        <div class="tabpane hidden" data-pane="presets"></div>
+        <div class="tabpane hidden" data-pane="notes"></div>
+        <div class="tabpane hidden" data-pane="shader"></div>
+        <div class="tabpane hidden" data-pane="share"></div>
+        <div class="tabpane hidden" data-pane="about"></div>
+      </div>
+      <div id="panelFoot"><span id="footLeft">ready</span><span id="footRight"></span></div>
+    </aside>
+  </main>
+</div>
+
+<noscript style="color:#ddd;font:14px system-ui;padding:24px;display:block">
+  Substrata is a WebGL2 page and needs JavaScript. Everything it draws — liquid crystals, conoscopic
+  figures, holographic fringes and clay relief — is computed in fragment shaders.
+</noscript>
+
+<script type="module" src="js/main.js"></script>
+</body>
+</html>
