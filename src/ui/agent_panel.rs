@@ -334,6 +334,15 @@ fn build_rows(app: &App, w: usize, panel_bg: Color) -> Vec<Row> {
         ) {
             rows.push(Row::text(l, dim));
         }
+        if a.spec.as_ref().is_some_and(|s| s.builtin) {
+            rows.push(Row::blank());
+            for l in wrap_text(
+                "Free models via Kilo Gateway: no account or key. What you send may be logged by the model provider, so avoid secrets.",
+                w,
+            ) {
+                rows.push(Row::text(l, dim));
+            }
+        }
         rows.push(Row::blank());
         let file = app
             .editor()
@@ -393,6 +402,11 @@ fn build_rows(app: &App, w: usize, panel_bg: Color) -> Vec<Row> {
                 rows.push(Row::blank());
             }
             Entry::Agent(t) => {
+                // Models often emit bare newlines around tool calls: skip those.
+                let t = t.trim_matches('\n');
+                if t.trim().is_empty() {
+                    continue;
+                }
                 if i > 0 && !matches!(a.entries[i - 1], Entry::User(_)) {
                     rows.push(Row::blank());
                 }

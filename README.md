@@ -14,12 +14,14 @@ A terminal code editor that looks and feels like the Visual Studio C# editor, fo
 
 Press `Ctrl+K A`, click **✦ Agent** in the title bar, or tap **✦** on a phone. Then ask in plain words, or tap one of the suggestions ("Find bugs in calc.py"). The agent can read and edit your project:
 
-- **Free by default.** termed runs [OpenCode](https://opencode.ai) through the [Agent Client Protocol](https://agentclientprotocol.com). OpenCode's free models need no account, no API key and no configuration. If OpenCode isn't installed, the panel offers a one-tap **Install OpenCode (free)** button, which runs `npm install -g opencode-ai`.
-- **Free models are busy sometimes.** Free models are shared and occasionally rate-limited. If one stays silent for 25 seconds, termed switches to another free model and asks again automatically, telling you in the chat. Tap the model name to choose one yourself; free models are listed first.
+- **Free by default, nothing to install.** termed has a built-in agent, **termed AI**, written in Rust. It uses the free models of [Kilo Gateway](https://kilo.ai/docs/gateway/authentication), which allows anonymous use of its `:free` models with no account and no API key. Because it needs nothing else installed, it also works in **Termux on Android**. It can list, read, search, edit and create files, and run commands; every command asks for your approval first.
+- **OpenCode, if you have it.** On desktop, if [OpenCode](https://opencode.ai) is installed, termed uses it by default through the [Agent Client Protocol](https://agentclientprotocol.com); its free models also need no account. You can switch between agents with *Agent: Choose Agent*. On Android, OpenCode's npm package doesn't install, so termed AI is the default there.
+- **Free models are busy sometimes.** Free models are shared and rate-limited (Kilo allows 200 requests per hour per IP address, and one reply can take several requests). If a model reports it is busy, or stays silent for 25 seconds, termed switches to another free model and asks again automatically, telling you in the chat. Tap the model name to choose one yourself; free models are listed first. Set `TERMED_FREE_MODEL` to change the built-in agent's starting model.
+- **Privacy.** Your prompt, the open file and the files the agent reads are sent to the free model's provider. Free models may log or train on what they receive, so don't use them with secrets or confidential code.
 - **You stay in control.** The agent's edits appear in your open files as normal edits with change bars, and one Ctrl+Z (↶) reverts an edit. Diffs show inline in the chat, and tapping a change opens the file at that spot. If the agent asks permission to run a tool, you tap Allow or Reject (or press 1–3).
 - **Context is automatic.** The open file, and your selection if there is one, are attached to every message (shown as `@ file.py:12-20` above the prompt). Unsaved files are saved first so the agent sees your latest code.
 - **Esc or ■ stops the agent.** + New starts a fresh chat.
-- **Other agents work too.** Gemini CLI (`gemini --acp`), Claude Code (`claude-agent-acp`) and Codex (`codex-acp`) are detected automatically if installed; pick one with *Agent: Choose Agent*. Note that these generally need a sign-in or paid plan. Any other ACP agent works with `TERMED_AGENT="command args"`.
+- **Other agents work too.** Gemini CLI (`gemini --acp`), Claude Code (`claude-agent-acp`) and Codex (`codex-acp`) are detected automatically if installed; pick one with *Agent: Choose Agent*. Note that these generally need a sign-in or paid plan. Any other ACP agent works with `TERMED_AGENT="command args"`, and `TERMED_AGENT=builtin` forces the built-in agent.
 - **On a phone** the panel is a full-screen sheet above the touch keyboard ([screenshot](docs/agent-phone.png)).
 
 ## On a phone
@@ -81,7 +83,7 @@ termed ~/code/project -t "Termed Neon"
 termed --mobile src/main.rs # force the phone layout
 ```
 
-On Android, install [Termux](https://termux.dev), run `pkg install rust git`, then `cargo install --path .`.
+On Android, install [Termux](https://termux.dev), run `pkg install rust git clang`, then `cargo install --path .`. The AI agent works there out of the box.
 
 You need a terminal with truecolor support to get the full look (Windows Terminal, iTerm2, WezTerm, kitty, Alacritty, GNOME Terminal and others). termed detects `COLORTERM=truecolor` and falls back to 256 colors when it isn't set; set `TERMED_TRUECOLOR=1` to force truecolor. Pass `--nerd-font` (or set `TERMED_NERD_FONT=1`) to use Nerd Font file icons.
 
@@ -130,7 +132,7 @@ Some combinations (Ctrl+Shift+…, Ctrl+Enter, Ctrl+[) can only be told apart in
 | File tree | [ignore](https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore) | ripgrep's walker; respects `.gitignore`. |
 | Change margin | [similar](https://github.com/mitsuhiko/similar) | Fast line diff against the saved file. |
 | Find / replace | [regex](https://github.com/rust-lang/regex) | Linear-time regex with capture-group replacement. |
-| AI agents | [Agent Client Protocol](https://agentclientprotocol.com) + [serde_json](https://github.com/serde-rs/json) | The open standard used by Zed and JetBrains for plugging in coding agents; OpenCode supplies free models. |
+| AI agents | [Agent Client Protocol](https://agentclientprotocol.com) + [serde_json](https://github.com/serde-rs/json) + [ureq](https://github.com/algesten/ureq) | ACP is the open standard Zed and JetBrains use for coding agents. ureq (with rustls and bundled root certificates) lets the built-in agent reach free models from anywhere, including Android. |
 | Text width | [unicode-width](https://github.com/unicode-rs/unicode-width) | Correct columns for CJK and wide characters. |
 
 Source layout:
@@ -142,6 +144,7 @@ src/
   highlight.rs    incremental, time-budgeted highlighting + string-aware bracket analysis
   theme.rs        Visual Studio Dark / Termed Neon + derived palettes for bundled themes
   agent.rs        Agent Client Protocol client: launches the agent, JSON-RPC, chat model, free-model failover
+  builtin_agent.rs  built-in agent: free models over an OpenAI-compatible API, file/search/command tools
   app.rs          state, key/mouse handling, palette, find/replace, dialogs
   ui/             title bar, explorer/drawer, tabs, code view, minimap, toolbar, overlays
 examples/
