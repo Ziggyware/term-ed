@@ -26,6 +26,20 @@ pub struct AgentSpec {
     pub args: Vec<String>,
     /// Usable without an account or payment.
     pub free: bool,
+    /// termed's own in-process agent (no install needed).
+    pub builtin: bool,
+}
+
+/// termed's built-in agent: free models, nothing to install. Works on
+/// Termux/Android, where OpenCode can't be installed.
+pub fn builtin_spec() -> AgentSpec {
+    AgentSpec {
+        name: "termed AI".into(),
+        program: String::new(),
+        args: Vec::new(),
+        free: true,
+        builtin: true,
+    }
 }
 
 /// Known ACP agents, in order of preference. OpenCode comes first because
@@ -64,7 +78,10 @@ fn base_name(p: &str) -> String {
 /// Agents available on this machine. `TERMED_AGENT="cmd args"` overrides.
 pub fn detect_agents() -> Vec<AgentSpec> {
     let mut out = Vec::new();
-    if let Ok(cmd) = std::env::var("TERMED_AGENT") {
+    let chosen = std::env::var("TERMED_AGENT").ok();
+    if chosen.as_deref() == Some("builtin") {
+        out.push(builtin_spec());
+    } else if let Some(cmd) = chosen {
         let mut parts = cmd.split_whitespace().map(String::from);
         if let Some(program) = parts.next() {
             let args: Vec<String> = parts.collect();
@@ -83,8 +100,14 @@ pub fn detect_agents() -> Vec<AgentSpec> {
                 program,
                 args,
                 free: false,
+                builtin: false,
             });
         }
+    }
+    // On Android (Termux) the external agents' npm packages don't install,
+    // so the built-in agent comes first there.
+    if cfg!(target_os = "android") && out.is_empty() {
+        out.push(builtin_spec());
     }
     for (name, program, args, free) in KNOWN {
         if let Some(path) = which(program) {
@@ -96,8 +119,12 @@ pub fn detect_agents() -> Vec<AgentSpec> {
                 program: path.to_string_lossy().into_owned(),
                 args: args.iter().map(|s| s.to_string()).collect(),
                 free: *free,
+                builtin: false,
             });
         }
+    }
+    if !out.iter().any(|s| s.builtin) {
+        out.push(builtin_spec());
     }
     out
 }
@@ -235,6 +262,7 @@ pub struct Agent {
     pub scroll: usize,
     child: Option<Child>,
     stdin: Option<ChildStdin>,
+    builtin_tx: Option<Sender<Value>>,
     tx: Sender<Inbound>,
     rx: Receiver<Inbound>,
     stderr: Arc<Mutex<VecDeque<String>>>,
@@ -284,6 +312,7 @@ impl Agent {
             scroll: 0,
             child: None,
             stdin: None,
+            builtin_tx: None,
             tx,
             rx,
             stderr: Arc::new(Mutex::new(VecDeque::new())),
@@ -321,7 +350,7 @@ impl Agent {
     }
 
     pub fn running(&self) -> bool {
-        self.child.is_some()
+        self.child.is_some() || self.builtin_tx.is_some()
     }
 
     pub fn model_label(&self) -> Option<String> {
@@ -345,13 +374,22 @@ impl Agent {
 
     /// Launch the agent process and begin the handshake.
     pub fn start(&mut self) {
-        if self.child.is_some() {
+        if self.running() {
             return;
         }
         let Some(spec) = self.spec.clone() else {
             self.state = State::NoAgent;
             return;
         };
+        if spec.builtin {
+            let tx = self.tx.clone();
+            self.builtin_tx = Some(crate::builtin_agent::spawn(self.cwd.clone(), move |v| {
+                let _ = tx.send(Inbound::Message(v));
+            }));
+            self.state = State::Starting;
+            self.handshake();
+            return;
+        }
         let mut cmd = Command::new(&spec.program);
         cmd.args(&spec.args)
             .current_dir(&self.cwd)
@@ -392,6 +430,10 @@ impl Agent {
             }
         });
         self.state = State::Starting;
+        self.handshake();
+    }
+
+    fn handshake(&mut self) {
         self.request(
             "initialize",
             json!({
@@ -412,6 +454,7 @@ impl Agent {
             let _ = c.wait();
         }
         self.stdin = None;
+        self.builtin_tx = None;
         self.session_id = None;
         self.pending.clear();
         if !matches!(self.state, State::NoAgent | State::Installing) {
@@ -439,7 +482,7 @@ impl Agent {
         self.usage = None;
         self.scroll = 0;
         self.reported.clear();
-        if self.child.is_some() && self.session_id.is_some() {
+        if self.running() && self.session_id.is_some() {
             self.session_id = None;
             self.state = State::Starting;
             self.new_session();
@@ -449,6 +492,13 @@ impl Agent {
     /// Install OpenCode through npm (the free default agent).
     pub fn install(&mut self) {
         if self.state == State::Installing {
+            return;
+        }
+        if cfg!(target_os = "android") {
+            self.install_log = vec![
+                "OpenCode has no Android build on npm.".into(),
+                "Use the built-in termed AI agent instead (Agent: Choose Agent): it is free and needs no install.".into(),
+            ];
             return;
         }
         let Some(npm) = which("npm") else {
@@ -507,7 +557,7 @@ impl Agent {
             self.send_prompt(blocks);
         } else {
             self.queued = Some(blocks);
-            if self.child.is_none() {
+            if !self.running() {
                 if matches!(self.state, State::Failed(_)) {
                     self.state = State::Idle;
                 }
@@ -583,6 +633,12 @@ impl Agent {
     // ------------------------------------------------------------ JSON-RPC
 
     fn write(&mut self, msg: Value) {
+        if let Some(b) = &self.builtin_tx {
+            if b.send(msg).is_err() {
+                self.builtin_tx = None;
+            }
+            return;
+        }
         if let Some(stdin) = &mut self.stdin {
             let mut line = msg.to_string();
             line.push('\n');

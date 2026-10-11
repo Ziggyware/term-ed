@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod app;
+pub mod builtin_agent;
 pub mod clipboard;
 pub mod commands;
 pub mod document;
