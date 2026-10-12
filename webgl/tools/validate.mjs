@@ -21,7 +21,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, '..');
 const read = (f) => readFileSync(join(root, 'js', 'shaders', f), 'utf8');
 
-const PRELUDE = `#version 300 es
+const PRELUDE = `
 precision highp float;
 precision highp int;
 out vec4 outColor;
@@ -59,8 +59,8 @@ function assemble(kind, modeId) {
   }
   if (kind === 'mem-update') return PRELUDE + g + read('lib.glsl') + read('mem-update.glsl') + '\nvoid main() { memMain(); }\n';
   if (kind === 'mem-stamp') return PRELUDE + g + read('lib.glsl') + read('mem-stamp.glsl') + '\nvoid main() { stampMain(); }\n';
-  if (kind === 'vs') return '#version 300 es\n' + read('common.vert.glsl');
-  if (kind === 'stamp-vs') return '#version 300 es\n' + read('stamp.vert.glsl');
+  if (kind === 'vs') return read('common.vert.glsl');
+  if (kind === 'stamp-vs') return read('stamp.vert.glsl');
   throw new Error('unknown kind ' + kind);
 }
 

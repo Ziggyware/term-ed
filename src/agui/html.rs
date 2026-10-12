@@ -1,7 +1,7 @@
 //! Embedded Visual Graph Editor & AG-UI Runtime Inspector.
 //! Serves an interactive visual canvas that connects directly to the AG-UI event stream.
 
-pub const VISUAL_EDITOR_HTML: &str = r#"<!DOCTYPE html>
+pub const VISUAL_EDITOR_HTML: &str = r##"<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -632,4 +632,4 @@ pub const VISUAL_EDITOR_HTML: &str = r#"<!DOCTYPE html>
   </script>
 </body>
 </html>
-"#;
+"##;

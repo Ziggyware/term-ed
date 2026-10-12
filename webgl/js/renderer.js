@@ -38,7 +38,7 @@ const SHADER_FILES = [
   'mode-hologram.glsl', 'mode-crystal.glsl', 'mode-weathering.glsl', 'mode-causal.glsl',
 ];
 
-const PRELUDE = `#version 300 es
+const PRELUDE = `
 precision highp float;
 precision highp int;
 out vec4 outColor;
@@ -126,17 +126,51 @@ export class Renderer {
   }
   compile(vsSrc, fsSrc, label) {
     const gl = this.gl;
+    const PRELUDE = '#version 300 es\n\n';
+    const PRELUDE_LINES = PRELUDE.split('\n').length - 1; // 2
+    const CONTEXT = 3;
+
+    // Numbered excerpt of only the lines the driver flagged (± context).
+    const excerpt = (src, log) => {
+      const flagged = new Set();
+      // ANGLE/Chrome: "ERROR: 0:12: ..." — older drivers: "0(12) : ..."
+      for (const m of log.matchAll(/^(?:ERROR|WARNING):\s*\d+:(\d+):/gim))
+        flagged.add(parseInt(m[1], 10) - PRELUDE_LINES);
+      for (const m of log.matchAll(/^\d+\((\d+)\)\s*:/gim))
+        flagged.add(parseInt(m[1], 10) - PRELUDE_LINES);
+
+      const srcLines = src.split('\n');
+      if (!flagged.size) { // no parseable locations — dump everything, numbered
+        return srcLines.map((l, i) => `${String(i + 1).padStart(4)} | ${l}`).join('\n');
+      }
+      const keep = new Set();
+      for (const n of flagged)
+        for (let i = n - CONTEXT; i <= n + CONTEXT; i++)
+          if (i >= 1 && i <= srcLines.length) keep.add(i);
+
+      const out = [];
+      let last = 0;
+      for (const n of [...keep].sort((a, b) => a - b)) {
+        if (n - last > 1) out.push('      ...');
+          out.push(`${flagged.has(n) ? '>>>' : '   '}${String(n).padStart(4)} | ${srcLines[n - 1]}`);
+        last = n;
+      }
+      return out.join('\n');
+    };
+
     const sh = (type, src, lbl) => {
       const s = gl.createShader(type);
-      gl.shaderSource(s, src);
+      gl.shaderSource(s, PRELUDE + src);
       gl.compileShader(s);
       if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
-        const err = gl.getShaderInfoLog(s) || '';
-        const lines = src.split('\n').map((l, i) => `${String(i + 1).padStart(4)} | ${l}`).join('\n');
-        throw new Error(`[${label} ${lbl}] ${err}\n${err ? lines : ''}`);
+        const log = gl.getShaderInfoLog(s) || 'unknown error';
+        throw new Error(`[${label} ${lbl}] shader compile failed\n${log}\n${excerpt(src, log)}`);
       }
       return s;
     };
+                                                                                                
+              
+    
     const v = sh(gl.VERTEX_SHADER, vsSrc, 'vs');
     const f = sh(gl.FRAGMENT_SHADER, fsSrc, 'fs');
     const p = gl.createProgram();
@@ -168,24 +202,24 @@ export class Renderer {
         + (m.march === 'sdf' ? this.get('march-sdf.glsl') : '')
         + (m.march === 'height' ? this.get('march-height.glsl') : '')
         + this.get(m.src) + AA_TAIL;
-      prog = this.compile('#version 300 es\n' + this.get('common.vert.glsl'), fs, 'mode-' + modeId);
+      prog = this.compile( this.get('common.vert.glsl'), fs, 'mode-' + modeId);
     } else if (kind === 'composite') {
       const fs = PRELUDE + g + this.get('lib.glsl') + this.get('glyphs.glsl') + this.get('claims.glsl')
         + this.get('composite.glsl') + '\nvoid main() { outColor = vec4(compositeMain(), 1.0); }\n';
-      prog = this.compile('#version 300 es\n' + this.get('common.vert.glsl'), fs, 'composite');
+      prog = this.compile(this.get('common.vert.glsl'), fs, 'composite');
     } else if (kind === 'bright' || kind === 'blur') {
       const body = kind === 'bright' ? 'brightPassMain()' : 'blurMain()';
       const fs = PRELUDE + g + this.get('lib.glsl') + this.get('bloom.glsl')
         + `\nvoid main() { outColor = vec4(${body}, 1.0); }\n`;
-      prog = this.compile('#version 300 es\n' + this.get('common.vert.glsl'), fs, kind);
+      prog = this.compile(this.get('common.vert.glsl'), fs, kind);
     } else if (kind === 'mem-update') {
       const fs = PRELUDE + g + this.get('lib.glsl') + this.get('mem-update.glsl')
         + '\nvoid main() { memMain(); }\n';
-      prog = this.compile('#version 300 es\n' + this.get('common.vert.glsl'), fs, kind);
+      prog = this.compile(this.get('common.vert.glsl'), fs, kind);
     } else if (kind === 'mem-stamp') {
       const fs = PRELUDE + g + this.get('lib.glsl') + this.get('mem-stamp.glsl')
         + '\nvoid main() { stampMain(); }\n';
-      prog = this.compile('#version 300 es\n' + this.get('stamp.vert.glsl'), fs, kind);
+      prog = this.compile(this.get('stamp.vert.glsl'), fs, kind);
     } else {
       throw new Error('unknown program kind ' + kind);
     }

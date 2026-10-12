@@ -1,4 +1,4 @@
-#version 300 es
+
 /* One fullscreen triangle, no vertex buffer needed beyond three void-attribute draws. */
 void main() {
   // gl_VertexID 0,1,2 -> (-1,-1), (3,-1), (-1,3)

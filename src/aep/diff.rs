@@ -40,13 +40,26 @@ impl AepPatch {
                 };
                 lines.push(format!("{}{}", prefix, change.value()));
             }
+           
+           
+            let ops = hunk.ops();
+            let (old_start, old_end, new_start, new_end) = match (ops.first(), ops.last()) {
+                (Some(first), Some(last)) => (
+                    first.old_range().start,
+                    last.old_range().end,
+                    first.new_range().start,
+                    last.new_range().end,
+                ),
+                _ => (0, 0, 0, 0),
+            };
             hunks.push(AepHunk {
-                old_start: hunk.old_range().start(),
-                old_lines: hunk.old_range().len(),
-                new_start: hunk.new_range().start(),
-                new_lines: hunk.new_range().len(),
+                old_start,
+                old_lines: old_end - old_start,
+                new_start,
+                new_lines: new_end - new_start,
                 lines,
             });
+        
         }
 
         Self {

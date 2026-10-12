@@ -44,6 +44,7 @@ vec4 slabRetardance(vec3 u, vec3 d, float dzUm, float lamUm) {
   float cosT = clamp(abs(dot(u, d)), 0.0, 1.0);
   float ne = neff(cosT, nb.y, nb.x);
   float dn = (ne - nb.x) * u_dnScale;
+  float dr = (ne - nb.y) * u_dnScale;
   vec3 e2 = cross(d, cross(u, d));              /* director ⟂ ray */
   float l = length(e2);
   vec2 axis = (l > 1e-4) ? normalize(e2.xy) : vec2(1.0, 0.0);
@@ -52,7 +53,8 @@ vec4 slabRetardance(vec3 u, vec3 d, float dzUm, float lamUm) {
   float sinExt = clamp(length(d.xy), 0.0, 0.999);
   float cosInt = sqrt(max(1.0 - (sinExt / nAvg) * (sinExt / nAvg), 0.04));
   /* u_opd is the honest cheat: a multiplier on the optical path only */
-  return vec4(dn * dzUm * 1e3 * u_opd / cosInt, axis);
+  return vec4(vec2(dn * dzUm * 1e3 * u_opd / cosInt,
+              dr * dzUm * 1e3 * u_opd / cosInt), axis);
 }
 
 /* --------------------------------------------------------- 3. Jones algebra -- */
@@ -63,7 +65,7 @@ vec2 cadd(vec2 x, vec2 y) { return x + y; }
 vec2 cexp2(float ph) { return vec2(cos(ph), sin(ph)); }
 
 J jIdentity() {
-  J j; j.a = vec2(1, 0); j.b = vec2(0, 0); j.c = vec2(0, 0); j.d = vec2(1, 0); return j;
+  J j; j.a = vec2(1.0, 0.0); j.b = vec2(0.0, 0.0); j.c = vec2(0.0, 0.0); j.d = vec2(1.0, 0.0); return j;
 }
 /* R(axis) · diag(e^{-iδ/2}, e^{+iδ/2}) · R(axis)^T, expanded so the symmetry
    J00 = c²α + s²β, J11 = s²α + c²β, J01 = J10 = cs(α−β) is visible */
@@ -121,8 +123,8 @@ float polarScope(J j, float lamNm) {
     j = jmul(q2, jmul(j, q1));
     A = P + PI * 0.5;
   }
-  if (m == 2) return jonesIntensity(j, P, 0.0, 1);
-  return jonesIntensity(j, P, A, 0);
+  if (m == 2) return jonesIntensity(j, P, 0.0, 1.0);
+  return jonesIntensity(j, P, A, 0.0);
 }
 
 /* ------------------------------------------------------------- 4. lamp model -- */

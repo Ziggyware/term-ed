@@ -40,7 +40,7 @@ float matPlasticity(float m) {   /* how much of an impression survives */
 
 /* ------------------------------------------------------------------ relief -- */
 float heightAt(vec2 p, out float mat) {
-  float m = u_mat;
+  float m = float(u_mat);
   mat = m;
   float time = uTime;
   vec2 q = p * u_vScale;
