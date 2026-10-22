@@ -88,6 +88,12 @@ pub fn draw(frame: &mut Frame, app: &mut App, truecolor: bool) {
     let mut cursor = None;
     if app.editors.is_empty() {
         render_welcome(buf, main, app);
+        // Project search works without an open file too.
+        if app.search.visible
+            && let Some(c) = overlay::render_search(buf, main, app)
+        {
+            cursor = Some(c);
+        }
     } else {
         // On a phone the title bar already names the file: skip the tab row
         // for a single file, and always skip breadcrumbs.
@@ -110,6 +116,11 @@ pub fn draw(frame: &mut Frame, app: &mut App, truecolor: bool) {
         cursor = editor_view::render(buf, editor, app);
         if app.find.visible
             && let Some(c) = overlay::render_find(buf, editor, app)
+        {
+            cursor = Some(c);
+        }
+        if app.search.visible
+            && let Some(c) = overlay::render_search(buf, editor, app)
         {
             cursor = Some(c);
         }

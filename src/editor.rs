@@ -1236,6 +1236,18 @@ impl Editor {
         self.finish();
     }
 
+    /// Replace the whole buffer in one undo step, keeping the caret where it
+    /// was as closely as possible. Used by Replace in Files.
+    pub fn replace_document(&mut self, text: &str) {
+        let head = self.sel.head;
+        let old_len = self.doc.rope.len_chars();
+        self.begin(EditKind::Other);
+        self.doc.remove(0, old_len);
+        self.doc.insert(0, text);
+        self.sel = Selection::caret(head.min(self.doc.rope.len_chars()));
+        self.finish();
+    }
+
     /// Replace many ranges (sorted, non-overlapping) in one undo step.
     pub fn replace_all(&mut self, ranges: &[(usize, usize)], text: &str) {
         if ranges.is_empty() {
