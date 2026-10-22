@@ -60,7 +60,6 @@ termed adapts to phone terminals such as Termux, Blink, Termius and iSH. Below 8
 - Chrome: a title bar with a quick-open box, a Solution-Explorer style tree with file icons, tabs with dirty markers, breadcrumbs that show the enclosing class or function, and a clickable status bar.
 - Floating panels with rounded borders and drop shadows: command palette, quick open, theme picker with live preview, language picker, go-to-line, a save dialog and toast notifications.
 - 14 themes: Visual Studio Dark, Termed Neon (a phosphor-green hacker theme), Dracula, Catppuccin, One Half Dark, Nord, Gruvbox, Solarized, Monokai and more.
-
 **Editing**
 - Highlighting for 192 languages (C#, C/C++, Rust, Go, Python, TypeScript, Java, Kotlin, Swift, SQL, YAML, Markdown and more; run `termed --list-languages` for the full list).
 - Auto-indent, smart block expansion when you press Enter between braces, and auto-closing brackets and quotes with type-over.
@@ -68,7 +67,7 @@ termed adapts to phone terminals such as Termux, Blink, Termius and iSH. Below 8
 - Box (column) selection like Visual Studio: Alt+Shift+arrows or Alt+drag. Typing, Tab, Backspace and Delete edit every line of the column, and copy/paste work per line.
 - Undo and redo that group typing into words, like VS.
 - Find and replace with match case, whole word and regex options (including `$1` capture groups), plus replace-one and replace-all.
-- **Find in files** (`Ctrl+Shift+F`) and **Replace in Files** (`Ctrl+Shift+H`): the filter is a list of glob patterns separated by `;`. `!` excludes, and a trailing `/` or `\` marks a directory, taking its whole subtree with it: `*.cs*;!*.csproj;!bin\` searches C# files but skips project files and anything under a folder named `bin`. `*`, `?`, `[...]` and `**` work, patterns apply to file names at any depth and to path tails (`src/*.rs`), `.gitignore` is honored, and binary files and files over 2 MB are skipped. Results are grouped by file with highlighted hits; `↑`/`↓` walk them, `Enter` opens one, and clicking a file header collapses it. Replace All edits open files in memory (so `Ctrl+Z` undoes it and they stay unsaved) and writes the rest to disk; `$1` groups work in regex mode and `⇄` replaces a single hit. Full key list under [Find in files](#find-in-files).
+- **Find in files** (`Ctrl+Shift+F`) and **Replace in Files** (`Ctrl+Shift+H`): pick the folder to search in the *root* box (empty = the project, `~/code/app` and `../other` work too), then filter with the *dirs* box (`src` scopes the search, `!bin;!obj` skips folders and everything under them) and the *files* box (`*.cs;!*.csproj`; `*`, `?`, `[...]` and `**` globs). Results are grouped by file with highlighted hits; `↑`/`↓` walk them, `Enter` opens one, clicking a file header collapses it. Replace All edits open files in memory (so `Ctrl+Z` undoes it and they stay unsaved) and writes the rest to disk; `$1` groups work in regex mode and `⇄` replaces a single hit. `.gitignore` is honored and binary or >2 MB files are skipped.
 - Copy with no selection copies the whole line, and pasting it inserts the line above, as in VS.
 - Clipboard works through OSC 52 (over SSH and in tmux) and through `wl-copy`, `xclip`, `xsel` or `pbcopy`.
 - Full mouse support: click, drag-select, double-click a word, triple-click a line, click the gutter to select a line, scroll, use tabs and the tree, drag the minimap or scrollbar, and resize the sidebar.
@@ -76,11 +75,13 @@ termed adapts to phone terminals such as Termux, Blink, Termius and iSH. Below 8
 
 ### Find in files
 
-`Ctrl+Shift+F` (or **Find in Files** in the command palette) opens the panel above the editor. Results update as you type, include unsaved editor buffers, and are grouped by file: click a file header to collapse it, click a hit to open it. The filter box takes the glob list described above; leave it empty to search every text file.
+`Ctrl+Shift+F` (or **Find in Files** in the command palette) opens the panel above the editor. Results update as you type, include unsaved editor buffers, and are grouped by file: click a file header to collapse it, click a hit to open it.
+
+The panel has four boxes, cycled with `Tab`: the **query**, the **root** to search in (empty means the project folder; absolute paths, `~` and relative paths such as `../other` are accepted), the **dirs** filter (`src` searches only that folder, `!bin;!obj;!node_modules` skips those folders at any depth) and the **files** filter (`*.cs;!*.csproj`, with `*`, `?`, `[...]` and `**`). Directories are matched against the folder path, files against the name and the path tail, so `src/*.rs` works where it appears.
 
 | Key | Action |
 | --- | --- |
-| `Tab` / `Shift+Tab` | Next / previous field (query, replace, filter) |
+| `Tab` / `Shift+Tab` | Next / previous box (query, replace, root, dirs, files) |
 | `↑` / `↓`, `PgUp` / `PgDn` | Move through the hits |
 | `Enter` | Open the selected hit (in the replace box: replace it) |
 | `Ctrl+Enter` | Replace every hit |
@@ -91,6 +92,12 @@ termed adapts to phone terminals such as Termux, Blink, Termius and iSH. Below 8
 | `Esc` | Close the panel |
 
 Regex mode supports capture groups in the replacement (`$1`, `${name}`). Matches inside a folder excluded by the filter are never touched, even by Replace All.
+
+### Plugins
+
+- Add commands with a folder and a script, in any language. A plugin is a manifest plus a program that speaks JSON-RPC over stdin/stdout, so a Python, Node, Go or Rust script is a plugin; the palette gets its commands and the manifest can claim keybindings. `Ctrl+Alt+P` opens the plugin manager (reload, reinstall the bundled set, enable/disable).
+- Reads VS Code extension manifests (`package.json` with `contributes.commands`), so `prettier-vscode`, `eslint` and friends appear in the manager with a clear reason when they need a bridge — and a one-line adapter makes them runnable.
+- Four plugins ship in the binary: **text-tools** (`Ctrl+Alt+L` sorts lines, plus de-duplicate, trim, case, format/minify JSON), **todo** (`Ctrl+Alt+T` lists `TODO`/`FIXME` markers across the project), **stats** (words/characters/lines) and **git-info** (`Ctrl+Alt+G` branch and status). See [docs/plugins.md](docs/plugins.md).
 
 ## Install
 
@@ -118,6 +125,8 @@ You need a terminal with truecolor support to get the full look (Windows Termina
 | Toggle / focus explorer | `Ctrl+B` / `Ctrl+E` |
 | Find / replace / next / previous | `Ctrl+F` / `Ctrl+H` / `F3` / `Shift+F3` |
 | Find / replace in files | `Ctrl+Shift+F` / `Ctrl+Shift+H` |
+| Plugin manager | `Ctrl+Alt+P` |
+| Bundled plugins: sort lines / TODOs / git status | `Ctrl+Alt+L` / `Ctrl+Alt+T` / `Ctrl+Alt+G` |
 | Find options: case, word, regex | `Alt+C`, `Alt+W`, `Alt+R` |
 | Go to line (`line:col`) | `Ctrl+G` |
 | Go to matching bracket | `Ctrl+\` |
@@ -154,6 +163,7 @@ Some combinations (Ctrl+Shift+…, Ctrl+Enter, Ctrl+[) can only be told apart in
 | Find / replace | [regex](https://github.com/rust-lang/regex) | Linear-time regex with capture-group replacement. |
 | AI agents | [Agent Client Protocol](https://agentclientprotocol.com) + [serde_json](https://github.com/serde-rs/json) + [ureq](https://github.com/algesten/ureq) | ACP is the open standard Zed and JetBrains use for coding agents. ureq (with rustls and bundled root certificates) lets the built-in agent reach free models from anywhere, including Android. |
 | Text width | [unicode-width](https://github.com/unicode-rs/unicode-width) | Correct columns for CJK and wide characters. |
+| Plugins | JSON-RPC 2.0 over stdio | Line-delimited JSON, the same transport as LSP and ACP, so any language can be a plugin. See [docs/plugins.md](docs/plugins.md). |
 
 Source layout:
 
@@ -165,11 +175,14 @@ src/
   theme.rs        Visual Studio Dark / Termed Neon + derived palettes for bundled themes
   agent.rs        Agent Client Protocol client: launches the agent, JSON-RPC, chat model, free-model failover
   builtin_agent.rs  built-in agent: free models over an OpenAI-compatible API, file/search/command tools
-  search.rs       find/replace in files: glob filters, project walk, replacements
+  search.rs       find/replace in files: roots, glob filters, walk, replacements
+  plugin.rs       plugin host: manifests, JSON-RPC subprocesses, discovery, manager
   app.rs          state, key/mouse handling, palette, find/replace, dialogs
   ui/             title bar, explorer/drawer, tabs, code view, minimap, toolbar, overlays
 examples/
   snapshot.rs     renders frames to HTML headlessly (used for the screenshots)
+plugins/
+  text-tools/ todo/ stats/ git-info/   bundled plugins, embedded into the binary
 ```
 
 ## Development

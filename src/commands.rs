@@ -24,6 +24,7 @@ pub enum Command {
     Replace,
     FindInFiles,
     ReplaceInFiles,
+    Plugins,
     FindNext,
     FindPrev,
     GotoLine,
@@ -98,6 +99,7 @@ cmds! {
     Replace, "Edit: Replace", "Ctrl+H";
     FindInFiles, "Edit: Find in Files", "Ctrl+Shift+F";
     ReplaceInFiles, "Edit: Replace in Files", "Ctrl+Shift+H";
+    Plugins, "Plugins: Manage Plugins", "Ctrl+Alt+P";
     FindNext, "Edit: Find Next", "F3";
     FindPrev, "Edit: Find Previous", "Shift+F3";
     GotoLine, "Go to Line...", "Ctrl+G";

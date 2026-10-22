@@ -1,0 +1,21 @@
+{
+  "name": "stats",
+  "version": "1.0.0",
+  "description": "Words, characters and lines for the buffer or the selection",
+  "author": "termed",
+  "command": [
+    "python3",
+    "main.py"
+  ],
+  "events": [],
+  "commands": [
+    {
+      "id": "document",
+      "title": "Statistics: Document"
+    },
+    {
+      "id": "selection",
+      "title": "Statistics: Selection"
+    }
+  ]
+}

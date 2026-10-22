@@ -11,6 +11,7 @@ use ratatui::crossterm::event::{
 };
 use ratatui::layout::{Position, Rect};
 use regex::{Regex, RegexBuilder};
+use serde_json::{Value, json};
 
 use crate::agent::{self, Agent, AgentEvent, State as AgentState};
 use crate::clipboard::Clipboard;
@@ -20,6 +21,7 @@ use crate::editor::Editor;
 use crate::explorer::{self, Explorer};
 use crate::fuzzy;
 use crate::highlight;
+use crate::plugin::{self, Host as PluginHost};
 use crate::search;
 use crate::theme::{self, ThemeEntry};
 
@@ -44,6 +46,8 @@ pub enum PaletteMode {
     SaveAs,
     AgentModels,
     AgentPicker,
+    /// Manage plugins: reload, reinstall the bundled ones, enable/disable.
+    Plugins,
 }
 
 pub struct Palette {
@@ -57,6 +61,8 @@ pub struct Palette {
     pub scroll: usize,
     /// Theme active before a live-preview picker opened (restored on Esc).
     pub restore_theme: Option<String>,
+    /// Plugin commands appended to the command list, as (plugin, command).
+    pub plugin_cmds: Vec<(usize, usize)>,
 }
 
 /// A sticky modifier for touch screens: soft keyboards cannot hold Ctrl,
@@ -272,6 +278,11 @@ pub enum SearchField {
     #[default]
     Query,
     Replace,
+    /// Where to search (empty = the project root).
+    Root,
+    /// Directory filter: `src;!bin;!obj` (plain = scope, `!` = skip).
+    Dirs,
+    /// File filter: `*.cs;!*.csproj`.
     Filter,
 }
 
@@ -285,9 +296,21 @@ pub struct SearchState {
     pub query_cursor: usize,
     pub replacement: String,
     pub replace_cursor: usize,
-    /// Glob filter: `*.cs*;!*.csproj;!bin\`.
+    /// Where to search. Empty means the project root; `~` and relative
+    /// paths are accepted too (`~/code/app`, `../other`).
+    pub root: String,
+    pub root_cursor: usize,
+    /// Directory filter: `src;!bin;!obj`. A plain entry scopes the search to
+    /// that folder, `!` skips it (and everything under it).
+    pub dirs: String,
+    pub dirs_cursor: usize,
+    /// File filter: `*.cs;!*.csproj`. A trailing `/` still means a folder.
     pub filter: String,
     pub filter_cursor: usize,
+    /// `root` resolved against the project root, for display and searching.
+    pub root_path: PathBuf,
+    /// The root box names a folder that does not exist.
+    pub missing_root: bool,
     pub field: SearchField,
     pub case_sensitive: bool,
     pub whole_word: bool,
@@ -305,8 +328,19 @@ pub struct SearchState {
 }
 
 /// Everything a search depends on, so typing in the replace box does not
-/// rebuild the results.
-type SearchKey = (String, String, bool, bool, bool, u64, PathBuf);
+/// rebuild the results: query, file filter, directory filter, root, options,
+/// the open editors' versions and the project root.
+type SearchKey = (
+    String,
+    String,
+    String,
+    String,
+    bool,
+    bool,
+    bool,
+    u64,
+    PathBuf,
+);
 
 /// Screen regions from the last frame, for mouse hit testing.
 #[derive(Default, Clone)]
@@ -325,7 +359,7 @@ pub struct Layout {
     pub find_buttons: Vec<(Rect, u8)>,
     pub search_box: Rect,
     pub search_list: Rect,
-    /// 0 = query, 1 = replace, 2 = filter.
+    /// 0 = query, 1 = replace, 2 = root, 3 = directories, 4 = files.
     pub search_fields: Vec<(Rect, u8)>,
     /// 0..=2 options, 3 replace all, 4 replace file, 5 close.
     pub search_buttons: Vec<(Rect, u8)>,
@@ -407,6 +441,8 @@ pub struct App {
     /// Latched modifiers from the touch toolbar.
     pub mods: StickyMods,
     pub agent: Agent,
+    /// External plugin processes (see `plugin.rs`).
+    pub plugins: PluginHost,
     pub show_agent: bool,
     pub toolbar_page: usize,
     drawer_init: bool,
@@ -450,6 +486,7 @@ impl App {
             compact: false,
             mods: StickyMods::default(),
             agent: Agent::new(root.clone()),
+            plugins: PluginHost::new(root.clone()),
             show_agent: false,
             toolbar_page: 0,
             drawer_init: false,
@@ -468,6 +505,8 @@ impl App {
         if app.editors.is_empty() {
             app.focus = Focus::Explorer;
         }
+        // Plugins that asked for `startup` can begin before the first frame.
+        app.plugins.warm_up();
         app
     }
 
@@ -549,6 +588,8 @@ impl App {
         }
         self.focus = Focus::Editor;
         self.explorer.reveal(&path);
+        self.plugins
+            .broadcast("open", json!({ "path": path.to_string_lossy() }));
     }
 
     pub fn set_theme(&mut self, name: &str) {
@@ -722,6 +763,9 @@ impl App {
             (KeyCode::Char('p'), true, true, _) | (KeyCode::F(1), ..) => {
                 Some(Command::CommandPalette)
             }
+            // Ctrl+Alt+P is the plugin manager, so it has to be matched
+            // before plain Ctrl+P opens quick open.
+            (KeyCode::Char('p'), true, _, true) => Some(Command::Plugins),
             (KeyCode::Char('p'), true, false, _) | (KeyCode::Char('o'), true, ..) => {
                 Some(Command::QuickOpen)
             }
@@ -751,6 +795,10 @@ impl App {
         };
         if let Some(c) = global {
             self.run(c);
+            return;
+        }
+        if let Some((pi, ci)) = self.plugins.key_action(code, k.modifiers) {
+            self.run_plugin(pi, ci);
             return;
         }
         if ctrl && code == KeyCode::Char('k') {
@@ -987,12 +1035,20 @@ impl App {
             Save => self.save_active(),
             SaveAll => {
                 let mut n = 0;
+                let mut saved = Vec::new();
                 for e in &mut self.editors {
                     if e.doc.is_dirty() && e.doc.path.is_some() && e.doc.save().is_ok() {
                         n += 1;
+                        if let Some(p) = &e.doc.path {
+                            saved.push(p.clone());
+                        }
                     }
                 }
                 self.toast(format!("Saved {n} file(s)"), ToastKind::Success);
+                for path in saved {
+                    self.plugins
+                        .broadcast("save", json!({ "path": path.to_string_lossy() }));
+                }
             }
             CloseTab => self.request_close(PendingClose::Tab(self.active)),
             Quit => self.request_close(PendingClose::Quit),
@@ -1093,6 +1149,7 @@ impl App {
             }
             FindInFiles => self.open_search(false),
             ReplaceInFiles => self.open_search(true),
+            Plugins => self.open_palette(PaletteMode::Plugins),
             Find | Replace => {
                 self.search.visible = false;
                 self.find.visible = true;
@@ -1273,11 +1330,16 @@ impl App {
             Ok(()) => {
                 let name = e.doc.name();
                 let lines = e.doc.len_lines();
+                let saved = e.doc.path.clone();
                 self.toast(
                     format!("Saved {name}  ·  {lines} lines"),
                     ToastKind::Success,
                 );
                 self.project_files = None;
+                if let Some(path) = saved {
+                    self.plugins
+                        .broadcast("save", json!({ "path": path.to_string_lossy() }));
+                }
             }
             Err(err) => self.toast(format!("Save failed: {err:#}"), ToastKind::Error),
         }
@@ -1389,11 +1451,49 @@ impl App {
     // ================================================================ palette
 
     pub fn open_palette(&mut self, mode: PaletteMode) {
+        let mut plugin_cmds: Vec<(usize, usize)> = Vec::new();
         let (items, hints): (Vec<String>, Vec<String>) = match mode {
-            PaletteMode::Commands => COMMANDS
-                .iter()
-                .map(|c| (c.title.to_string(), c.keys.to_string()))
-                .unzip(),
+            PaletteMode::Commands => {
+                let mut items: Vec<String> = COMMANDS.iter().map(|c| c.title.to_string()).collect();
+                let mut hints: Vec<String> = COMMANDS.iter().map(|c| c.keys.to_string()).collect();
+                for (pi, ci, title) in self.plugins.commands() {
+                    items.push(title);
+                    hints.push(
+                        self.plugins
+                            .plugins
+                            .get(pi)
+                            .and_then(|p| p.commands.get(ci))
+                            .and_then(|c| c.keys.clone())
+                            .unwrap_or_else(|| "plugin".to_string()),
+                    );
+                    plugin_cmds.push((pi, ci));
+                }
+                (items, hints)
+            }
+            PaletteMode::Plugins => {
+                let mut items = vec![
+                    "Plugins: Reload".to_string(),
+                    "Plugins: Reinstall Bundled Plugins".to_string(),
+                ];
+                let mut hints = vec![
+                    "re-read the plugin folders".to_string(),
+                    "rewrite ~/.cache/termed/plugins".to_string(),
+                ];
+                if self.plugins.plugins.is_empty() {
+                    items.push("No plugins found — press Enter to look again".to_string());
+                    hints.push(String::new());
+                }
+                for p in &self.plugins.plugins {
+                    items.push(format!(
+                        "{} {}  —  {}",
+                        if p.enabled { "[on]" } else { "[off]" },
+                        p.name,
+                        p.status()
+                    ));
+                    hints.push(p.dir.to_string_lossy().into_owned());
+                }
+                (items, hints)
+            }
             PaletteMode::Files => {
                 let root = self.explorer.root.clone();
                 let files = self
@@ -1482,6 +1582,7 @@ impl App {
             selected: 0,
             scroll: 0,
             restore_theme,
+            plugin_cmds,
         });
         self.refilter();
         if mode == PaletteMode::Themes
@@ -1605,7 +1706,35 @@ impl App {
         match p.mode {
             PaletteMode::Commands => {
                 if let Some(s) = p.filtered.get(p.selected) {
-                    self.run(COMMANDS[s.index].cmd);
+                    if let Some(cmd) = COMMANDS.get(s.index) {
+                        self.run(cmd.cmd);
+                    } else if let Some(&(pi, ci)) = p.plugin_cmds.get(s.index - COMMANDS.len()) {
+                        self.run_plugin(pi, ci);
+                    }
+                }
+            }
+            PaletteMode::Plugins => {
+                if let Some(s) = p.filtered.get(p.selected) {
+                    match s.index {
+                        0 => self.plugins.reload(),
+                        1 => {
+                            let _ = plugin::install_bundled();
+                            self.plugins.reload();
+                        }
+                        i if i >= 2 => {
+                            let pi = i - 2;
+                            let enabled = self
+                                .plugins
+                                .plugins
+                                .get(pi)
+                                .map(|p| !p.enabled)
+                                .unwrap_or(false);
+                            self.plugins.set_enabled(pi, enabled);
+                        }
+                        _ => {}
+                    }
+                    // Stay in the manager so the new state is visible.
+                    self.open_palette(PaletteMode::Plugins);
                 }
             }
             PaletteMode::Files => {
@@ -1973,6 +2102,8 @@ impl App {
                 &mut self.search.replacement,
                 &mut self.search.replace_cursor,
             ),
+            SearchField::Root => (&mut self.search.root, &mut self.search.root_cursor),
+            SearchField::Dirs => (&mut self.search.dirs, &mut self.search.dirs_cursor),
             SearchField::Filter => (&mut self.search.filter, &mut self.search.filter_cursor),
             _ => (&mut self.search.query, &mut self.search.query_cursor),
         }
@@ -2022,6 +2153,8 @@ impl App {
         let key = (
             q.text.clone(),
             self.search.filter.clone(),
+            self.search.dirs.clone(),
+            self.search.root.clone(),
             q.case_sensitive,
             q.whole_word,
             q.regex,
@@ -2051,8 +2184,15 @@ impl App {
             self.search.results = search::Results::default();
             return;
         }
-        let filter = search::FilterSet::parse(&self.search.filter);
-        match search::search(&self.explorer.root, &q, &filter, &overrides) {
+        let root = search::resolve_root(&self.explorer.root, &self.search.root);
+        self.search.root_path = root.clone();
+        let filter = search::FilterSet::parse_parts(&self.search.dirs, &self.search.filter);
+        self.search.missing_root = !root.is_dir();
+        if self.search.missing_root {
+            self.search.results = search::Results::default();
+            return;
+        }
+        match search::search(&root, &q, &filter, &overrides) {
             Ok(results) => {
                 self.search.results = results;
                 self.search.selected = prev.and_then(|(path, line, start)| {
@@ -2392,7 +2532,12 @@ impl App {
     }
 
     fn cycle_search_field(&mut self, back: bool) {
-        let mut fields = vec![SearchField::Query, SearchField::Filter];
+        let mut fields = vec![
+            SearchField::Query,
+            SearchField::Root,
+            SearchField::Dirs,
+            SearchField::Filter,
+        ];
         if self.search.replace {
             fields.insert(1, SearchField::Replace);
         }
@@ -2529,6 +2674,143 @@ impl App {
                 self.update_search();
             }
         }
+    }
+
+    // ================================================================ plugins
+
+    /// Start a plugin command (palette entry or keybinding).
+    pub fn run_plugin(&mut self, pi: usize, ci: usize) {
+        let file = self.editor().and_then(|e| e.doc.path.clone());
+        self.plugins.run(pi, ci, file.as_deref());
+        let name = self
+            .plugins
+            .plugins
+            .get(pi)
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        if let Some(err) = self.plugins.start_errors.get(&pi).cloned() {
+            self.toast(format!("Could not start {name}: {err}"), ToastKind::Error);
+        } else if !self.plugins.running_plugin(pi) {
+            self.toast(format!("{name} is not running"), ToastKind::Error);
+        }
+    }
+
+    /// Answer a plugin's request. Anything unrecognized returns `null` so a
+    /// newer plugin degrades instead of hanging.
+    fn plugin_call(&mut self, method: &str, params: &Value) -> Value {
+        match method {
+            "editor.text" => match self.editor() {
+                Some(e) => json!(e.doc.rope.to_string()),
+                None => Value::Null,
+            },
+            "editor.path" => match self.editor().and_then(|e| e.doc.path.clone()) {
+                Some(p) => json!(p.to_string_lossy()),
+                None => Value::Null,
+            },
+            "editor.selection" => match self.editor() {
+                Some(e) => json!(e.selected_text()),
+                None => Value::Null,
+            },
+            "editor.insert" => {
+                if let Some(text) = params.get("text").and_then(Value::as_str)
+                    && let Some(e) = self.editor_mut()
+                {
+                    e.insert_text(text);
+                    e.scroll_into_view();
+                }
+                Value::Null
+            }
+            "editor.replace" => {
+                if let Some(text) = params.get("text").and_then(Value::as_str)
+                    && let Some(e) = self.editor_mut()
+                {
+                    e.replace_document(text);
+                }
+                Value::Null
+            }
+            "editor.open" => {
+                if let Some(path) = params.get("path").and_then(Value::as_str) {
+                    self.open_file(Path::new(path));
+                    if let Some(line) = params.get("line").and_then(Value::as_u64)
+                        && let Some(e) = self.editor_mut()
+                    {
+                        let line = (line as usize).saturating_sub(1);
+                        let at = e.doc.idx(line, 0);
+                        e.sel = Selection::caret(at);
+                        e.center_on_cursor();
+                        e.scroll_into_view();
+                    }
+                }
+                Value::Null
+            }
+            "project.root" => json!(self.explorer.root.to_string_lossy()),
+            "project.files" => {
+                let limit = params
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(20_000) as usize;
+                let files = explorer::project_files(&self.explorer.root, limit);
+                json!(files)
+            }
+            "ui.toast" => {
+                let message = params
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let kind = match params.get("kind").and_then(Value::as_str) {
+                    Some("error") => ToastKind::Error,
+                    Some("success") | Some("ok") => ToastKind::Success,
+                    _ => ToastKind::Info,
+                };
+                if !message.is_empty() {
+                    self.toast(message, kind);
+                }
+                Value::Null
+            }
+            _ => Value::Null,
+        }
+    }
+
+    /// Drain plugin messages and answer their requests. Returns true when
+    /// anything happened (the caller redraws).
+    pub fn pump_plugins(&mut self) -> bool {
+        let msgs = self.plugins.pump();
+        if msgs.is_empty() {
+            return false;
+        }
+        for msg in msgs {
+            match msg {
+                plugin::Msg::Request {
+                    plugin,
+                    id,
+                    method,
+                    params,
+                } => {
+                    let result = self.plugin_call(&method, &params);
+                    if let Some(id) = id {
+                        self.plugins.reply(plugin, id, result);
+                    }
+                }
+                plugin::Msg::Exited { plugin, code } => {
+                    if let Some(0) | None = code {
+                        continue;
+                    }
+                    let name = self
+                        .plugins
+                        .plugins
+                        .get(plugin)
+                        .map(|p| p.name.clone())
+                        .unwrap_or_else(|| "plugin".to_string());
+                    self.toast(
+                        format!("{name} stopped unexpectedly ({}).", code.unwrap_or(-1)),
+                        ToastKind::Error,
+                    );
+                }
+                plugin::Msg::Junk { .. } => {}
+            }
+        }
+        true
     }
 
     // ================================================================ mouse
@@ -2692,6 +2974,8 @@ impl App {
                 self.search.field = match f {
                     0 => SearchField::Query,
                     1 => SearchField::Replace,
+                    2 => SearchField::Root,
+                    3 => SearchField::Dirs,
                     _ => SearchField::Filter,
                 };
                 self.update_search();

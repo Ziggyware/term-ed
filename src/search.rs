@@ -90,40 +90,66 @@ impl Glob {
     }
 }
 
-/// A parsed file filter: includes (empty means everything) and exclusions.
+/// A parsed filter: which directories to walk and which files to look at.
+///
+/// An empty include list means "everything", so an empty `FilterSet` searches
+/// the whole root. Directory rules are the ones from the panel's `dirs` box
+/// (`bin;src`) and from legacy trailing-separator entries in the file box.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FilterSet {
     includes: Vec<Glob>,
     excludes: Vec<Glob>,
+    /// Only these directories (and their sub-directories) are searched.
+    dir_includes: Vec<Glob>,
+    /// These directories and everything under them are skipped.
+    dir_excludes: Vec<Glob>,
 }
 
 impl FilterSet {
-    /// Parse `*.cs*;!*.csproj;!bin\`. Empty entries are ignored, `\` and `/`
-    /// are interchangeable, and `!` may be followed by whitespace.
+    /// Parse one combined filter string, as Visual Studio's *file* box does:
+    /// `*.cs*;!*.csproj;!bin\`. Entries with a trailing separator are
+    /// directory rules; everything else applies to file names.
     pub fn parse(spec: &str) -> Self {
         let mut set = Self::default();
-        for part in spec.split([';', '\n']) {
-            let mut t = part.trim();
-            let exclude = t.starts_with('!');
+        for (exclude, g) in parse_entries(spec) {
+            if g.dir {
+                if exclude {
+                    set.dir_excludes.push(g);
+                } else {
+                    set.dir_includes.push(g);
+                }
+            } else if exclude {
+                set.excludes.push(g);
+            } else {
+                set.includes.push(g);
+            }
+        }
+        set
+    }
+
+    /// Parse the panel's separate boxes: `dirs` (`bin;!obj;src`) and `files`
+    /// (`*.cs;!*.csproj`). Every entry in `dirs` is a directory rule, whether
+    /// or not it was written with a trailing separator, and `src` (without a
+    /// `!`) scopes the search to that folder instead of skipping it.
+    pub fn parse_parts(dirs: &str, files: &str) -> Self {
+        let mut set = Self::default();
+        for (exclude, mut g) in parse_entries(dirs) {
+            g.dir = true;
             if exclude {
-                t = t[1..].trim_start();
+                set.dir_excludes.push(g);
+            } else {
+                set.dir_includes.push(g);
             }
-            if t.is_empty() {
-                continue;
-            }
-            let mut text = t.replace('\\', "/");
-            while text.starts_with("./") {
-                text.drain(..2);
-            }
-            let dir = text.ends_with('/');
-            while text.ends_with('/') {
-                text.pop();
-            }
-            if text.is_empty() {
-                continue;
-            }
-            let g = Glob { text, dir };
-            if exclude {
+        }
+        for (exclude, g) in parse_entries(files) {
+            if g.dir {
+                // `!bin\` in the file box keeps working as a folder exclude.
+                if exclude {
+                    set.dir_excludes.push(g);
+                } else {
+                    set.dir_includes.push(g);
+                }
+            } else if exclude {
                 set.excludes.push(g);
             } else {
                 set.includes.push(g);
@@ -133,11 +159,20 @@ impl FilterSet {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.includes.is_empty() && self.excludes.is_empty()
+        self.includes.is_empty()
+            && self.excludes.is_empty()
+            && self.dir_includes.is_empty()
+            && self.dir_excludes.is_empty()
     }
 
-    /// Does a project-relative file path pass the filter?
+    /// Does a root-relative file path pass the filter?
     pub fn matches_file(&self, rel: &str) -> bool {
+        if !self.dir_includes.is_empty() && !self.dir_includes.iter().any(|g| in_dir(rel, g)) {
+            return false;
+        }
+        if self.dir_excludes.iter().any(|g| hits_path(rel, g)) {
+            return false;
+        }
         if !self.includes.is_empty() {
             let included = self.includes.iter().any(|g| {
                 if g.dir {
@@ -153,12 +188,65 @@ impl FilterSet {
         !self.excludes.iter().any(|g| hits_path(rel, g))
     }
 
-    /// May the walker descend into this directory? Only exclusions prune;
-    /// include patterns are applied to files, so a broad include is never
+    /// May the walker descend into this directory? Directory rules prune (and
+    /// scope) the tree; file patterns never do, so a broad include is not
     /// silently narrowed by an over-eager directory skip.
     pub fn allows_dir(&self, rel: &str) -> bool {
-        !self.excludes.iter().any(|g| hits_path(rel, g))
+        if self.dir_excludes.iter().any(|g| hits_path(rel, g)) {
+            return false;
+        }
+        if self.dir_includes.is_empty() {
+            return true;
+        }
+        // Descend when the folder is inside a scope, or on the way to one
+        // (`src` scopes the walk, so `src/app` must stay reachable).
+        self.dir_includes.iter().any(|g| dir_reaches(rel, g))
     }
+}
+
+/// Split a filter string into `(excluded, glob)` pairs. Empty entries are
+/// ignored, `\` and `/` are interchangeable, and `!` may be followed by
+/// whitespace.
+fn parse_entries(spec: &str) -> Vec<(bool, Glob)> {
+    let mut out = Vec::new();
+    for part in spec.split([';', '\n']) {
+        let mut t = part.trim();
+        let exclude = t.starts_with('!');
+        if exclude {
+            t = t[1..].trim_start();
+        }
+        if t.is_empty() {
+            continue;
+        }
+        let mut text = t.replace('\\', "/");
+        while text.starts_with("./") {
+            text.drain(..2);
+        }
+        let dir = text.ends_with('/');
+        while text.ends_with('/') {
+            text.pop();
+        }
+        if text.is_empty() {
+            continue;
+        }
+        out.push((exclude, Glob { text, dir }));
+    }
+    out
+}
+
+/// Is the directory `rel` the include pattern itself, inside it, or on the
+/// way to it? (`src` scopes the walk, so the walker may enter `src/app`.)
+fn dir_reaches(rel: &str, g: &Glob) -> bool {
+    if g.matches(rel) || in_dir(rel, g) {
+        return true;
+    }
+    // A plain (wildcard-free) pattern can be reached by walking into its
+    // leading folders. Globs are matched against folders as we go instead.
+    if g.text.contains(['*', '?', '[']) {
+        return false;
+    }
+    let prefix = format!("{rel}/");
+    g.text.starts_with(&prefix) || rel.is_empty()
 }
 
 /// `a/b/c.txt` -> `["a", "a/b"]`.
@@ -337,6 +425,68 @@ pub fn relative(root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+/// Turn what the user typed in the panel's root box into a directory.
+///
+/// Empty means the project root, `~` means home, and relative paths are
+/// resolved against the project root. `..` and `.` are folded lexically so
+/// the label stays readable and the search key stays stable.
+pub fn resolve_root(project: &Path, input: &str) -> PathBuf {
+    let t = input.trim();
+    if t.is_empty() || t == "." {
+        return project.to_path_buf();
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
+    let expanded = if t == "~" {
+        home.clone().unwrap_or_else(|| PathBuf::from(t))
+    } else if let Some(rest) = t.strip_prefix("~/").or_else(|| t.strip_prefix("~\\")) {
+        home.map(|h| h.join(rest))
+            .unwrap_or_else(|| PathBuf::from(t))
+    } else {
+        PathBuf::from(t)
+    };
+    let joined = if expanded.is_absolute() {
+        expanded
+    } else {
+        project.join(expanded)
+    };
+    normalize(&joined)
+}
+
+/// Fold `.` and `..` without touching the filesystem (the path may not exist).
+fn normalize(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// A short, readable label for a search root (`~/code/app`, `/srv/app`).
+pub fn root_label(root: &Path) -> String {
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+        && let Ok(rest) = root.strip_prefix(&home)
+    {
+        let rest = rest.to_string_lossy().replace('\\', "/");
+        return if rest.is_empty() {
+            "~".to_string()
+        } else {
+            format!("~/{rest}")
+        };
+    }
+    root.to_string_lossy().replace('\\', "/")
 }
 
 // ================================================================ search
@@ -650,5 +800,57 @@ mod tests {
             "foo bar foo"
         );
         assert!(replace_at("foo", 2, &re, "bar", true).is_none());
+    }
+
+    #[test]
+    fn separate_directory_and_file_filters() {
+        // Directory box: `!bin` skips that folder at any depth.
+        let f = FilterSet::parse_parts("!bin;!obj", "*.cs;!*.csproj");
+        assert!(f.matches_file("src/Program.cs"));
+        assert!(f.matches_file("deep/nested/Widget.cs"));
+        assert!(!f.matches_file("bin/Tool.cs"));
+        assert!(!f.matches_file("src/bin/Debug/Gen.cs"));
+        assert!(!f.matches_file("src/obj/Gen.cs"));
+        assert!(!f.matches_file("src/App.csproj"));
+        assert!(!f.matches_file("README.md"));
+
+        // A plain entry scopes the walk instead of excluding it.
+        let f = FilterSet::parse_parts("src", "*");
+        assert!(f.matches_file("src/a/b/main.rs"));
+        assert!(!f.matches_file("tests/main.rs"));
+        assert!(f.allows_dir("src"));
+        assert!(f.allows_dir("src/a"));
+        assert!(!f.allows_dir("tests"));
+        // On the way to a scope, the walker may descend.
+        let f = FilterSet::parse_parts("src/app", "*");
+        assert!(f.allows_dir("src"));
+        assert!(!f.allows_dir("tests"));
+
+        // `!` in the directory box excludes; globs work there too.
+        let f = FilterSet::parse_parts("!**/generated", "*.rs");
+        assert!(!f.matches_file("a/generated/x.rs"));
+        assert!(f.matches_file("a/src/x.rs"));
+
+        // The file box still accepts a legacy trailing-separator directory rule.
+        let f = FilterSet::parse_parts("", r"*.cs*;!*.csproj;!bin\");
+        assert!(!f.matches_file("src/bin/Debug/Gen.cs"));
+        assert!(f.matches_file("src/Program.cs"));
+    }
+
+    #[test]
+    fn roots_resolve_relative_to_the_project() {
+        let project = Path::new("/work/app");
+        assert_eq!(resolve_root(project, ""), PathBuf::from("/work/app"));
+        assert_eq!(resolve_root(project, "  "), PathBuf::from("/work/app"));
+        assert_eq!(resolve_root(project, "."), PathBuf::from("/work/app"));
+        assert_eq!(resolve_root(project, "src"), PathBuf::from("/work/app/src"));
+        assert_eq!(
+            resolve_root(project, "src/../tests"),
+            PathBuf::from("/work/app/tests")
+        );
+        assert_eq!(
+            resolve_root(project, "/srv/other"),
+            PathBuf::from("/srv/other")
+        );
     }
 }
