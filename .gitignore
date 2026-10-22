@@ -1,3 +1,7 @@
 /target
-# the WebGL page's dev-only dependencies (two checkers)
-webgl/node_modules
+/target/
+target/
+target/release
+release/
+/release
+/release/

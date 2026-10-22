@@ -44,7 +44,7 @@ pub fn detect_syntax(path: Option<&std::path::Path>, first_line: &str) -> &'stat
                 "csx" => Some("cs"),
                 "tsx" | "mts" | "cts" => Some("ts"),
                 "jsx" | "mjs" | "cjs" => Some("js"),
-                "h" | "hh" | "hxx" => Some("cpp"),
+                "h" | "hh" | "hxx" | "hlsl" | "glsl" | "shader" | "c" | "hpp" | "pch" => Some("cpp"),
                 "kts" => Some("kt"),
                 _ => None,
             };
@@ -424,6 +424,13 @@ mod tests {
             ("py", "Python"),
             ("ts", "TypeScript"),
             ("go", "Go"),
+            ("cpp", "Cpp"),
+            ("h", "Cpp"),
+            ("hpp", "Cpp"),
+            ("hx", "Cpp"),
+            ("hxx", "Cpp"),
+            ("hlsl", "Cpp"),
+            ("shader", "Cpp")
         ] {
             let s = detect_syntax(Some(std::path::Path::new(&format!("a.{ext}"))), "");
             assert_eq!(s.name, name, "extension {ext}");
