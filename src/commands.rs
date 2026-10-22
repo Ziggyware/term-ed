@@ -22,6 +22,8 @@ pub enum Command {
     SelectNextOccurrence,
     Find,
     Replace,
+    FindInFiles,
+    ReplaceInFiles,
     FindNext,
     FindPrev,
     GotoLine,
@@ -94,6 +96,8 @@ cmds! {
     SelectNextOccurrence, "Selection: Add Next Occurrence", "Ctrl+D";
     Find, "Edit: Find", "Ctrl+F";
     Replace, "Edit: Replace", "Ctrl+H";
+    FindInFiles, "Edit: Find in Files", "Ctrl+Shift+F";
+    ReplaceInFiles, "Edit: Replace in Files", "Ctrl+Shift+H";
     FindNext, "Edit: Find Next", "F3";
     FindPrev, "Edit: Find Previous", "Shift+F3";
     GotoLine, "Go to Line...", "Ctrl+G";

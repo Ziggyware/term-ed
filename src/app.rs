@@ -1,5 +1,8 @@
 //! Application state and input handling.
 
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -17,6 +20,7 @@ use crate::editor::Editor;
 use crate::explorer::{self, Explorer};
 use crate::fuzzy;
 use crate::highlight;
+use crate::search;
 use crate::theme::{self, ThemeEntry};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,6 +28,8 @@ pub enum Focus {
     Editor,
     Explorer,
     Find,
+    /// Typing into the find/replace-in-files panel.
+    Search,
     /// Typing into the AI agent panel.
     Agent,
 }
@@ -260,6 +266,48 @@ pub struct FindState {
     key: Option<(String, bool, bool, bool, u64, usize)>,
 }
 
+/// Which field of the find-in-files panel receives typing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SearchField {
+    #[default]
+    Query,
+    Replace,
+    Filter,
+}
+
+/// Find/Replace in Files: the query, the file filter and the results.
+#[derive(Default)]
+pub struct SearchState {
+    pub visible: bool,
+    /// The replace inputs and buttons are shown.
+    pub replace: bool,
+    pub query: String,
+    pub query_cursor: usize,
+    pub replacement: String,
+    pub replace_cursor: usize,
+    /// Glob filter: `*.cs*;!*.csproj;!bin\`.
+    pub filter: String,
+    pub filter_cursor: usize,
+    pub field: SearchField,
+    pub case_sensitive: bool,
+    pub whole_word: bool,
+    pub regex: bool,
+    pub results: search::Results,
+    pub error: bool,
+    /// File headers the user collapsed.
+    pub collapsed: HashSet<PathBuf>,
+    /// Selected file index and match index.
+    pub selected: Option<(usize, usize)>,
+    pub scroll: usize,
+    /// The query was pre-filled from the editor and is shown selected.
+    pub query_selected: bool,
+    key: Option<SearchKey>,
+}
+
+/// Everything a search depends on, so typing in the replace box does not
+/// rebuild the results.
+type SearchKey = (String, String, bool, bool, bool, u64, PathBuf);
+
 /// Screen regions from the last frame, for mouse hit testing.
 #[derive(Default, Clone)]
 pub struct Layout {
@@ -275,6 +323,18 @@ pub struct Layout {
     pub palette_list: Rect,
     pub find_box: Rect,
     pub find_buttons: Vec<(Rect, u8)>,
+    pub search_box: Rect,
+    pub search_list: Rect,
+    /// 0 = query, 1 = replace, 2 = filter.
+    pub search_fields: Vec<(Rect, u8)>,
+    /// 0..=2 options, 3 replace all, 4 replace file, 5 close.
+    pub search_buttons: Vec<(Rect, u8)>,
+    /// File headers (click to collapse/expand).
+    pub search_files: Vec<(Rect, usize)>,
+    /// Match rows (click to open).
+    pub search_hits: Vec<(Rect, (usize, usize))>,
+    /// Per-match replace buttons.
+    pub search_replace_hits: Vec<(Rect, (usize, usize))>,
     pub dialog_buttons: Vec<(Rect, usize)>,
     pub click_items: Vec<(Rect, Command)>,
     pub toolbar: Vec<(Rect, Tool)>,
@@ -336,6 +396,7 @@ pub struct App {
     pub palette: Option<Palette>,
     pub dialog: Option<Dialog>,
     pub find: FindState,
+    pub search: SearchState,
     pub toasts: Vec<Toast>,
     pub settings: Settings,
     pub git_branch: Option<String>,
@@ -374,6 +435,7 @@ impl App {
                 case_sensitive: false,
                 ..Default::default()
             },
+            search: SearchState::default(),
             toasts: Vec::new(),
             settings: Settings {
                 minimap: true,
@@ -526,6 +588,12 @@ impl App {
             let (field, cur) = self.find_field();
             field.insert_str(byte_at(field, *cur), &t);
             *cur += t.chars().count();
+        } else if self.focus == Focus::Search {
+            let t = text.replace(['\n', '\r'], "");
+            let (field, cur) = self.search_field_mut();
+            field.insert_str(byte_at(field, *cur), &t);
+            *cur += t.chars().count();
+            self.update_search();
         } else if let Some(e) = self.editor_mut() {
             e.insert_text(text);
             e.scroll_into_view();
@@ -671,6 +739,8 @@ impl App {
                 Some(Command::NextTab)
             }
             (KeyCode::PageUp, true, ..) | (KeyCode::BackTab, true, ..) => Some(Command::PrevTab),
+            (KeyCode::Char('f'), true, true, _) => Some(Command::FindInFiles),
+            (KeyCode::Char('h'), true, true, _) => Some(Command::ReplaceInFiles),
             (KeyCode::Char('f'), true, ..) => Some(Command::Find),
             (KeyCode::Char('h'), true, ..) => Some(Command::Replace),
             (KeyCode::Char('g'), true, ..) => Some(Command::GotoLine),
@@ -705,6 +775,7 @@ impl App {
 
         match self.focus {
             Focus::Find => self.find_key(code, ctrl, shift, alt),
+            Focus::Search => self.search_key(code, ctrl, shift, alt),
             Focus::Agent => self.agent_key(code, ctrl, shift, alt),
             Focus::Explorer => self.explorer_key(code),
             Focus::Editor => self.editor_key(code, ctrl, shift, alt),
@@ -798,7 +869,9 @@ impl App {
         }
         match code {
             KeyCode::Esc => {
-                if find_visible {
+                if self.search.visible {
+                    self.search.visible = false;
+                } else if find_visible {
                     self.find.visible = false;
                 } else {
                     e.sel = Selection::caret(e.sel.head);
@@ -1018,7 +1091,10 @@ impl App {
                     self.focus = Focus::Explorer;
                 }
             }
+            FindInFiles => self.open_search(false),
+            ReplaceInFiles => self.open_search(true),
             Find | Replace => {
+                self.search.visible = false;
                 self.find.visible = true;
                 self.find.show_replace = cmd == Replace;
                 self.find.on_replace = false;
@@ -1850,6 +1926,611 @@ impl App {
         self.toast(format!("Replaced {n} occurrence(s)"), ToastKind::Success);
     }
 
+    // ========================================================== find in files
+
+    /// Open the project-wide search panel. A single-line selection becomes
+    /// the query, like Visual Studio.
+    pub fn open_search(&mut self, replace: bool) {
+        let already_open = self.search.visible && self.focus == Focus::Search;
+        self.find.visible = false;
+        self.search.visible = true;
+        self.search.replace = replace;
+        if self.focus != Focus::Search {
+            if let Some(e) = self.editor() {
+                let text = e.selected_text();
+                if !text.is_empty() && !text.contains(['\n', '\r']) && text.len() <= 200 {
+                    self.search.query = text;
+                    self.search.query_cursor = self.search.query.chars().count();
+                    self.search.query_selected = true;
+                }
+            }
+            self.search.field = SearchField::Query;
+        }
+        if !replace && self.search.field == SearchField::Replace {
+            self.search.field = SearchField::Query;
+        }
+        // Ctrl+Shift+H on an open search moves on to the replacement.
+        if already_open && replace && self.search.field == SearchField::Query {
+            self.search.field = SearchField::Replace;
+        }
+        self.focus = Focus::Search;
+        self.search.key = None;
+        self.update_search();
+    }
+
+    fn close_search(&mut self) {
+        self.search.visible = false;
+        self.focus = if self.editors.is_empty() {
+            Focus::Explorer
+        } else {
+            Focus::Editor
+        };
+    }
+
+    fn search_field_mut(&mut self) -> (&mut String, &mut usize) {
+        match self.search.field {
+            SearchField::Replace if self.search.replace => (
+                &mut self.search.replacement,
+                &mut self.search.replace_cursor,
+            ),
+            SearchField::Filter => (&mut self.search.filter, &mut self.search.filter_cursor),
+            _ => (&mut self.search.query, &mut self.search.query_cursor),
+        }
+    }
+
+    fn search_query(&self) -> search::Query {
+        search::Query {
+            text: self.search.query.clone(),
+            case_sensitive: self.search.case_sensitive,
+            whole_word: self.search.whole_word,
+            regex: self.search.regex,
+        }
+    }
+
+    fn search_regex(&mut self) -> Option<Regex> {
+        let q = self.search_query();
+        if q.is_empty() {
+            return None;
+        }
+        match q.compile() {
+            Ok(re) => Some(re),
+            Err(e) => {
+                self.toast(format!("Invalid pattern: {e}"), ToastKind::Error);
+                None
+            }
+        }
+    }
+
+    /// Recompute the results when the query, options, filter or an open
+    /// editor changed. Cheap to call: nothing happens if the key is the same.
+    pub fn update_search(&mut self) {
+        if !self.search.visible {
+            return;
+        }
+        let q = self.search_query();
+        // Open editors can hold unsaved text; their edits are part of the key
+        // so nothing is copied until the results are actually stale.
+        let mut versions = self.editors.len() as u64;
+        for e in &self.editors {
+            if let Some(p) = &e.doc.path {
+                let mut h = DefaultHasher::new();
+                p.hash(&mut h);
+                e.doc.version.hash(&mut h);
+                versions = versions.rotate_left(9) ^ h.finish();
+            }
+        }
+        let key = (
+            q.text.clone(),
+            self.search.filter.clone(),
+            q.case_sensitive,
+            q.whole_word,
+            q.regex,
+            versions,
+            self.explorer.root.clone(),
+        );
+        if self.search.key.as_ref() == Some(&key) {
+            return;
+        }
+        self.search.key = Some(key);
+        let mut overrides = HashMap::new();
+        for e in &self.editors {
+            if let Some(p) = &e.doc.path {
+                overrides.insert(p.clone(), e.doc.rope.to_string());
+            }
+        }
+        // Keep the selection on the same occurrence if it is still there.
+        let prev = self.search.selected.and_then(|(fi, mi)| {
+            let f = self.search.results.files.get(fi)?;
+            let m = f.matches.get(mi)?;
+            Some((f.path.clone(), m.line, m.start))
+        });
+        self.search.error = false;
+        self.search.selected = None;
+        self.search.scroll = 0;
+        if q.is_empty() {
+            self.search.results = search::Results::default();
+            return;
+        }
+        let filter = search::FilterSet::parse(&self.search.filter);
+        match search::search(&self.explorer.root, &q, &filter, &overrides) {
+            Ok(results) => {
+                self.search.results = results;
+                self.search.selected = prev.and_then(|(path, line, start)| {
+                    self.search
+                        .results
+                        .files
+                        .iter()
+                        .enumerate()
+                        .find_map(|(fi, f)| {
+                            if f.path != path {
+                                return None;
+                            }
+                            f.matches
+                                .iter()
+                                .position(|m| m.line == line && m.start == start)
+                                .map(|mi| (fi, mi))
+                        })
+                });
+                if self.search.selected.is_none() {
+                    self.search.selected = self.first_search_hit();
+                }
+            }
+            Err(_) => {
+                self.search.results = search::Results::default();
+                self.search.error = true;
+            }
+        }
+    }
+
+    fn first_search_hit(&self) -> Option<(usize, usize)> {
+        self.search
+            .results
+            .files
+            .iter()
+            .position(|f| !f.matches.is_empty())
+            .map(|fi| (fi, 0))
+    }
+
+    /// The flat rows of the results list: a header per file, then its
+    /// matches (unless the file is collapsed).
+    pub fn search_rows(&self) -> Vec<(usize, Option<usize>)> {
+        let mut rows = Vec::new();
+        for (fi, f) in self.search.results.files.iter().enumerate() {
+            rows.push((fi, None));
+            if !self.search.collapsed.contains(&f.path) {
+                rows.extend((0..f.matches.len()).map(|mi| (fi, Some(mi))));
+            }
+        }
+        rows
+    }
+
+    fn search_hits(&self) -> Vec<(usize, usize)> {
+        self.search
+            .results
+            .files
+            .iter()
+            .enumerate()
+            .flat_map(|(fi, f)| (0..f.matches.len()).map(move |mi| (fi, mi)))
+            .collect()
+    }
+
+    fn search_move(&mut self, delta: isize) {
+        let hits = self.search_hits();
+        if hits.is_empty() {
+            return;
+        }
+        let n = hits.len() as isize;
+        let next = match self
+            .search
+            .selected
+            .and_then(|s| hits.iter().position(|h| *h == s))
+        {
+            Some(i) => (i as isize + delta).rem_euclid(n),
+            None if delta < 0 => n - 1,
+            None => 0,
+        };
+        let (fi, mi) = hits[next as usize];
+        self.search.selected = Some((fi, mi));
+        if let Some(f) = self.search.results.files.get(fi) {
+            // Keyboard navigation should never land on a hidden row.
+            self.search.collapsed.remove(&f.path);
+        }
+    }
+
+    fn search_hit_valid(&self) -> bool {
+        self.search.selected.is_some_and(|(fi, mi)| {
+            self.search
+                .results
+                .files
+                .get(fi)
+                .is_some_and(|f| mi < f.matches.len())
+        })
+    }
+
+    fn open_selected_search_hit(&mut self) {
+        if !self.search_hit_valid() {
+            self.search.selected = self.first_search_hit();
+        }
+        match self.search.selected {
+            Some((fi, mi)) => self.open_search_hit(fi, mi),
+            None => self.update_search(),
+        }
+    }
+
+    /// Jump to a result: open its file and select the occurrence.
+    pub fn open_search_hit(&mut self, fi: usize, mi: usize) {
+        let Some(f) = self.search.results.files.get(fi) else {
+            return;
+        };
+        let Some(m) = f.matches.get(mi) else {
+            return;
+        };
+        let (path, line, start, end) = (f.path.clone(), m.line, m.start, m.end);
+        self.search.selected = Some((fi, mi));
+        self.open_file(&path);
+        if let Some(e) = self.editor_mut() {
+            let line = line.min(e.doc.len_lines().saturating_sub(1));
+            let len = e.doc.line_len(line);
+            let s = e.doc.idx(line, start.min(len));
+            let en = e.doc.idx(line, end.min(len));
+            e.sel = Selection::new(s, en);
+            e.center_on_cursor();
+            e.scroll_into_view();
+        }
+        // Keep typing in the search box; Esc goes back to the editor.
+        self.focus = Focus::Search;
+    }
+
+    fn toggle_search_file(&mut self, fi: usize) {
+        let Some(path) = self.search.results.files.get(fi).map(|f| f.path.clone()) else {
+            return;
+        };
+        if !self.search.collapsed.remove(&path) {
+            self.search.collapsed.insert(path);
+        }
+    }
+
+    /// Replace in one path: an open editor keeps the change in memory (so it
+    /// can be undone and saved); a closed file is written to disk.
+    fn replace_in_path(
+        &mut self,
+        path: &Path,
+        re: &Regex,
+        replacement: &str,
+        literal: bool,
+    ) -> Result<usize, ()> {
+        if let Some(i) = self
+            .editors
+            .iter()
+            .position(|e| e.doc.path.as_deref() == Some(path))
+        {
+            let text = self.editors[i].doc.rope.to_string();
+            let (new, n) = search::replace_in_text(&text, re, replacement, literal);
+            if n > 0 {
+                self.editors[i].replace_document(&new);
+            }
+            return Ok(n);
+        }
+        let file = search::TextFile::read(path).ok_or(())?;
+        let (new, n) = search::replace_in_text(&file.text, re, replacement, literal);
+        if n == 0 {
+            return Ok(0);
+        }
+        file.write(&new).map_err(|_| ())?;
+        Ok(n)
+    }
+
+    fn after_search_replace(&mut self, total: usize, files: usize, failed: usize) {
+        if total == 0 {
+            let (text, kind) = if failed > 0 {
+                (
+                    "Could not replace: some files could not be read".to_string(),
+                    ToastKind::Error,
+                )
+            } else {
+                ("No matches to replace".to_string(), ToastKind::Info)
+            };
+            self.toast(text, kind);
+            return;
+        }
+        self.search.key = None;
+        self.update_search();
+        let mut msg = format!("Replaced {total} occurrence(s) in {files} file(s)");
+        if failed > 0 {
+            msg.push_str(&format!(" · {failed} failed"));
+        }
+        self.toast(
+            msg,
+            if failed > 0 {
+                ToastKind::Error
+            } else {
+                ToastKind::Success
+            },
+        );
+    }
+
+    fn search_replace_all(&mut self) {
+        let Some(re) = self.search_regex() else {
+            return;
+        };
+        let literal = !self.search.regex;
+        let replacement = self.search.replacement.clone();
+        let paths: Vec<PathBuf> = self
+            .search
+            .results
+            .files
+            .iter()
+            .map(|f| f.path.clone())
+            .collect();
+        let (mut total, mut files, mut failed) = (0, 0, 0);
+        for path in paths {
+            match self.replace_in_path(&path, &re, &replacement, literal) {
+                Ok(0) => {}
+                Ok(n) => {
+                    total += n;
+                    files += 1;
+                }
+                Err(()) => failed += 1,
+            }
+        }
+        self.after_search_replace(total, files, failed);
+    }
+
+    fn search_replace_file(&mut self) {
+        if !self.search_hit_valid() {
+            self.toast("Select a result first", ToastKind::Info);
+            return;
+        }
+        let Some((fi, _)) = self.search.selected else {
+            return;
+        };
+        let Some(path) = self.search.results.files.get(fi).map(|f| f.path.clone()) else {
+            return;
+        };
+        let Some(re) = self.search_regex() else {
+            return;
+        };
+        let literal = !self.search.regex;
+        let replacement = self.search.replacement.clone();
+        match self.replace_in_path(&path, &re, &replacement, literal) {
+            Ok(n) => self.after_search_replace(n, if n > 0 { 1 } else { 0 }, 0),
+            Err(()) => self.after_search_replace(0, 0, 1),
+        }
+    }
+
+    /// Replace just the selected occurrence.
+    pub fn search_replace_one(&mut self, fi: usize, mi: usize) {
+        let Some(re) = self.search_regex() else {
+            return;
+        };
+        let literal = !self.search.regex;
+        let replacement = self.search.replacement.clone();
+        let Some((path, line, start)) = self.search.results.files.get(fi).and_then(|f| {
+            let m = f.matches.get(mi)?;
+            Some((f.path.clone(), m.line, m.start))
+        }) else {
+            return;
+        };
+        let mut done = false;
+        if let Some(i) = self
+            .editors
+            .iter()
+            .position(|e| e.doc.path.as_deref() == Some(path.as_path()))
+        {
+            let e = &mut self.editors[i];
+            if line < e.doc.len_lines() {
+                let text = e.doc.line_str(line);
+                if let Some(new_line) = search::replace_at(&text, start, &re, &replacement, literal)
+                {
+                    let s = e.doc.line_start(line);
+                    let len = e.doc.line_len(line);
+                    e.replace_range(s, s + len, &new_line);
+                    done = true;
+                }
+            }
+        } else if let Some(file) = search::TextFile::read(&path) {
+            let mut out = String::with_capacity(file.text.len());
+            for (n, l) in file.text.split('\n').enumerate() {
+                if n > 0 {
+                    out.push('\n');
+                }
+                if n == line && !done {
+                    match search::replace_at(l, start, &re, &replacement, literal) {
+                        Some(new_line) => {
+                            out.push_str(&new_line);
+                            done = true;
+                        }
+                        None => out.push_str(l),
+                    }
+                } else {
+                    out.push_str(l);
+                }
+            }
+            if done && file.write(&out).is_err() {
+                done = false;
+            }
+        }
+        if done {
+            self.search.key = None;
+            self.update_search();
+            self.toast("Replaced 1 occurrence", ToastKind::Success);
+        } else {
+            self.toast("That match is gone — search again", ToastKind::Info);
+        }
+    }
+
+    fn search_replace_one_selected(&mut self) {
+        if !self.search_hit_valid() {
+            self.toast("Select a result first", ToastKind::Info);
+            return;
+        }
+        if let Some((fi, mi)) = self.search.selected {
+            self.search_replace_one(fi, mi);
+        }
+    }
+
+    fn search_button(&mut self, b: u8) {
+        match b {
+            0 => self.search.case_sensitive = !self.search.case_sensitive,
+            1 => self.search.whole_word = !self.search.whole_word,
+            2 => self.search.regex = !self.search.regex,
+            3 => {
+                self.search_replace_all();
+                return;
+            }
+            4 => {
+                self.search_replace_file();
+                return;
+            }
+            5 => {
+                self.close_search();
+                return;
+            }
+            _ => return,
+        }
+        self.update_search();
+    }
+
+    fn cycle_search_field(&mut self, back: bool) {
+        let mut fields = vec![SearchField::Query, SearchField::Filter];
+        if self.search.replace {
+            fields.insert(1, SearchField::Replace);
+        }
+        let i = fields
+            .iter()
+            .position(|f| *f == self.search.field)
+            .unwrap_or(0);
+        let n = fields.len();
+        self.search.field = fields[if back { (i + n - 1) % n } else { (i + 1) % n }];
+    }
+
+    fn search_key(&mut self, code: KeyCode, ctrl: bool, shift: bool, alt: bool) {
+        match (code, ctrl, shift, alt) {
+            (KeyCode::Esc, ..) => {
+                self.close_search();
+                return;
+            }
+            (KeyCode::Tab, ..) | (KeyCode::BackTab, ..) => {
+                self.cycle_search_field(code == KeyCode::BackTab || shift);
+                return;
+            }
+            (KeyCode::Enter, true, true, _) => {
+                if self.search.replace {
+                    self.search_replace_one_selected();
+                }
+                return;
+            }
+            (KeyCode::Enter, true, false, _) => {
+                if self.search.replace {
+                    self.search_replace_all();
+                } else {
+                    self.open_selected_search_hit();
+                }
+                return;
+            }
+            (KeyCode::Enter, false, false, true) => {
+                if self.search.replace {
+                    self.search_replace_file();
+                }
+                return;
+            }
+            (KeyCode::Enter, false, false, false) => {
+                if self.search.replace && self.search.field == SearchField::Replace {
+                    self.search_replace_one_selected();
+                } else {
+                    self.open_selected_search_hit();
+                }
+                return;
+            }
+            (KeyCode::F(5), ..) => {
+                // Re-run the search after editing files behind the panel.
+                self.search.key = None;
+                self.update_search();
+                return;
+            }
+            (KeyCode::Up, ..) => {
+                self.search_move(-1);
+                return;
+            }
+            (KeyCode::Down, ..) => {
+                self.search_move(1);
+                return;
+            }
+            (KeyCode::PageUp, ..) => {
+                self.search_move(-10);
+                return;
+            }
+            (KeyCode::PageDown, ..) => {
+                self.search_move(10);
+                return;
+            }
+            (KeyCode::Char('c'), _, _, true) => {
+                self.search.case_sensitive = !self.search.case_sensitive;
+                self.update_search();
+                return;
+            }
+            (KeyCode::Char('w'), _, _, true) => {
+                self.search.whole_word = !self.search.whole_word;
+                self.update_search();
+                return;
+            }
+            (KeyCode::Char('r'), _, _, true) => {
+                self.search.regex = !self.search.regex;
+                self.update_search();
+                return;
+            }
+            _ => {
+                // Field editing.
+                let selected = std::mem::take(&mut self.search.query_selected)
+                    && self.search.field == SearchField::Query;
+                if selected
+                    && matches!(
+                        code,
+                        KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete
+                    )
+                {
+                    self.search.query.clear();
+                    self.search.query_cursor = 0;
+                    if !matches!(code, KeyCode::Char(_)) {
+                        self.update_search();
+                        return;
+                    }
+                }
+                let (field, cur) = self.search_field_mut();
+                match code {
+                    KeyCode::Left => *cur = cur.saturating_sub(1),
+                    KeyCode::Right => *cur = (*cur + 1).min(field.chars().count()),
+                    KeyCode::Home => *cur = 0,
+                    KeyCode::End => *cur = field.chars().count(),
+                    KeyCode::Backspace if ctrl => {
+                        field.clear();
+                        *cur = 0;
+                    }
+                    KeyCode::Backspace => {
+                        if *cur > 0 {
+                            let b = byte_at(field, *cur - 1);
+                            field.remove(b);
+                            *cur -= 1;
+                        }
+                    }
+                    KeyCode::Delete => {
+                        if *cur < field.chars().count() {
+                            let b = byte_at(field, *cur);
+                            field.remove(b);
+                        }
+                    }
+                    KeyCode::Char(c) if !ctrl && !alt => {
+                        let b = byte_at(field, *cur);
+                        field.insert(b, c);
+                        *cur += 1;
+                    }
+                    _ => return,
+                }
+                self.update_search();
+            }
+        }
+    }
+
     // ================================================================ mouse
 
     fn on_mouse(&mut self, m: MouseEvent) {
@@ -1869,6 +2550,11 @@ impl App {
                             .clamp(0, n.saturating_sub(1) as isize)
                             as usize;
                     }
+                } else if self.search.visible && l.search_box.contains(pos) {
+                    let rows = self.search_rows().len();
+                    let max = rows.saturating_sub(l.search_list.height as usize);
+                    self.search.scroll =
+                        (self.search.scroll as isize + d).clamp(0, max as isize) as usize;
                 } else if l.agent_panel.contains(pos) {
                     let a = &mut self.agent;
                     a.scroll = (a.scroll as isize - d).max(0) as usize;
@@ -1994,6 +2680,38 @@ impl App {
                     self.agent.cursor = self.agent.input.chars().count();
                 }
             }
+            return;
+        }
+        if self.search.visible && l.search_box.contains(pos) {
+            if let Some((_, b)) = l.search_buttons.iter().find(|(r, _)| r.contains(pos)) {
+                self.search_button(*b);
+                return;
+            }
+            if let Some((_, f)) = l.search_fields.iter().find(|(r, _)| r.contains(pos)) {
+                self.focus = Focus::Search;
+                self.search.field = match f {
+                    0 => SearchField::Query,
+                    1 => SearchField::Replace,
+                    _ => SearchField::Filter,
+                };
+                self.update_search();
+                return;
+            }
+            if let Some((_, (fi, mi))) = l.search_replace_hits.iter().find(|(r, _)| r.contains(pos))
+            {
+                self.search_replace_one(*fi, *mi);
+                return;
+            }
+            if let Some((_, fi)) = l.search_files.iter().find(|(r, _)| r.contains(pos)) {
+                self.toggle_search_file(*fi);
+                return;
+            }
+            if let Some((_, (fi, mi))) = l.search_hits.iter().find(|(r, _)| r.contains(pos)) {
+                self.open_search_hit(*fi, *mi);
+                return;
+            }
+            self.focus = Focus::Search;
+            self.update_search();
             return;
         }
         if l.title_search.contains(pos) {

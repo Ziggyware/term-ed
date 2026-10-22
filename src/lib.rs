@@ -15,5 +15,6 @@ pub mod fuzzy;
 pub mod highlight;
 pub mod icons;
 pub mod mcp;
+pub mod search;
 pub mod theme;
 pub mod ui;
