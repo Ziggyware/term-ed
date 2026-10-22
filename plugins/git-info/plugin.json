@@ -1,0 +1,18 @@
+{
+  "name": "git-info",
+  "version": "1.0.0",
+  "description": "Branch and working-tree status for the project",
+  "author": "termed",
+  "command": [
+    "python3",
+    "main.py"
+  ],
+  "events": [],
+  "commands": [
+    {
+      "id": "status",
+      "title": "Git: Branch and Status",
+      "keys": "ctrl+alt+g"
+    }
+  ]
+}

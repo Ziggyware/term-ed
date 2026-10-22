@@ -1,0 +1,22 @@
+{
+  "name": "todo",
+  "version": "1.0.0",
+  "description": "Find TODO, FIXME, HACK and XXX comments across the project",
+  "author": "termed",
+  "command": [
+    "python3",
+    "main.py"
+  ],
+  "events": [],
+  "commands": [
+    {
+      "id": "list",
+      "title": "List TODOs in Project",
+      "keys": "ctrl+alt+t"
+    },
+    {
+      "id": "count",
+      "title": "Count TODOs in Project"
+    }
+  ]
+}

@@ -506,8 +506,8 @@ pub fn render_search(buf: &mut Buffer, editor: Rect, app: &mut App) -> Option<Po
     if w < 30 || editor.height < 7 {
         return None;
     }
-    // rows: query, [replace], filter, status, results; plus the border.
-    let fixed = 5 + u16::from(replace);
+    // rows: query, [replace], root, dirs, files, status, results; border.
+    let fixed = 7 + u16::from(replace);
     let max_h = editor.height.saturating_sub(u16::from(!compact));
     if max_h <= fixed {
         return None;
@@ -620,21 +620,90 @@ pub fn render_search(buf: &mut Buffer, editor: Rect, app: &mut App) -> Option<Po
             .push((Rect::new(btn_x + 6, ry, 6, 1), 4));
     }
 
-    // ----------------------------------------------------------- filter row
-    let fy = r.y + 2 + u16::from(replace);
+    // ------------------------------------------------------------ root row
+    let root_y = r.y + 2 + u16::from(replace);
+    put(
+        buf,
+        r.x + 2,
+        root_y,
+        "⌂",
+        bold(fgbg(pal.accent, bg)),
+        r.right(),
+    );
+    let project = crate::search::root_label(&app.explorer.root);
+    let root_hint = if compact {
+        project.clone()
+    } else {
+        format!("search in: {project}")
+    };
+    let c = input(
+        buf,
+        Rect::new(r.x + 4, root_y, r.width.saturating_sub(6), 1),
+        &app.search.root,
+        app.search.root_cursor,
+        &root_hint,
+        if app.search.missing_root {
+            pal.error
+        } else {
+            pal.popup_fg
+        },
+        pal.popup_dim,
+        pal.input_bg,
+    );
+    if focused && app.search.field == crate::app::SearchField::Root {
+        caret = Some(c);
+    }
+    app.layout
+        .search_fields
+        .push((Rect::new(r.x + 1, root_y, r.width - 2, 1), 2));
+
+    // ------------------------------------------------------------ dirs row
+    let dyy = root_y + 1;
+    put(
+        buf,
+        r.x + 2,
+        dyy,
+        "▤",
+        bold(fgbg(pal.accent, bg)),
+        r.right(),
+    );
+    let dirs_hint = if compact {
+        "src;!bin;!obj"
+    } else {
+        "dirs: src;!bin;!obj   (plain = only these, ! = skip)"
+    };
+    let c = input(
+        buf,
+        Rect::new(r.x + 4, dyy, r.width.saturating_sub(6), 1),
+        &app.search.dirs,
+        app.search.dirs_cursor,
+        &dirs_hint,
+        pal.popup_fg,
+        pal.popup_dim,
+        pal.input_bg,
+    );
+    if focused && app.search.field == crate::app::SearchField::Dirs {
+        caret = Some(c);
+    }
+    app.layout
+        .search_fields
+        .push((Rect::new(r.x + 1, dyy, r.width - 2, 1), 3));
+
+    // ----------------------------------------------------------- files row
+    let fy = dyy + 1;
     put(buf, r.x + 2, fy, "⚑", bold(fgbg(pal.accent, bg)), r.right());
     let fw = r.width.saturating_sub(6);
     let filter_hint = if compact {
-        "*.cs*;!*.csproj;!bin\\"
+        "*.cs;!*.csproj"
     } else {
-        "files: *.cs*;!*.csproj;!bin\\"
+        "files: *.cs;!*.csproj   (globs, ! excludes)"
     };
     let c = input(
         buf,
         Rect::new(r.x + 4, fy, fw, 1),
         &app.search.filter,
         app.search.filter_cursor,
-        filter_hint,
+        &filter_hint,
         pal.popup_fg,
         pal.popup_dim,
         pal.input_bg,
@@ -644,7 +713,7 @@ pub fn render_search(buf: &mut Buffer, editor: Rect, app: &mut App) -> Option<Po
     }
     app.layout
         .search_fields
-        .push((Rect::new(r.x + 1, fy, r.width - 2, 1), 2));
+        .push((Rect::new(r.x + 1, fy, r.width - 2, 1), 4));
 
     // ----------------------------------------------------------- status row
     let sy = fy + 1;
@@ -652,6 +721,11 @@ pub fn render_search(buf: &mut Buffer, editor: Rect, app: &mut App) -> Option<Po
         let results = &app.search.results;
         if app.search.error {
             "Invalid pattern".to_string()
+        } else if app.search.missing_root {
+            format!(
+                "No such folder: {}",
+                crate::search::root_label(&app.search.root_path)
+            )
         } else if app.search.query.is_empty() {
             "Type a query to search every file in the project".to_string()
         } else if results.matches == 0 {
@@ -669,10 +743,17 @@ pub fn render_search(buf: &mut Buffer, editor: Rect, app: &mut App) -> Option<Po
             } else {
                 s.push_str(&format!(" · {} scanned", results.scanned));
             }
+            // When the search is rooted somewhere else, say where.
+            if !app.search.root.trim().is_empty() {
+                s.push_str(&format!(
+                    " · in {}",
+                    crate::search::root_label(&app.search.root_path)
+                ));
+            }
             s
         }
     };
-    let sc = if app.search.error {
+    let sc = if app.search.error || app.search.missing_root {
         pal.error
     } else {
         pal.popup_dim
@@ -702,8 +783,10 @@ pub fn render_search(buf: &mut Buffer, editor: Rect, app: &mut App) -> Option<Po
     if rows.is_empty() {
         let msg = if app.search.error {
             "Fix the pattern to see results"
+        } else if app.search.missing_root {
+            "That folder does not exist - clear the root box to search the project"
         } else if app.search.query.is_empty() {
-            "Glob filters: *.cs*;!*.csproj;!bin\\   (separate with ;)"
+            "Filter with globs: dirs src;!bin   files *.cs;!*.csproj"
         } else {
             "No matches"
         };

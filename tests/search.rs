@@ -332,3 +332,77 @@ fn panel_fits_the_compact_phone_layout() {
     assert!(screen.contains("2 matches in 1 file"), "{screen}");
     assert!(app.layout.search_box.width <= 60);
 }
+
+#[test]
+fn root_and_directory_boxes_scope_the_search() {
+    let root = project("scope");
+    let mut app = App::new(
+        root.clone(),
+        vec![root.join("src/Program.cs")],
+        "Visual Studio Dark",
+        false,
+    );
+    app.run(Command::FindInFiles);
+    type_text(&mut app, "class");
+    assert!(app.search.results.matches >= 3);
+
+    // Directory box: skip generated folders, and only inside src.
+    app.search.field = SearchField::Dirs;
+    type_text(&mut app, "!bin;!obj");
+    let names = rels(&app);
+    assert!(!names.iter().any(|n| n.contains("bin/")), "{names:?}");
+
+    // Root box: a sub-folder becomes the search root. Paths in the results
+    // are relative to the root that was searched.
+    app.search.field = SearchField::Root;
+    type_text(&mut app, "src");
+    let names = rels(&app);
+    assert!(names.contains(&"Program.cs".to_string()), "{names:?}");
+    assert!(!names.iter().any(|n| n.starts_with("tests/")), "{names:?}");
+    assert!(names.iter().all(|n| !n.contains("/bin/")), "{names:?}");
+    assert_eq!(app.search.root_path, root.join("src"));
+    assert!(!app.search.missing_root);
+
+    // A root that does not exist is reported instead of searching nothing.
+    app.search.root.clear();
+    app.search.root_cursor = 0;
+    type_text(&mut app, "no-such-folder");
+    assert!(app.search.missing_root);
+    assert_eq!(app.search.results.matches, 0);
+
+    // Back to the project root: everything is searched again.
+    app.search.root.clear();
+    app.search.root_cursor = 0;
+    app.search.dirs.clear();
+    app.search.dirs_cursor = 0;
+    app.search.field = SearchField::Query;
+    app.search.query.clear();
+    app.search.query_cursor = 0;
+    app.search.query_selected = false;
+    type_text(&mut app, "class");
+    assert!(!app.search.missing_root);
+    assert!(app.search.results.matches >= 3);
+}
+
+#[test]
+fn panel_renders_the_root_and_filter_rows() {
+    let root = project("rows");
+    let mut app = App::new(
+        root.clone(),
+        vec![root.join("src/Program.cs")],
+        "Visual Studio Dark",
+        false,
+    );
+    app.run(Command::FindInFiles);
+    type_text(&mut app, "class");
+    app.search.dirs = "!bin".into();
+    app.search.filter = "*.cs;!*.csproj".into();
+    let mut term = Terminal::new(TestBackend::new(110, 32)).unwrap();
+    term.draw(|f| termed::ui::draw(f, &mut app, true)).unwrap();
+    let screen = screen(&term);
+    assert!(screen.contains("!bin"), "{screen}");
+    assert!(screen.contains("*.cs;!*.csproj"), "{screen}");
+    // Four hit-testable fields: query, root, dirs, files.
+    let ids: Vec<u8> = app.layout.search_fields.iter().map(|(_, id)| *id).collect();
+    assert_eq!(ids, vec![0, 2, 3, 4]);
+}

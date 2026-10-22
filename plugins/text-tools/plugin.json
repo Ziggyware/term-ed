@@ -1,0 +1,46 @@
+{
+  "name": "text-tools",
+  "version": "1.0.0",
+  "description": "Sort, trim, de-duplicate, re-case and pretty-print the buffer",
+  "author": "termed",
+  "command": [
+    "python3",
+    "main.py"
+  ],
+  "events": [],
+  "commands": [
+    {
+      "id": "sort",
+      "title": "Sort Lines (A-Z)",
+      "keys": "ctrl+alt+l"
+    },
+    {
+      "id": "sort-desc",
+      "title": "Sort Lines (Z-A)"
+    },
+    {
+      "id": "dedupe",
+      "title": "Remove Duplicate Lines"
+    },
+    {
+      "id": "trim",
+      "title": "Trim Trailing Whitespace"
+    },
+    {
+      "id": "upper",
+      "title": "Convert to UPPER CASE"
+    },
+    {
+      "id": "lower",
+      "title": "Convert to lower case"
+    },
+    {
+      "id": "json-pretty",
+      "title": "Format JSON"
+    },
+    {
+      "id": "json-minify",
+      "title": "Minify JSON"
+    }
+  ]
+}
