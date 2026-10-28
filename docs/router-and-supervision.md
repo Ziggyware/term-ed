@@ -10,12 +10,18 @@ models. No new external agent install is needed.
 
 1. Open **Settings → AI agent configuration** (or the agent panel's **⚙**).
 2. Choose **Save Router API Key…**, enter/paste the raw key in the masked field,
-   then press Enter. Esc cancels without saving. Do not use the separate
-   **API key environment variable** field for the actual secret.
-3. Choose **Use NoKey Router**. This persists `builtin` + `router` + `free:code`
-   in workspace preferences while retaining your other permissions/budgets.
-4. Send a task. Authentication and provider failures appear in the transcript;
-   saving a key alone does not validate it or start a billable model request.
+   then press Enter. Esc cancels without saving. The editor saves the credential
+   locally and selects the built-in NoKey Router for this workspace, retaining
+   your other permissions/budgets and an already-selected router model. Do not
+   put the secret in the separate **API key environment variable** field.
+3. Send a task. Authentication and provider failures appear in the transcript;
+   saving a key does not validate it or start a model request.
+
+If selecting the router fails because workspace settings cannot be saved, the
+editor reports that separately: the key is still saved locally. Fix the settings
+and choose **Use NoKey Router**. That action can also switch an existing workspace
+to the router without re-entering the key. It selects `builtin` + `router` +
+`free:code` and preserves your other permissions/budgets.
 
 **From a local terminal:**
 
@@ -26,9 +32,11 @@ termed --router-logout   # remove the saved key and exit
 ```
 
 `--router-login` also imports an already exported `ROUTER_API_KEY`, or reads stdin
-when piped. There is deliberately **no key-valued command-line argument**. An
-existing nonempty `ROUTER_API_KEY` takes precedence over the saved key at runtime;
-removing the saved file does not unset your environment variable.
+when piped. It does not change a workspace's settings; launch with `--router` or
+choose **Use NoKey Router** in that workspace. There is deliberately **no
+key-valued command-line argument**. An existing nonempty `ROUTER_API_KEY` takes
+precedence over the saved key at runtime; the editor warns if that override is
+active when saving a key. Removing the saved file does not unset the override.
 
 ### Storage and origin restrictions
 
@@ -59,9 +67,11 @@ fetch: `free:code` (default), `free:auto`, `free:fast`, `free:smart`,
 `free:reasoning`, and `openrouter/free`. An explicit model ID can also be set.
 Actual availability, rate limits and function support depend on the deployed
 router and its upstreams. Its buffered SSE format is supported, including
-`reasoning_content` and multiple complete, unindexed tool calls in one event.
-OpenAI-style indexed fragments remain supported. Partial/oversized/malformed
-streams do not execute incomplete tool arguments.
+`reasoning_content` and multiple complete, unindexed tool calls. OpenAI-style
+indexed fragments, object-form tool arguments, and complete JSON responses from
+compatible providers that ignore streaming are also supported. Missing or reused
+tool-call IDs are made unique across the conversation. Partial/oversized/malformed
+responses do not execute incomplete tool arguments.
 
 The legacy anonymous Kilo path and custom OpenAI-compatible endpoints remain
 available. Custom providers use a separately named environment variable, not

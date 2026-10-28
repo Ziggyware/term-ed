@@ -22,6 +22,7 @@ pub mod icons;
 pub mod image_view;
 pub mod management;
 pub mod mcp;
+mod model_response;
 pub mod plugin;
 pub mod process_guard;
 pub mod provider;
