@@ -261,51 +261,6 @@ fn compact_history(history: &mut Vec<Value>, system_bytes: usize) {
     }
 }
 
-/// OpenAI sends indexed fragments; NoKey Router sends complete, unindexed
-/// calls in one event. Preserve each function separately in either format.
-fn merge_tool_calls(
-    calls: &mut Vec<(String, String, String)>,
-    delta: &Value,
-) -> Result<(), String> {
-    for (position, call) in delta
-        .get("tool_calls")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .enumerate()
-    {
-        let index = match call.get("index") {
-            None => position as u64,
-            Some(v) => v
-                .as_u64()
-                .ok_or("Tool call index must be a nonnegative integer")?,
-        };
-        if index >= 16 {
-            return Err("Model returned too many tool calls (limit 16)".into());
-        }
-        let i = index as usize;
-        while calls.len() <= i {
-            calls.push(Default::default());
-        }
-        if let Some(id) = call.get("id").and_then(Value::as_str) {
-            if id.len() > 128 {
-                return Err("Tool call ID is too long".into());
-            }
-            calls[i].0 = id.into();
-        }
-        if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
-            calls[i].1.push_str(name);
-        }
-        if let Some(args) = call.pointer("/function/arguments").and_then(Value::as_str) {
-            calls[i].2.push_str(args);
-        }
-        if calls[i].1.len() > 128 || calls[i].2.len() > 64 * 1024 {
-            return Err("Model tool call exceeds its size limit".into());
-        }
-    }
-    Ok(())
-}
-
 struct Worker {
     cwd: PathBuf,
     options: AgentConfig,
@@ -319,6 +274,8 @@ struct Worker {
     history: Vec<Value>,
     dynamic_tools: Vec<Value>,
     next_id: u64,
+    next_tool_id: u64,
+    used_tool_ids: HashSet<String>,
     always_allow_commands: bool,
     policy: PermissionPolicy,
     model_selector: ModelSelector,
@@ -364,6 +321,8 @@ impl Worker {
             history: Vec::new(),
             dynamic_tools: Vec::new(),
             next_id: 1000,
+            next_tool_id: 0,
+            used_tool_ids: HashSet::new(),
             always_allow_commands: false,
             policy,
             model_selector,
@@ -413,6 +372,7 @@ impl Worker {
                     self.cwd = PathBuf::from(c);
                 }
                 self.history.clear();
+                self.used_tool_ids.clear();
                 self.always_allow_commands = false;
                 if self.models.is_empty() {
                     self.models = if self.options.uses_router() {
@@ -648,117 +608,92 @@ impl Worker {
                 .unwrap_or_else(|| format!("HTTP {status}"));
             return Err(Step::Failed(clean(&message), Some(status)));
         }
+        // Some OpenAI-compatible gateways ignore `stream: true` and return a
+        // complete JSON response. Apply the same safety checks as for SSE.
+        let is_json = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| {
+                let media_type = v.split(';').next().unwrap_or("").trim();
+                media_type.eq_ignore_ascii_case("application/json")
+                    || media_type.to_ascii_lowercase().ends_with("+json")
+            });
+        let mut response = crate::model_response::ModelResponse::default();
         let mut reader = BufReader::new(resp.into_body().into_reader());
-        let mut content = String::new();
-        let mut calls: Vec<(String, String, String)> = Vec::new();
-        let mut bytes = 0;
-        let mut finished = false;
-        loop {
-            if self.cancel.load(Ordering::SeqCst) {
-                return Err(Step::Cancelled);
-            }
-            let mut line = String::new();
-            let read = std::io::Read::take(&mut reader, 512 * 1024 + 1)
-                .read_line(&mut line)
+        if is_json {
+            let mut text = String::new();
+            std::io::Read::take(&mut reader, 2 * 1024 * 1024 + 1)
+                .read_to_string(&mut text)
                 .map_err(|_| {
                     Step::Failed(
                         "Connection lost while reading a model response".into(),
                         None,
                     )
                 })?;
-            if read == 0 {
-                break;
-            }
-            bytes += read;
-            if read > 512 * 1024 || bytes > 2 * 1024 * 1024 {
+            if text.len() > 2 * 1024 * 1024 {
                 return Err(Step::Failed(
-                    "Model stream exceeded its size limit".into(),
+                    "Model response exceeded its size limit".into(),
                     Some(502),
                 ));
             }
-            let Some(data) = line.strip_prefix("data:") else {
-                continue;
-            };
-            let data = data.trim();
-            if data == "[DONE]" {
-                finished = true;
-                break;
+            if self.cancel.load(Ordering::SeqCst) {
+                return Err(Step::Cancelled);
             }
-            let v: Value = serde_json::from_str(data)
-                .map_err(|_| Step::Failed("Malformed model stream event".into(), Some(502)))?;
-            if let Some(error) = v.get("error") {
-                return Err(Step::Failed(
-                    clean(
-                        error
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .unwrap_or("Model error"),
-                    ),
-                    Some(502),
-                ));
-            }
-            if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
-                let used = u.get("total_tokens").and_then(Value::as_u64).unwrap_or(0);
-                self.update(json!({"sessionUpdate":"usage_update","used":used,"size":0,"cost":{"amount":0,"currency":"USD"}}));
-            }
-            // Some OpenAI-compatible servers send a full message in an SSE event.
-            let delta = v
-                .pointer("/choices/0/delta")
-                .or_else(|| v.pointer("/choices/0/message"));
-            let Some(delta) = delta else {
-                continue;
-            };
-            if let Some(reason) = v
-                .pointer("/choices/0/finish_reason")
-                .and_then(Value::as_str)
-            {
-                if reason == "length" || reason == "content_filter" {
+            let value: Value = serde_json::from_str(&text)
+                .map_err(|_| Step::Failed("Malformed model JSON response".into(), Some(502)))?;
+            self.accept_model_event(&mut response, &value, key.as_ref())?;
+        } else {
+            let mut bytes = 0;
+            loop {
+                if self.cancel.load(Ordering::SeqCst) {
+                    return Err(Step::Cancelled);
+                }
+                let mut line = String::new();
+                let read = std::io::Read::take(&mut reader, 512 * 1024 + 1)
+                    .read_line(&mut line)
+                    .map_err(|_| {
+                        Step::Failed(
+                            "Connection lost while reading a model response".into(),
+                            None,
+                        )
+                    })?;
+                if self.cancel.load(Ordering::SeqCst) {
+                    return Err(Step::Cancelled);
+                }
+                if read == 0 {
+                    break;
+                }
+                bytes += read;
+                if read > 512 * 1024 || bytes > 2 * 1024 * 1024 {
                     return Err(Step::Failed(
-                        format!(
-                            "Model stopped with {reason}; partial tool calls were not executed. Adjust the output budget or task."
-                        ),
-                        Some(413),
+                        "Model stream exceeded its size limit".into(),
+                        Some(502),
                     ));
                 }
-                finished = true;
+                let Some(data) = line.strip_prefix("data:") else {
+                    continue;
+                };
+                let data = data.trim();
+                if data == "[DONE]" {
+                    response.done();
+                    break;
+                }
+                let value: Value = serde_json::from_str(data)
+                    .map_err(|_| Step::Failed("Malformed model stream event".into(), Some(502)))?;
+                self.accept_model_event(&mut response, &value, key.as_ref())?;
             }
-            if let Some(r) = delta
-                .get("reasoning_content")
-                .or_else(|| delta.get("reasoning"))
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-            {
-                self.update(json!({"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":r}}));
-            }
-            if let Some(c) = delta
-                .get("content")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-            {
-                content.push_str(c);
-                self.update(json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":c}}));
-            }
-            merge_tool_calls(&mut calls, delta).map_err(|e| Step::Failed(e, Some(502)))?;
         }
-        // Never execute partially received arguments or silently treat an empty
-        // response as success. This also prevents unsafe retry of partial calls.
-        if !finished {
-            return Err(Step::Failed("Model stream ended before a completion marker; no partial tool calls were executed".into(),Some(502)));
-        }
-        calls.retain(|c| !c.1.is_empty());
-        if calls.is_empty() && content.trim().is_empty() {
-            return Err(Step::Failed(
-                "Model returned neither an answer nor tool calls".into(),
-                Some(502),
-            ));
-        }
+        let (content, mut calls) = response
+            .finish()
+            .map_err(|e| Step::Failed(clean(&e.message), Some(e.status)))?;
+        crate::model_response::assign_tool_call_ids(
+            &mut calls,
+            &mut self.used_tool_ids,
+            &mut self.next_tool_id,
+        );
         let mut assistant = json!({"role":"assistant","content":content});
         if !calls.is_empty() {
-            for (i, call) in calls.iter_mut().enumerate() {
-                if call.0.is_empty() {
-                    call.0 = format!("call_{}_{i}", self.next_id);
-                }
-            }
             assistant["tool_calls"]=json!(calls.iter().map(|(id,name,args)|json!({"id":id,"type":"function","function":{"name":name,"arguments":args}})).collect::<Vec<_>>());
         }
         self.history.push(assistant);
@@ -779,6 +714,27 @@ impl Worker {
                 .push(json!({"role":"tool","tool_call_id":id,"content":result}));
         }
         Ok(true)
+    }
+
+    fn accept_model_event(
+        &self,
+        response: &mut crate::model_response::ModelResponse,
+        value: &Value,
+        key: Option<&crate::credentials::Secret>,
+    ) -> Result<(), Step> {
+        let update = response.push(value).map_err(|e| {
+            Step::Failed(crate::provider::sanitize(&e.message, key), Some(e.status))
+        })?;
+        if let Some(used) = update.used {
+            self.update(json!({"sessionUpdate":"usage_update","used":used,"size":0,"cost":{"amount":0,"currency":"USD"}}));
+        }
+        if let Some(reasoning) = update.reasoning {
+            self.update(json!({"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":reasoning}}));
+        }
+        if let Some(content) = update.content {
+            self.update(json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":content}}));
+        }
+        Ok(())
     }
 
     /// Resolve a model-supplied path inside the project (never outside it).
@@ -1468,37 +1424,6 @@ mod configured_tests {
 #[cfg(test)]
 mod router_stream_tests {
     use super::*;
-    #[test]
-    fn complete_unindexed_router_calls_do_not_merge_and_fragments_still_work() {
-        let mut calls = Vec::new();
-        merge_tool_calls(
-            &mut calls,
-            &json!({"tool_calls":[
-                {"id":"a","function":{"name":"read_file","arguments":"{\"path\":\"a\"}"}},
-                {"id":"b","function":{"name":"search","arguments":"{\"pattern\":\"b\"}"}}
-            ]}),
-        )
-        .unwrap();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].1, "read_file");
-        assert_eq!(calls[1].1, "search");
-        let mut fragments = Vec::new();
-        merge_tool_calls(&mut fragments,&json!({"tool_calls":[{"index":0,"id":"c","function":{"name":"read_","arguments":"{\"pa"}}]})).unwrap();
-        merge_tool_calls(&mut fragments,&json!({"tool_calls":[{"index":0,"function":{"name":"file","arguments":"th\":\"a\"}"}}]})).unwrap();
-        assert_eq!(fragments[0].1, "read_file");
-        assert_eq!(
-            serde_json::from_str::<Value>(&fragments[0].2).unwrap(),
-            json!({"path":"a"})
-        );
-        assert!(
-            merge_tool_calls(
-                &mut fragments,
-                &json!({"tool_calls":[{"index":1_000_000_000}]})
-            )
-            .is_err()
-        );
-        assert!(merge_tool_calls(&mut fragments, &json!({"tool_calls":[{"index":-1}]})).is_err());
-    }
     #[test]
     fn compaction_preserves_current_goal_and_does_not_orphan_tool_results() {
         let mut history = vec![

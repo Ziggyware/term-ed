@@ -428,7 +428,7 @@ impl App {
                     } else if crate::credentials::path().exists() {
                         "Saved locally; never shown or copied into workspace settings"
                     } else {
-                        "Not saved; enter locally in a masked field"
+                        "Not saved; enter locally in a masked field to save and select the router"
                     };
                     row("Save Router API Key…".into(), status.into());
                     row(
@@ -714,7 +714,7 @@ impl App {
                         0 => {let mut prefs=self.preferences.clone();prefs.agent.use_router();self.save_preferences(prefs)?;self.open_palette(mode);}
                         1 => {
                             if self.agent.is_working()||self.automation.busy(){bail!("Stop the AI turn before replacing credentials");}
-                            self.edit_value(EditTarget::RouterKey,"Save Router API Key (hidden)","Local plaintext outside workspace settings (owner-only on Unix). ROUTER_API_KEY wins. Esc cancels.",String::new());
+                            self.edit_value(EditTarget::RouterKey,"Save Router API Key (hidden)","Saves locally and selects the built-in router for this workspace. ROUTER_API_KEY wins. Esc cancels.",String::new());
                         }
                         2 => {
                             if self.agent.is_working()||self.automation.busy(){bail!("Stop the AI turn before removing credentials");}
@@ -830,12 +830,40 @@ impl App {
                     bail!("Stop the AI turn before replacing credentials");
                 }
                 crate::credentials::Store::default().save(input)?;
+                // Saving a router credential is an explicit request to use it.
+                // Do not leave the editor silently connected to a different
+                // backend; preserve a router model the user already selected.
+                let already_router = prefs.agent.uses_router();
+                if !already_router || prefs.agent.backend != "builtin" {
+                    let model = prefs.agent.model.clone();
+                    prefs.agent.use_router();
+                    if already_router && !model.is_empty() {
+                        prefs.agent.model = model;
+                    }
+                }
+                // The current selection can be a launch-only --router override,
+                // so persist even if the router was already active in memory.
+                let selection = self.save_preferences(prefs);
+                // Drop the masked input even if preferences cannot be written:
+                // the credential was already saved, so reporting otherwise (or
+                // keeping it in the palette) would be misleading.
                 self.management.edit = None;
                 self.open_palette(PaletteMode::AgentSettings);
-                self.toast(
-                    "Router key saved privately; choose Use NoKey Router to connect",
-                    ToastKind::Success,
-                );
+                match selection {
+                    Err(e) => self.toast(
+                        format!("Router key saved locally, but router settings could not be saved: {e:#}. Fix the settings, then choose Use NoKey Router."),
+                        ToastKind::Error,
+                    ),
+                    Ok(()) if std::env::var(crate::credentials::ROUTER_ENV)
+                        .is_ok_and(|key| !key.trim().is_empty()) => self.toast(
+                        "Router selected; the ROUTER_API_KEY environment override is still in use instead of the saved key",
+                        ToastKind::Info,
+                    ),
+                    Ok(()) => self.toast(
+                        "Router key saved privately and NoKey Router selected",
+                        ToastKind::Success,
+                    ),
+                }
                 return Ok(());
             }
             EditTarget::CreateSkill => {

@@ -390,3 +390,146 @@ fn router_setup_masks_input_and_provider_and_overwatch_controls_are_accessible()
         |e| matches!(e,termed::agent::Entry::Notice{text,..} if text.contains("Agent overwatch"))
     ));
 }
+
+#[test]
+fn saving_router_key_selects_builtin_and_reports_override_or_selection_failure() {
+    if let Some(root) = std::env::var_os("TERMED_ROUTER_SETUP_ROOT") {
+        let root = PathBuf::from(root);
+        let mut a = app(&root);
+        a.run(Command::AgentSettings);
+        choose(&mut a, "Step budget:");
+        type_value(&mut a, "7");
+        choose(&mut a, "Save Router API Key");
+        type_value(&mut a, "test-only-saved+key");
+        assert!(a.agent.options.uses_router());
+        assert_eq!(a.agent.options.backend, "builtin");
+        assert_eq!(a.agent.options.model, "free:code");
+        assert_eq!(a.agent.options.max_steps, 7);
+        let settings = std::fs::read_to_string(settings_path(&root)).unwrap();
+        assert!(!settings.contains("test-only-saved+key"));
+        assert!(!settings.contains("router_api_key"));
+        let saved = termed::credentials::Store::default()
+            .load()
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.expose(), "test-only-saved+key");
+        let override_set = std::env::var_os("TERMED_ROUTER_SETUP_OVERRIDE").is_some();
+        let selected =
+            termed::provider::authorization(&a.agent.options, termed::provider::ROUTER_ENDPOINT)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            selected.expose(),
+            if override_set {
+                "test-only-override+key"
+            } else {
+                "test-only-saved+key"
+            }
+        );
+        assert!(a.toasts.iter().any(|toast| if override_set {
+            toast.text.contains("environment override")
+        } else {
+            toast.text.contains("NoKey Router selected")
+        }));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(termed::credentials::path())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
+        // Replacing a key must not reset a router model already chosen.
+        let mut prefs = a.preferences.clone();
+        prefs.agent.model = "free:fast".into();
+        a.save_preferences(prefs).unwrap();
+        a.run(Command::AgentSettings);
+        choose(&mut a, "Save Router API Key");
+        type_value(&mut a, "test-only-replacement+key");
+        assert_eq!(a.agent.options.model, "free:fast");
+        assert_eq!(app(&root).agent.options.model, "free:fast");
+
+        // --router is a launch-only override. Saving a key while it is active
+        // must also persist the selected router and model for the next launch.
+        let transient = root.join("transient");
+        std::fs::create_dir_all(&transient).unwrap();
+        let mut c = app(&transient);
+        c.preferences.agent.use_router();
+        c.preferences.agent.model = "free:smart".into();
+        c.agent
+            .configure(c.preferences.agent.clone(), String::new())
+            .unwrap();
+        assert!(!settings_path(&transient).exists());
+        c.run(Command::AgentSettings);
+        choose(&mut c, "Save Router API Key");
+        type_value(&mut c, "test-only-transient+key");
+        let reloaded = app(&transient);
+        assert!(reloaded.agent.options.uses_router());
+        assert_eq!(reloaded.agent.options.model, "free:smart");
+
+        // A broken settings file cannot be overwritten, but a successful key
+        // save must be reported honestly and the masked input cleared.
+        let broken = root.join("broken");
+        std::fs::create_dir_all(broken.join(".termed")).unwrap();
+        std::fs::write(settings_path(&broken), "invalid JSON").unwrap();
+        let mut b = app(&broken);
+        b.run(Command::AgentSettings);
+        choose(&mut b, "Save Router API Key");
+        type_value(&mut b, "test-only-broken-settings+key");
+        assert!(!b.agent.options.uses_router());
+        assert!(b.management.edit.is_none());
+        assert!(
+            b.toasts
+                .iter()
+                .any(|t| t.text.contains("key saved locally")
+                    && t.text.contains("could not be saved"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(settings_path(&broken)).unwrap(),
+            "invalid JSON"
+        );
+        assert_eq!(
+            termed::credentials::Store::default()
+                .load()
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "test-only-broken-settings+key"
+        );
+        return;
+    }
+
+    for environment_override in [false, true] {
+        let root = project(if environment_override {
+            "router-setup-env"
+        } else {
+            "router-setup-saved"
+        });
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "saving_router_key_selects_builtin_and_reports_override_or_selection_failure",
+            ])
+            .env("TERMED_ROUTER_SETUP_ROOT", &root)
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env_remove("ROUTER_API_KEY");
+        if environment_override {
+            command
+                .env("TERMED_ROUTER_SETUP_OVERRIDE", "1")
+                .env("ROUTER_API_KEY", "test-only-override+key");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
