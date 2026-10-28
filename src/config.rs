@@ -1,6 +1,8 @@
-//! Persistent, validated workspace preferences. User defaults are overlaid by
-//! `.termed/settings.json`; secrets are referenced by environment variable name.
+//! Persistent, validated user preferences, with a legacy workspace fallback.
+//! Secrets are referenced by environment variable name, not stored here.
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -54,10 +56,10 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            backend: "auto".into(),
+            backend: "builtin".into(),
             command: String::new(),
             model: String::new(),
-            provider: "auto".into(),
+            provider: "router".into(),
             endpoint: String::new(),
             api_key_env: String::new(),
             instructions: String::new(),
@@ -162,6 +164,13 @@ impl AgentConfig {
         }
         if self.backend.trim().is_empty() {
             bail!("Choose an agent backend");
+        }
+        if self.backend.trim().eq_ignore_ascii_case("opencode")
+            || (self.backend == "custom" && crate::agent::removed_opencode_command(&self.command))
+        {
+            bail!(
+                "OpenCode integration has been removed; choose the built-in or another ACP agent"
+            );
         }
         if self.backend == "custom" && crate::plugin::split_command(&self.command).is_empty() {
             bail!("A custom ACP agent needs a command");
@@ -278,6 +287,8 @@ impl Default for SubAgentConfig {
             enabled: true,
             agent: AgentConfig {
                 backend: "builtin".into(),
+                // Specialists inherit the parent's provider unless explicitly set.
+                provider: "auto".into(),
                 read_only: true,
                 max_steps: 12,
                 sub_agents: false,
@@ -335,10 +346,10 @@ impl Default for Preferences {
             ..Default::default() };
         let coordinator=SubAgentConfig {id:"coordinator".into(),name:"Coordinator".into(),
             description:"Read-only coordinator that can delegate focused reviews and test planning to grandchildren".into(),
-            agent:AgentConfig{backend:"builtin".into(),read_only:true,commands:CommandPolicy::Deny,plugins:false,max_steps:18,sub_agents:true,
+            agent:AgentConfig{backend:"builtin".into(),provider:"auto".into(),read_only:true,commands:CommandPolicy::Deny,plugins:false,max_steps:18,sub_agents:true,
                 instructions:"Coordinate a focused investigation. When useful, delegate distinct evidence-based tasks to reviewer and tester, passing relevant findings, scope and acceptance criteria. Collect every result before finishing, verify claims, and report disagreements, blockers and checks not run. Do not edit files or execute commands.".into(),..Default::default()},..Default::default()};
         Self {
-            version: 1,
+            version: 2,
             editor: EditorConfig::default(),
             agent: AgentConfig::default(),
             sub_agents: vec![reviewer, tester, coordinator],
@@ -348,20 +359,32 @@ impl Default for Preferences {
 }
 
 pub fn config_dir() -> PathBuf {
+    // A relative/empty XDG_CONFIG_HOME would accidentally make settings vary
+    // with the current project directory. The XDG spec requires an absolute path.
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
         .unwrap_or_else(|| {
-            std::env::var_os("HOME")
-                .or_else(|| std::env::var_os("USERPROFILE"))
+            let home = ["HOME", "USERPROFILE"]
+                .into_iter()
+                .filter_map(std::env::var_os)
                 .map(PathBuf::from)
-                .unwrap_or_else(std::env::temp_dir)
-                .join(".config")
+                .find(|path| path.is_absolute());
+            #[allow(deprecated)]
+            let home = home.or_else(|| std::env::home_dir().filter(|path| path.is_absolute()));
+            home.unwrap_or_else(std::env::temp_dir).join(".config")
         })
         .join("termed")
 }
 
+/// Old per-workspace settings, used only until user settings are saved.
 pub fn settings_path(project: &Path) -> PathBuf {
     project.join(".termed/settings.json")
+}
+
+/// Settings used for every workspace, alongside (but separate from) credentials.
+pub fn user_settings_path() -> PathBuf {
+    config_dir().join("settings.json")
 }
 
 pub fn valid_id(id: &str) -> bool {
@@ -374,7 +397,7 @@ pub fn valid_id(id: &str) -> bool {
 
 impl Preferences {
     pub fn validate(&self) -> Result<()> {
-        if self.version != 1 {
+        if !matches!(self.version, 1 | 2) {
             bail!("Unsupported settings version {}", self.version);
         }
         self.agent.validate()?;
@@ -401,36 +424,167 @@ impl Preferences {
 
     pub fn load(project: &Path) -> Result<Self> {
         let mut value = serde_json::to_value(Self::default())?;
-        for path in [config_dir().join("settings.json"), settings_path(project)] {
+        let mut selected_in_file = false;
+        let mut legacy_schema = false;
+        // Existing per-project preferences are a migration source only. Once
+        // user settings exist, old workspace files cannot override or break
+        // the preferences chosen for all folders.
+        let user_path = user_settings_path();
+        let mut source = None;
+        for path in [user_path, settings_path(project)] {
             match std::fs::read_to_string(&path) {
                 Ok(text) => {
-                    let overlay: Value = serde_json::from_str(&text)
-                        .with_context(|| format!("Invalid JSON in {}", path.display()))?;
-                    if !overlay.is_object() {
-                        bail!("{} must contain a JSON object", path.display());
-                    }
-                    merge(&mut value, overlay);
+                    source = Some((path, text));
+                    break;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e).with_context(|| format!("Cannot read {}", path.display())),
             }
         }
-        let prefs: Self = serde_json::from_value(value).context("Invalid settings value")?;
+        if let Some((path, text)) = source {
+            let mut overlay: Value = serde_json::from_str(&text)
+                .with_context(|| format!("Invalid JSON in {}", path.display()))?;
+            if !overlay.is_object() {
+                bail!("{} must contain a JSON object", path.display());
+            }
+            // Version 1 and unversioned files used the anonymous gateway as
+            // the implicit built-in provider. Version 2 makes the router the
+            // default while keeping a deliberately chosen `auto` provider.
+            legacy_schema = overlay
+                .get("version")
+                .is_none_or(|version| version.as_u64() == Some(1));
+            selected_in_file = overlay
+                .get("agent")
+                .and_then(Value::as_object)
+                .is_some_and(|a| {
+                    ["backend", "provider", "endpoint"]
+                        .iter()
+                        .any(|key| a.contains_key(*key))
+                });
+            prepare_legacy_overlay(&mut overlay);
+            merge(&mut value, overlay);
+        }
+        let mut prefs: Self = serde_json::from_value(value).context("Invalid settings value")?;
+        // Preserve an explicit custom ACP environment override for users who
+        // have not selected a backend/provider in their settings. It cannot
+        // resurrect the removed OpenCode integration.
+        let mut environment_agent = false;
+        if !selected_in_file
+            && let Ok(command) = std::env::var("TERMED_AGENT")
+            && command != "builtin"
+            && !crate::plugin::split_command(&command).is_empty()
+            && !crate::agent::removed_opencode_command(&command)
+        {
+            prefs.agent.backend = "auto".into();
+            prefs.agent.provider = "auto".into();
+            environment_agent = true;
+        }
+        if !matches!(prefs.version, 1 | 2) {
+            bail!("Unsupported settings version {}", prefs.version);
+        }
+        migrate_removed_backend(&mut prefs.agent, !environment_agent, legacy_schema);
+        for profile in &mut prefs.sub_agents {
+            migrate_removed_backend(&mut profile.agent, false, legacy_schema);
+        }
+        prefs.version = 2;
         prefs.validate()?;
         Ok(prefs)
     }
 
-    pub fn save(&self, project: &Path) -> Result<()> {
+    /// Save to the user configuration directory, regardless of the workspace.
+    /// The project argument is retained for existing callers.
+    pub fn save(&self, _project: &Path) -> Result<()> {
         self.validate()?;
-        let path = settings_path(project);
-        std::fs::create_dir_all(path.parent().unwrap())?;
-        // A failed write never destroys the previous valid settings file.
-        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-        let mut text = serde_json::to_string_pretty(self)?;
-        text.push('\n');
-        std::fs::write(&tmp, text).context("Cannot write settings")?;
-        std::fs::rename(&tmp, &path).context("Cannot replace settings file")?;
-        Ok(())
+        let path = user_settings_path();
+        let parent = path.parent().context("User settings path has no parent")?;
+        let mut directories = std::fs::DirBuilder::new();
+        directories.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            directories.mode(0o700);
+        }
+        directories
+            .create(parent)
+            .context("Cannot create user settings directory")?;
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let tmp = parent.join(format!(
+            ".settings-{}-{}.tmp",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        // Write a unique sibling and rename only after it is complete. This
+        // preserves the previous file on errors and avoids cross-process clashes.
+        let result = (|| -> Result<()> {
+            let mut file = options.open(&tmp).context("Cannot create user settings")?;
+            serde_json::to_writer_pretty(&mut file, self).context("Cannot write user settings")?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&tmp, &path).context("Cannot replace user settings file")?;
+            Ok(())
+        })();
+        let _ = std::fs::remove_file(&tmp);
+        result
+    }
+}
+
+/// Older partial settings used an implicit custom endpoint and specialist
+/// provider inheritance. Preserve those meanings with the new router default.
+fn prepare_legacy_overlay(overlay: &mut Value) {
+    if let Some(agent) = overlay.get_mut("agent").and_then(Value::as_object_mut) {
+        let custom_endpoint = agent
+            .get("endpoint")
+            .and_then(Value::as_str)
+            .is_some_and(|url| !url.is_empty() && !crate::provider::pinned_router(url));
+        if custom_endpoint && !agent.contains_key("provider") {
+            agent.insert("provider".into(), Value::String("auto".into()));
+        }
+    }
+    if let Some(profiles) = overlay.get_mut("sub_agents").and_then(Value::as_array_mut) {
+        for profile in profiles {
+            if let Some(agent) = profile.get_mut("agent").and_then(Value::as_object_mut) {
+                agent
+                    .entry("provider")
+                    .or_insert_with(|| Value::String("auto".into()));
+            }
+        }
+    }
+}
+
+/// Drop the removed backend and migrate implicit legacy defaults, while
+/// preserving explicit custom endpoints and deliberately selected providers.
+fn migrate_removed_backend(agent: &mut AgentConfig, primary: bool, legacy_schema: bool) {
+    let removed = agent.backend.trim().eq_ignore_ascii_case("opencode")
+        || (agent.backend == "custom" && crate::agent::removed_opencode_command(&agent.command));
+    let implicit_provider = agent.provider == "auto"
+        && agent.endpoint.is_empty()
+        && (agent.api_key_env.is_empty() || agent.api_key_env == crate::credentials::ROUTER_ENV);
+    let legacy_auto = primary
+        && legacy_schema
+        && agent.backend == "auto"
+        && (agent.uses_router() || implicit_provider);
+    if removed || legacy_auto {
+        agent.backend = "builtin".into();
+        if removed {
+            agent.command.clear();
+        }
+    }
+    if primary && (legacy_schema || removed) && agent.backend == "builtin" && implicit_provider {
+        agent.provider = "router".into();
+    }
+    let model = agent.model.to_ascii_lowercase();
+    if (removed || legacy_auto || (primary && agent.uses_router()))
+        && (model.starts_with("opencode/") || model.ends_with("big-pickle"))
+    {
+        agent.model.clear();
     }
 }
 

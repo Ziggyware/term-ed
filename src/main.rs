@@ -75,7 +75,7 @@ fn main() -> Result<()> {
     if args.router_login {
         termed::credentials::import_from_terminal()?;
         eprintln!(
-            "Router key saved in private user configuration (not workspace settings). Start with `termed --router`, or select Use NoKey Router in AI settings."
+            "Router key saved in private user configuration. NoKey Router is the default; if you selected another provider, choose Use NoKey Router in AI settings or launch with --router."
         );
         return Ok(());
     }

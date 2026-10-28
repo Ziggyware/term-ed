@@ -1,3 +1,5 @@
+mod common;
+
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -18,6 +20,9 @@ impl Drop for Server {
 
 #[test]
 fn built_in_agent_uses_live_plugins_skills_and_an_isolated_specialist() {
+    if common::isolate("built_in_agent_uses_live_plugins_skills_and_an_isolated_specialist") {
+        return;
+    }
     let fixture =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_automation_gateway.py");
     let Ok(mut server) = Command::new("python3")
@@ -42,6 +47,7 @@ fn built_in_agent_uses_live_plugins_skills_and_an_isolated_specialist() {
     .unwrap();
     let mut prefs = Preferences::default();
     prefs.agent.backend = "builtin".into();
+    prefs.agent.provider = "custom".into();
     prefs.agent.endpoint = format!("http://127.0.0.1:{}", port.trim());
     prefs.agent.model = "test/automation".into();
     prefs.agent.instructions = "PARENT-AUTOMATION".into();
@@ -111,6 +117,9 @@ fn built_in_agent_uses_live_plugins_skills_and_an_isolated_specialist() {
 
 #[test]
 fn external_acp_agents_get_an_authenticated_mcp_stdio_relay() {
+    if common::isolate("external_acp_agents_get_an_authenticated_mcp_stdio_relay") {
+        return;
+    }
     let bridge = Bridge::start().unwrap();
     let spec = bridge.mcp_server().unwrap();
     assert!(bridge.address.ip().is_loopback());

@@ -140,7 +140,7 @@ pub fn render_palette(buf: &mut Buffer, screen: Rect, app: &mut App) -> Option<P
         PaletteMode::Plugins | PaletteMode::PluginActions | PaletteMode::PluginCommands => {
             "Plugins"
         }
-        PaletteMode::Settings => "Settings · Workspace",
+        PaletteMode::Settings => "Settings · User",
         PaletteMode::AgentSettings => "AI Agent Configuration",
         PaletteMode::SubAgents | PaletteMode::SubAgentSettings => {
             "Sub-agents · Built-in Specialists"

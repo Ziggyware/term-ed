@@ -1,3 +1,5 @@
+mod common;
+
 use serde_json::json;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -28,6 +30,11 @@ fn project(tag: &str) -> PathBuf {
 
 #[test]
 fn router_shaped_stream_runs_generated_function_child_and_grandchild_with_correct_context() {
+    if common::isolate(
+        "router_shaped_stream_runs_generated_function_child_and_grandchild_with_correct_context",
+    ) {
+        return;
+    }
     let fixture =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_supervised_gateway.py");
     let mut server = Command::new("python3")
@@ -51,6 +58,7 @@ fn router_shaped_stream_runs_generated_function_child_and_grandchild_with_correc
     let mut prefs = Preferences::default();
     prefs.agent = AgentConfig {
         backend: "builtin".into(),
+        provider: "custom".into(),
         endpoint: format!("http://127.0.0.1:{}/v1", port.trim()),
         model: "test/router-contract".into(),
         instructions:
@@ -133,6 +141,9 @@ fn router_shaped_stream_runs_generated_function_child_and_grandchild_with_correc
 
 #[test]
 fn cli_key_setup_is_user_local_private_and_not_put_in_workspace_settings() {
+    if common::isolate("cli_key_setup_is_user_local_private_and_not_put_in_workspace_settings") {
+        return;
+    }
     let root = project("credential-cli");
     let config = root.join("config");
     let key = "test-only-not-a-real-router-credential";
@@ -183,6 +194,10 @@ fn cli_key_setup_is_user_local_private_and_not_put_in_workspace_settings() {
 
 #[test]
 fn nested_inheritance_keeps_instructions_skills_provider_and_all_restrictions() {
+    if common::isolate("nested_inheritance_keeps_instructions_skills_provider_and_all_restrictions")
+    {
+        return;
+    }
     let mut root = AgentConfig {
         instructions: "ROOT scope".into(),
         skills: vec!["root-skill".into()],
@@ -223,6 +238,7 @@ fn nested_inheritance_keeps_instructions_skills_provider_and_all_restrictions() 
     assert!(serialized.get("inherited_instructions").is_none());
     assert!(serialized.get("router_api_key").is_none());
     let foreign = AgentConfig {
+        provider: "custom".into(),
         endpoint: "https://different.invalid/v1".into(),
         ..Default::default()
     }
@@ -252,6 +268,11 @@ fn nested_inheritance_keeps_instructions_skills_provider_and_all_restrictions() 
 
 #[test]
 fn saved_router_key_resolves_privately_env_overrides_and_file_tools_cannot_read_it() {
+    if common::isolate(
+        "saved_router_key_resolves_privately_env_overrides_and_file_tools_cannot_read_it",
+    ) {
+        return;
+    }
     const KEY: &str = "test-only-persisted-router-key";
     if std::env::var_os("TERMED_KEY_RESOLUTION_CHILD").is_some() {
         let root = PathBuf::from(std::env::var_os("TERMED_TEST_PRIVATE_ROOT").unwrap());
@@ -341,6 +362,9 @@ fn saved_router_key_resolves_privately_env_overrides_and_file_tools_cannot_read_
 
 #[test]
 fn https_bearer_auth_redacts_errors_and_refuses_cross_origin_redirects() {
+    if common::isolate("https_bearer_auth_redacts_errors_and_refuses_cross_origin_redirects") {
+        return;
+    }
     if std::env::var_os("TERMED_SECURITY_CHILD").is_some() {
         let root = PathBuf::from(std::env::var_os("TERMED_SECURITY_ROOT").unwrap());
         let mode = std::env::var("TERMED_SECURITY_MODE").unwrap();
@@ -366,6 +390,7 @@ fn https_bearer_auth_redacts_errors_and_refuses_cross_origin_redirects() {
         let mut prefs = Preferences::default();
         prefs.agent = AgentConfig {
             backend: "builtin".into(),
+            provider: "custom".into(),
             endpoint: format!("https://127.0.0.1:{}/v1", port.trim()),
             api_key_env: "TERMED_TEST_PROVIDER_KEY".into(),
             model: "test/security".into(),

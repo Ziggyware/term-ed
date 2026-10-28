@@ -1,6 +1,8 @@
 //! A rate-limited free model stays silent; termed switches to another free
 //! model and resends the prompt by itself.
 
+mod common;
+
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -11,6 +13,9 @@ use termed::commands::Command;
 
 #[test]
 fn stalled_free_model_fails_over_to_another_free_model() {
+    if common::isolate("stalled_free_model_fails_over_to_another_free_model") {
+        return;
+    }
     if std::process::Command::new("python3")
         .arg("--version")
         .output()
@@ -23,7 +28,7 @@ fn stalled_free_model_fails_over_to_another_free_model() {
     // SAFETY: single test in this binary; no concurrent environment access.
     unsafe {
         std::env::set_var("TERMED_AGENT", format!("python3 {}", fixture.display()));
-        std::env::set_var("FAKE_STALL", "opencode/big-pickle");
+        std::env::set_var("FAKE_STALL", "mock/first-free");
     }
     let root = std::env::temp_dir().join(format!("termed-failover-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
@@ -65,7 +70,7 @@ fn stalled_free_model_fails_over_to_another_free_model() {
     }
     assert_eq!(
         app.agent.model.as_deref(),
-        Some("opencode/step-5-free"),
+        Some("mock/second-free"),
         "skipped the paid model"
     );
     assert!(

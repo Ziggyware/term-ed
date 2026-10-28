@@ -1,9 +1,8 @@
 //! AI coding agents over the Agent Client Protocol (ACP).
 //!
-//! termed is an ACP *client*: it launches an agent (OpenCode, Gemini CLI,
-//! Claude Code, Codex, ...) as a subprocess and talks JSON-RPC 2.0 over its
-//! stdin/stdout. Out of the box it uses OpenCode, whose free models need no
-//! account or API key, so the panel works with zero configuration.
+//! termed uses its built-in agent by default. Optional ACP agents such as
+//! Gemini CLI, Claude Code and Codex run as subprocesses and communicate over
+//! JSON-RPC 2.0 on stdin/stdout.
 //!
 //! The protocol runs on a reader thread that forwards parsed messages over a
 //! channel; everything else happens on the UI thread in `poll()`.
@@ -31,8 +30,7 @@ pub struct AgentSpec {
     pub builtin: bool,
 }
 
-/// termed's built-in agent: free models, nothing to install. Works on
-/// Termux/Android, where OpenCode can't be installed.
+/// termed's built-in agent needs no external agent installation.
 pub fn builtin_spec() -> AgentSpec {
     AgentSpec {
         name: "termed AI".into(),
@@ -43,10 +41,8 @@ pub fn builtin_spec() -> AgentSpec {
     }
 }
 
-/// Known ACP agents, in order of preference. OpenCode comes first because
-/// its bundled free models work without signing in.
+/// Optional ACP agents offered when explicitly selected.
 const KNOWN: &[(&str, &str, &[&str], bool)] = &[
-    ("OpenCode", "opencode", &["acp"], true),
     ("Gemini CLI", "gemini", &["--acp"], false),
     ("Claude Code", "claude-agent-acp", &[], false),
     ("Claude Code", "claude-code-acp", &[], false),
@@ -60,7 +56,6 @@ pub fn which(program: &str) -> Option<PathBuf> {
         .unwrap_or_default();
     if let Some(home) = std::env::var_os("HOME") {
         let home = PathBuf::from(home);
-        dirs.push(home.join(".opencode/bin"));
         dirs.push(home.join(".local/bin"));
         dirs.push(home.join(".npm-global/bin"));
     }
@@ -76,13 +71,35 @@ fn base_name(p: &str) -> String {
         .unwrap_or_else(|| p.to_string())
 }
 
-/// Agents available on this machine. `TERMED_AGENT="cmd args"` overrides.
+fn removed_opencode_program(program: &str) -> bool {
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let name = name.split(['.', '@']).next().unwrap_or(name);
+    name.eq_ignore_ascii_case("opencode") || name.eq_ignore_ascii_case("opencode-ai")
+}
+
+pub(crate) fn removed_opencode_command(command: &str) -> bool {
+    let parts = crate::plugin::split_command(command);
+    let Some(program) = parts.first() else {
+        return false;
+    };
+    removed_opencode_program(program)
+        || (["npx", "bunx"]
+            .iter()
+            .any(|launcher| launcher.eq_ignore_ascii_case(&base_name(program)))
+            && parts
+                .iter()
+                .skip(1)
+                .any(|arg| removed_opencode_program(arg)))
+}
+
+/// Agents available on this machine. An explicit `TERMED_AGENT` can provide
+/// a custom ACP command; automatic discovery otherwise starts with built-in.
 pub fn detect_agents() -> Vec<AgentSpec> {
     let mut out = Vec::new();
     let chosen = std::env::var("TERMED_AGENT").ok();
     if chosen.as_deref() == Some("builtin") {
         out.push(builtin_spec());
-    } else if let Some(cmd) = chosen {
+    } else if let Some(cmd) = chosen.filter(|cmd| !removed_opencode_command(cmd)) {
         let mut parts = crate::plugin::split_command(&cmd).into_iter();
         if let Some(program) = parts.next() {
             let args: Vec<String> = parts.collect();
@@ -105,9 +122,9 @@ pub fn detect_agents() -> Vec<AgentSpec> {
             });
         }
     }
-    // On Android (Termux) the external agents' npm packages don't install,
-    // so the built-in agent comes first there.
-    if cfg!(target_os = "android") && out.is_empty() {
+    // An explicit custom command may come first; never auto-select a detected
+    // external agent in preference to the built-in one.
+    if out.is_empty() {
         out.push(builtin_spec());
     }
     for (name, program, args, free) in KNOWN {
@@ -190,7 +207,6 @@ pub enum State {
     /// Not launched yet (launches on the first prompt).
     Idle,
     NoAgent,
-    Installing,
     Starting,
     Ready,
     Working,
@@ -238,8 +254,6 @@ pub enum AgentEvent {
 enum Inbound {
     Message(Value),
     Exited,
-    InstallLine(String),
-    InstallDone(bool),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,7 +284,6 @@ pub struct Agent {
     pub embedded_context: bool,
     pub auth_hint: Option<String>,
     pub turn_started: Option<Instant>,
-    pub install_log: Vec<String>,
     // UI state for the input box and transcript.
     pub input: String,
     pub cursor: usize,
@@ -312,12 +325,8 @@ impl Agent {
             skill_context: String::new(),
             mcp_servers: Vec::new(),
             local_events: VecDeque::new(),
-            spec: available.first().cloned(),
-            state: if available.is_empty() {
-                State::NoAgent
-            } else {
-                State::Idle
-            },
+            spec: Some(builtin_spec()),
+            state: State::Idle,
             available,
             entries: Vec::new(),
             models: Vec::new(),
@@ -328,7 +337,6 @@ impl Agent {
             embedded_context: false,
             auth_hint: None,
             turn_started: None,
-            install_log: Vec::new(),
             input: String::new(),
             cursor: 0,
             scroll: 0,
@@ -402,10 +410,7 @@ impl Agent {
     }
 
     pub fn is_working(&self) -> bool {
-        matches!(
-            self.state,
-            State::Working | State::Starting | State::Installing
-        )
+        matches!(self.state, State::Working | State::Starting)
     }
 
     pub fn idle_for(&self) -> Duration {
@@ -560,7 +565,7 @@ impl Agent {
         self.local_events.clear();
         self.session_id = None;
         self.pending.clear();
-        if !matches!(self.state, State::NoAgent | State::Installing) {
+        if self.state != State::NoAgent {
             self.state = State::Idle;
         }
     }
@@ -594,56 +599,6 @@ impl Agent {
             self.state = State::Starting;
             self.new_session();
         }
-    }
-
-    /// Install OpenCode through npm (the free default agent).
-    pub fn install(&mut self) {
-        if self.state == State::Installing {
-            return;
-        }
-        if cfg!(target_os = "android") {
-            self.install_log = vec![
-                "OpenCode has no Android build on npm.".into(),
-                "Use the built-in termed AI agent instead (Agent: Choose Agent): it is free and needs no install.".into(),
-            ];
-            return;
-        }
-        let Some(npm) = which("npm") else {
-            self.install_log = vec![
-                "npm was not found. Install Node.js first, then tap Install again:".into(),
-                "  Termux:  pkg install nodejs".into(),
-                "  Debian/Ubuntu:  sudo apt install nodejs npm".into(),
-                "  macOS:  brew install node".into(),
-                "Or install OpenCode directly: https://opencode.ai".into(),
-            ];
-            return;
-        };
-        self.state = State::Installing;
-        self.install_log = vec!["$ npm install -g opencode-ai".into()];
-        let tx = self.tx.clone();
-        std::thread::spawn(move || {
-            let child = Command::new(npm)
-                .args(["install", "-g", "opencode-ai"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn();
-            let ok = match child {
-                Ok(mut c) => {
-                    if let Some(out) = c.stderr.take() {
-                        for l in BufReader::new(out).lines().map_while(Result::ok) {
-                            let _ = tx.send(Inbound::InstallLine(l));
-                        }
-                    }
-                    c.wait().is_ok_and(|s| s.success())
-                }
-                Err(e) => {
-                    let _ = tx.send(Inbound::InstallLine(e.to_string()));
-                    false
-                }
-            };
-            let _ = tx.send(Inbound::InstallDone(ok));
-        });
     }
 
     // ------------------------------------------------------------ prompting
@@ -805,8 +760,8 @@ impl Agent {
         );
     }
 
-    /// Free models are shared and get rate-limited; OpenCode then retries
-    /// silently. If a turn has produced nothing at all for `stall_after`,
+    /// Free models are shared and can be rate-limited. If an external agent
+    /// has produced nothing at all for `stall_after`,
     /// switch to another free model and resend, so it "just works".
     fn check_stall(&mut self) -> bool {
         // Built-in requests already have transport bounds and provider failover;
@@ -899,25 +854,6 @@ impl Agent {
             match msg {
                 Inbound::Message(v) => self.handle(v, &mut events),
                 Inbound::Exited => self.exited(),
-                Inbound::InstallLine(l) => {
-                    self.install_log.push(l);
-                    if self.install_log.len() > 12 {
-                        self.install_log.remove(1);
-                    }
-                }
-                Inbound::InstallDone(ok) => {
-                    self.available = detect_agents();
-                    self.spec = self.available.first().cloned();
-                    if ok && self.spec.is_some() {
-                        self.install_log.push("Installed. Starting…".into());
-                        self.state = State::Idle;
-                        self.start();
-                    } else {
-                        self.install_log
-                            .push("Install failed — see the messages above.".into());
-                        self.state = State::NoAgent;
-                    }
-                }
             }
         }
         // Drain incoming activity before deciding the model has gone silent.
@@ -1545,9 +1481,9 @@ mod tests {
             free: true,
             builtin: false,
         });
-        a.model = Some("opencode/big-pickle".into());
+        a.model = Some("mock/first-free".into());
         a.models = vec![
-            ("opencode/big-pickle".into(), "First".into()),
+            ("mock/first-free".into(), "First".into()),
             ("test/other-free".into(), "Second".into()),
         ];
         a.stall_after = Duration::from_secs(1);
@@ -1572,15 +1508,15 @@ mod tests {
         a.last_activity = Instant::now() - Duration::from_secs(10);
         a.respond_error(json!(9), "Child cancelled");
         assert!(a.idle_for() < Duration::from_secs(1));
-        assert_eq!(a.model.as_deref(), Some("opencode/big-pickle"));
+        assert_eq!(a.model.as_deref(), Some("mock/first-free"));
     }
 
     #[test]
     fn models_come_from_config_options() {
         let mut a = agent();
         a.read_models(&json!({"configOptions":[{"id":"model","category":"model","type":"select",
-            "currentValue":"opencode/big-pickle","options":[{"value":"opencode/big-pickle","name":"Big Pickle"}]}]}));
-        assert_eq!(a.model_label().as_deref(), Some("Big Pickle"));
+            "currentValue":"mock/first-free","options":[{"value":"mock/first-free","name":"First free"}]}]}));
+        assert_eq!(a.model_label().as_deref(), Some("First free"));
     }
 
     #[test]

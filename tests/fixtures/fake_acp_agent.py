@@ -17,7 +17,7 @@ def recv():
     return json.loads(line)
 
 cwd = os.getcwd()
-model = "opencode/big-pickle"
+model = "mock/first-free"
 stalled_prompt = None
 while True:
     m = recv()
@@ -31,10 +31,10 @@ while True:
         cwd = p["cwd"]
         send({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": "s1", "configOptions": [
             {"id": "model", "name": "Model", "category": "model", "type": "select",
-             "currentValue": "opencode/big-pickle",
-             "options": [{"value": "opencode/big-pickle", "name": "Big Pickle"},
+             "currentValue": "mock/first-free",
+             "options": [{"value": "mock/first-free", "name": "First free"},
                          {"value": "paid/pro", "name": "Pro Model"},
-                         {"value": "opencode/step-5-free", "name": "Step 5 (free)"}]}]}})
+                         {"value": "mock/second-free", "name": "Step 5 (free)"}]}]}})
     elif meth == "session/set_config_option":
         model = p.get("value", model)
         send({"jsonrpc": "2.0", "id": mid, "result": {}})

@@ -1,3 +1,5 @@
+mod common;
+
 use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
@@ -77,6 +79,9 @@ fn key(a: &mut App, code: KeyCode) {
 
 #[test]
 fn images_are_decoded_not_lossy_text_and_cannot_be_edited_or_saved_as_text() {
+    if common::isolate("images_are_decoded_not_lossy_text_and_cannot_be_edited_or_saved_as_text") {
+        return;
+    }
     let root = project("png");
     let path = root.join("art.png");
     let bytes = png();
@@ -102,6 +107,9 @@ fn images_are_decoded_not_lossy_text_and_cannot_be_edited_or_saved_as_text() {
 
 #[test]
 fn all_enabled_image_codecs_have_real_decoding_coverage() {
+    if common::isolate("all_enabled_image_codecs_have_real_decoding_coverage") {
+        return;
+    }
     let root = project("formats");
     for (ext, format) in [
         ("png", ImageFormat::Png),
@@ -130,6 +138,9 @@ fn all_enabled_image_codecs_have_real_decoding_coverage() {
 
 #[test]
 fn jpeg_exif_orientation_is_applied_to_the_preview_only() {
+    if common::isolate("jpeg_exif_orientation_is_applied_to_the_preview_only") {
+        return;
+    }
     let mut encoded = Cursor::new(Vec::new());
     DynamicImage::new_rgb8(2, 3)
         .write_to(&mut encoded, ImageFormat::Jpeg)
@@ -148,6 +159,9 @@ fn jpeg_exif_orientation_is_applied_to_the_preview_only() {
 
 #[test]
 fn image_canvas_supports_resize_touch_targets_zoom_and_pan() {
+    if common::isolate("image_canvas_supports_resize_touch_targets_zoom_and_pan") {
+        return;
+    }
     let root = project("canvas");
     let file = root.join("art.png");
     fs::write(&file, png()).unwrap();
@@ -195,6 +209,11 @@ fn image_canvas_supports_resize_touch_targets_zoom_and_pan() {
 
 #[test]
 fn corrupt_images_and_unrecognized_binary_are_rejected_without_lossy_conversion() {
+    if common::isolate(
+        "corrupt_images_and_unrecognized_binary_are_rejected_without_lossy_conversion",
+    ) {
+        return;
+    }
     let root = project("corrupt");
     for (name, bytes) in [
         ("bad.png", &b"not an image"[..]),
@@ -210,6 +229,9 @@ fn corrupt_images_and_unrecognized_binary_are_rejected_without_lossy_conversion(
 
 #[test]
 fn archive_is_both_a_folder_and_an_openable_read_only_file() {
+    if common::isolate("archive_is_both_a_folder_and_an_openable_read_only_file") {
+        return;
+    }
     let root = project("tree");
     let path = root.join("bundle.zip");
     zip(
@@ -292,6 +314,9 @@ fn archive_is_both_a_folder_and_an_openable_read_only_file() {
 
 #[test]
 fn zip_members_edit_save_and_undo_while_preserving_other_files_and_comments() {
+    if common::isolate("zip_members_edit_save_and_undo_while_preserving_other_files_and_comments") {
+        return;
+    }
     let root = project("edit");
     let path = root.join("project.zip");
     zip(
@@ -327,6 +352,11 @@ fn zip_members_edit_save_and_undo_while_preserving_other_files_and_comments() {
 
 #[test]
 fn different_zip_members_can_save_concurrently_but_same_member_conflicts_are_kept() {
+    if common::isolate(
+        "different_zip_members_can_save_concurrently_but_same_member_conflicts_are_kept",
+    ) {
+        return;
+    }
     let root = project("conflict");
     let path = root.join("project.zip");
     zip(&path, &[("a.txt", b"A"), ("b.txt", b"B")]);
@@ -354,6 +384,9 @@ fn different_zip_members_can_save_concurrently_but_same_member_conflicts_are_kep
 
 #[test]
 fn new_text_members_and_save_as_exports_use_the_correct_container() {
+    if common::isolate("new_text_members_and_save_as_exports_use_the_correct_container") {
+        return;
+    }
     let root = project("new-member");
     let path = root.join("project.zip");
     zip(&path, &[("a.txt", b"old")]);
@@ -378,6 +411,9 @@ fn new_text_members_and_save_as_exports_use_the_correct_container() {
 
 #[test]
 fn disappearing_zip_never_turns_into_an_ordinary_directory_on_save() {
+    if common::isolate("disappearing_zip_never_turns_into_an_ordinary_directory_on_save") {
+        return;
+    }
     let root = project("missing");
     let path = root.join("project.zip");
     zip(&path, &[("a.txt", b"old")]);
@@ -394,6 +430,9 @@ fn disappearing_zip_never_turns_into_an_ordinary_directory_on_save() {
 
 #[test]
 fn unsafe_zip_paths_and_file_folder_conflicts_are_refused() {
+    if common::isolate("unsafe_zip_paths_and_file_folder_conflicts_are_refused") {
+        return;
+    }
     let root = project("unsafe");
     let path = root.join("bad.zip");
     for name in [
@@ -416,6 +455,9 @@ fn unsafe_zip_paths_and_file_folder_conflicts_are_refused() {
 
 #[test]
 fn zip_links_and_encryption_are_not_damaged_and_dot_zip_directories_work() {
+    if common::isolate("zip_links_and_encryption_are_not_damaged_and_dot_zip_directories_work") {
+        return;
+    }
     let root = project("links");
     let path = root.join("links.zip");
     let mut z = ZipWriter::new(fs::File::create(&path).unwrap());
@@ -476,6 +518,9 @@ fn zip_links_and_encryption_are_not_damaged_and_dot_zip_directories_work() {
 
 #[test]
 fn studio_theme_keeps_primary_and_secondary_chrome_text_readable() {
+    if common::isolate("studio_theme_keeps_primary_and_secondary_chrome_text_readable") {
+        return;
+    }
     let t = termed::theme::load("Termed Studio").unwrap();
     let p = t.palette;
     let luminance = |c| {
@@ -509,6 +554,9 @@ fn studio_theme_keeps_primary_and_secondary_chrome_text_readable() {
 
 #[test]
 fn resource_limits_reject_oversized_images_members_and_archive_indexes() {
+    if common::isolate("resource_limits_reject_oversized_images_members_and_archive_indexes") {
+        return;
+    }
     let root = project("limits");
     let mut image = png();
     image[16..20].copy_from_slice(&4097u32.to_be_bytes());
@@ -569,6 +617,9 @@ fn resource_limits_reject_oversized_images_members_and_archive_indexes() {
 
 #[test]
 fn corrupt_zip_member_crc_is_reported_without_returning_partial_text() {
+    if common::isolate("corrupt_zip_member_crc_is_reported_without_returning_partial_text") {
+        return;
+    }
     let root = project("crc");
     let path = root.join("corrupt.zip");
     let mut z = ZipWriter::new(fs::File::create(&path).unwrap());
@@ -594,6 +645,10 @@ fn corrupt_zip_member_crc_is_reported_without_returning_partial_text() {
 
 #[test]
 fn exports_and_save_as_never_overwrite_their_source_container_or_binary_alias() {
+    if common::isolate("exports_and_save_as_never_overwrite_their_source_container_or_binary_alias")
+    {
+        return;
+    }
     let root = project("aliases");
     let path = root.join("project.zip");
     let pixels = png();
@@ -627,6 +682,9 @@ fn exports_and_save_as_never_overwrite_their_source_container_or_binary_alias() 
 
 #[test]
 fn svg_remains_editable_source_instead_of_a_broken_binary_preview() {
+    if common::isolate("svg_remains_editable_source_instead_of_a_broken_binary_preview") {
+        return;
+    }
     let root = project("svg");
     let path = root.join("vector.svg");
     let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\"><circle r=\"4\"/></svg>";
@@ -641,6 +699,11 @@ fn svg_remains_editable_source_instead_of_a_broken_binary_preview() {
 
 #[test]
 fn read_only_previews_block_every_text_command_and_do_not_pollute_project_search() {
+    if common::isolate(
+        "read_only_previews_block_every_text_command_and_do_not_pollute_project_search",
+    ) {
+        return;
+    }
     let root = project("read-only");
     let path = root.join("project.zip");
     zip(&path, &[("needle-only-in-filename.txt", b"original")]);

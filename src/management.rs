@@ -153,7 +153,7 @@ fn hint(field: Field) -> &'static str {
             "Empty = provider/environment default. Built-in: any tool-capable model supported by your API"
         }
         Field::Endpoint => {
-            "Built-in only: OpenAI-compatible base URL (include /v1 if needed); empty = free gateway"
+            "Built-in only: OpenAI-compatible base URL (include /v1 if needed); empty uses the selected provider"
         }
         Field::ApiKeyEnv => {
             "Environment variable NAME only (e.g. OPENAI_API_KEY). Never paste a secret here"
@@ -258,13 +258,19 @@ impl App {
     }
 
     pub(crate) fn ensure_preferences_writable(&self) -> Result<()> {
-        let path = crate::search::absolute_path(&config::settings_path(&self.explorer.root));
-        if self
-            .editors
-            .iter()
-            .any(|e| e.doc.path.as_ref() == Some(&path) && e.doc.is_dirty())
-        {
-            bail!("Workspace settings JSON has unsaved edits; save it and reload settings first");
+        let user = config::user_settings_path();
+        let mut paths = vec![crate::search::absolute_path(&user)];
+        // Until a user file exists, the legacy workspace file is the active
+        // migration source and its unsaved edits must also be protected.
+        if !user.exists() {
+            paths.push(crate::search::absolute_path(&config::settings_path(
+                &self.explorer.root,
+            )));
+        }
+        if self.editors.iter().any(|e| {
+            e.doc.is_dirty() && e.doc.path.as_ref().is_some_and(|path| paths.contains(path))
+        }) {
+            bail!("Settings JSON has unsaved edits; save it and reload settings first");
         }
         if self.management.load_error.is_some() {
             bail!("Fix the invalid settings JSON and reload it before saving menu changes");
@@ -344,23 +350,20 @@ impl App {
                 ] {
                     row(
                         format!("{label}: {v}"),
-                        "Enter to change; saved for this workspace".into(),
+                        "Enter to change; saved for this user across folders".into(),
                     );
                 }
                 row(
-                    "Open Workspace Settings JSON".into(),
-                    config::settings_path(&self.explorer.root)
-                        .display()
-                        .to_string(),
+                    "Open User Settings JSON".into(),
+                    config::user_settings_path().display().to_string(),
                 );
                 row(
                     "Reload Settings from Disk".into(),
-                    "Applies validated user defaults and workspace overrides".into(),
+                    "Applies validated user settings (or a legacy workspace file)".into(),
                 );
                 row(
-                    "Open User Defaults JSON".into(),
-                    config::config_dir()
-                        .join("settings.json")
+                    "Open Legacy Workspace Settings JSON".into(),
+                    config::settings_path(&self.explorer.root)
                         .display()
                         .to_string(),
                 );
@@ -405,17 +408,20 @@ impl App {
                 }
                 for &(field, label) in FIELDS.iter().skip(if sub { 2 } else { 0 }) {
                     let v = value(field, config);
-                    row(
-                        format!(
-                            "{label}: {}",
-                            if v.is_empty() {
-                                "(default / empty)"
-                            } else {
-                                &v
+                    let display = if !sub && v.is_empty() && config.uses_router() {
+                        match field {
+                            Field::Endpoint => {
+                                format!("{} (default)", crate::provider::ROUTER_ENDPOINT)
                             }
-                        ),
-                        hint(field).into(),
-                    );
+                            Field::Model => format!("{} (default)", crate::provider::ROUTER_MODEL),
+                            _ => "(default / empty)".into(),
+                        }
+                    } else if v.is_empty() {
+                        "(default / empty)".into()
+                    } else {
+                        v
+                    };
+                    row(format!("{label}: {display}"), hint(field).into());
                 }
                 if sub {
                     row("Delete Sub-agent…".into(), "Requires confirmation".into());
@@ -685,11 +691,11 @@ impl App {
                         9=>prefs.editor.word_wrap=cycle(prefs.editor.word_wrap), _=>prefs.editor.toolbar=cycle(prefs.editor.toolbar) }
                     self.save_preferences(prefs)?; self.open_palette(mode);
                 }
-                11 => { let path = config::settings_path(&self.explorer.root); if !path.exists() { self.preferences.save(&self.explorer.root)?; } self.open_file(&path); }
+                11 => { let path = config::user_settings_path(); if !path.exists() { self.save_preferences(self.preferences.clone())?; } self.open_file(&path); }
                 12 => { self.reload_preferences(); self.open_palette(mode); }
                 13 => {
-                    let path = config::config_dir().join("settings.json");
-                    if !path.exists() { std::fs::create_dir_all(path.parent().unwrap())?; std::fs::write(&path,"{}\n")?; }
+                    let path = config::settings_path(&self.explorer.root);
+                    if !path.exists() { bail!("No legacy workspace settings exist in this folder"); }
                     self.open_file(&path);
                 }
                 _ => {}
@@ -714,7 +720,7 @@ impl App {
                         0 => {let mut prefs=self.preferences.clone();prefs.agent.use_router();self.save_preferences(prefs)?;self.open_palette(mode);}
                         1 => {
                             if self.agent.is_working()||self.automation.busy(){bail!("Stop the AI turn before replacing credentials");}
-                            self.edit_value(EditTarget::RouterKey,"Save Router API Key (hidden)","Saves locally and selects the built-in router for this workspace. ROUTER_API_KEY wins. Esc cancels.",String::new());
+                            self.edit_value(EditTarget::RouterKey,"Save Router API Key (hidden)","Saves locally and selects the built-in router for all folders. ROUTER_API_KEY wins. Esc cancels.",String::new());
                         }
                         2 => {
                             if self.agent.is_working()||self.automation.busy(){bail!("Stop the AI turn before removing credentials");}
@@ -841,8 +847,8 @@ impl App {
                         prefs.agent.model = model;
                     }
                 }
-                // The current selection can be a launch-only --router override,
-                // so persist even if the router was already active in memory.
+                // A launch-only override or legacy workspace selection is not
+                // yet user-wide, so persist even if the router is already active.
                 let selection = self.save_preferences(prefs);
                 // Drop the masked input even if preferences cannot be written:
                 // the credential was already saved, so reporting otherwise (or
@@ -851,7 +857,7 @@ impl App {
                 self.open_palette(PaletteMode::AgentSettings);
                 match selection {
                     Err(e) => self.toast(
-                        format!("Router key saved locally, but router settings could not be saved: {e:#}. Fix the settings, then choose Use NoKey Router."),
+                        format!("Router key saved locally, but user router settings could not be saved: {e:#}. Fix the settings, then choose Use NoKey Router."),
                         ToastKind::Error,
                     ),
                     Ok(()) if std::env::var(crate::credentials::ROUTER_ENV)
@@ -953,7 +959,20 @@ fn set_field(a: &mut AgentConfig, field: Field, input: &str) -> Result<()> {
         }
         Field::Command => a.command = input.into(),
         Field::Model => a.model = input.into(),
-        Field::Endpoint => a.endpoint = input.trim_end_matches('/').into(),
+        Field::Endpoint => {
+            let endpoint = input.trim_end_matches('/');
+            if a.provider == "router"
+                && !endpoint.is_empty()
+                && !crate::provider::pinned_router(endpoint)
+            {
+                // Switching to another endpoint must never forward the router key.
+                a.provider = "custom".into();
+                if a.api_key_env == crate::credentials::ROUTER_ENV {
+                    a.api_key_env.clear();
+                }
+            }
+            a.endpoint = endpoint.into();
+        }
         Field::ApiKeyEnv => a.api_key_env = input.into(),
         Field::Instructions => a.instructions = input.into(),
         Field::MaxSteps => {

@@ -2,14 +2,20 @@
 
 ## Menus
 
-- **Settings** in the desktop title bar, **Preferences: Settings** in the command palette, or **Ctrl+,** opens workspace preferences.
+- **Settings** in the desktop title bar, **Preferences: Settings** in the command palette, or **Ctrl+,** opens user preferences.
 - **Plugins** in the title bar, **Plugins: Manage Plugins**, or **Ctrl+Alt+P** opens plugin management. Select a plugin for its commands, enable/disable switch, AI permission and manifest.
 - **Agent: Configure AI Agent**, **Agent: Manage Sub-agents**, and **Skills: Manage Skills** go directly to those settings. The agent panel's **⚙** button opens agent configuration.
 - On a phone, use **⋯** to find any of these commands. Menus are searchable and support arrows, Enter, Esc and touch. Setting values are preselected; type or paste to replace, **Ctrl+A** selects all, and **Ctrl+Backspace** clears the field.
 
-Menu changes save to **`.termed/settings.json` in the current workspace**. User defaults in `$XDG_CONFIG_HOME/termed/settings.json` (normally `~/.config/termed/settings.json`) are loaded first, then workspace settings override them. Objects merge, while arrays replace the user-default array. Saving from a menu writes a complete workspace configuration. No settings file is created simply by opening the editor. The separate **Save Router API Key** action writes user-local credentials, never workspace preferences. See [router setup and supervision](router-and-supervision.md).
+## User settings and migration
 
-Use **Open Workspace Settings JSON** for multi-line instructions or bulk edits, then **Reload Settings from Disk**. Invalid JSON, unsupported versions, invalid budgets and unavailable backends are reported; the last live configuration is retained on a failed reload. At startup, an invalid configuration falls back to defaults with an error notification. Menu changes do not overwrite an invalid configuration or an unsaved workspace settings buffer. Stop an AI turn before changing its agent/sub-agent configuration.
+Menu changes save a complete user configuration at **`$XDG_CONFIG_HOME/termed/settings.json`** (normally `~/.config/termed/settings.json`). `XDG_CONFIG_HOME` must be an absolute path; an empty or relative value is ignored. On Windows, when `XDG_CONFIG_HOME` and `HOME` are unset, it is under `%USERPROFILE%\.config\termed\settings.json`. The same settings load across folders and restarts; opening the editor alone does not create a file. On Unix, a newly created configuration directory is private (`0700`), and settings are atomically replaced using a private (`0600`) file. Other platforms rely on their user-directory ACLs. The separate **Save Router API Key** action stores credentials in a user-local credentials file, never in settings JSON. See [router setup and supervision](router-and-supervision.md).
+
+For migration, if no user settings file exists, termed reads the current folder's old `.termed/settings.json`. Version 1 or unversioned automatic/OpenCode backends are migrated to the built-in agent; the old implicit built-in gateway becomes the router, and an old OpenCode default model is cleared. A deliberately selected `auto`, `kilo`, or custom provider in version 2 is retained. Other settings, including explicitly selected non-OpenCode backends, custom providers and permission restrictions, are preserved. Loading alone does not write a file. The first successful menu save writes these settings at user scope and leaves the old workspace file untouched.
+
+**Important:** Once a user settings file exists it is authoritative, and legacy `.termed/settings.json` files in *all* folders are ignored—including any per-project instructions, `read_only`, command or plugin restrictions. An in-editor notice appears when a legacy file is present. Before migrating, inspect and copy any restrictions you need into the user settings; reapply folder-specific safeguards yourself. The old workspace files are not deleted. Skills and plugins still have their own workspace discovery rules.
+
+Use **Open User Settings JSON** for multi-line instructions or bulk edits, then **Reload Settings from Disk**. Invalid JSON, unsupported versions, invalid budgets and unavailable backends are reported; the last live configuration is retained on a failed reload. At startup, an invalid configuration falls back to defaults with an error notification. Menu changes do not overwrite an invalid configuration or an unsaved user settings buffer. Stop an AI turn before changing its agent/sub-agent configuration.
 
 Editor preferences include theme, minimap, whitespace, indent guides, line numbers, word wrap and the touch toolbar. Wrap and toolbar each cycle through automatic/on/off. Editor display commands also persist their changes.
 
@@ -19,10 +25,10 @@ The agent configuration menu exposes:
 
 | Setting | Meaning |
 | --- | --- |
-| Backend | `auto` (existing detection), `builtin`, `custom`, or the exact display name of an installed ACP agent |
+| Backend | `builtin` (default), `custom`, or the exact display name of an installed ACP agent; legacy `auto` selects the built-in agent |
 | Custom ACP command | An argv string with single/double-quoted arguments; no shell expansion. Set it before choosing `custom` |
 | Model | Explicit provider model ID; empty preserves the environment/provider default |
-| API base URL | Built-in agent's OpenAI-compatible base URL, including `/v1` when required; empty preserves `TERMED_FREE_GATEWAY` / the free gateway |
+| API base URL | Built-in agent's OpenAI-compatible base URL, including `/v1` when required; empty uses the selected provider. The default router uses `https://nokey-router.ziggyware.deno.net/v1` |
 | API key environment variable | **The name of an environment variable**, never the API key itself |
 | Instructions | Role, conventions and additional instructions; use JSON for multiple lines |
 | Step budget | 1–100 built-in model/tool rounds per turn (default 30) |
@@ -35,7 +41,7 @@ The agent configuration menu exposes:
 | Delegations per turn | 1–32 total tasks for the whole root tree (default 4); descendants share this budget |
 | Task timeout | 10–1800 seconds (default 300) for the root turn and inherited absolute specialist deadlines, including approval waits |
 | Attach editor context | Include the active file and selection in prompts and bounded worker briefs |
-| Built-in provider | `auto` (legacy Kilo/custom), `router`, `kilo`, `custom`; external ACP processes configure their own providers |
+| Built-in provider | `router` (default), `auto` (legacy Kilo/custom), `kilo`, `custom`; external ACP processes configure their own providers |
 | Maximum agent depth | 1–3 (default 2): root=0, child=1, grandchild=2; every ancestor can impose a smaller cap |
 | Concurrent tasks | 1–8 active tasks (default 4), including waiting coordinators; new delegation fails fast when full |
 | Overwatch stall timeout | 15–600 seconds (default 150); child/approval/plugin waits are exempt from idle detection, not absolute deadlines |
@@ -54,10 +60,11 @@ This is a partial configuration; omitted fields retain defaults:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "editor": { "minimap": false, "word_wrap": true },
   "agent": {
     "backend": "builtin",
+    "provider": "custom",
     "endpoint": "http://127.0.0.1:11434/v1",
     "model": "your-tool-capable-model",
     "api_key_env": "",
@@ -102,7 +109,7 @@ For external agents, termed supplies an authenticated **stdio MCP relay** in ACP
 
 Three editable profiles are provided by default: **Reviewer**, **Test planner**, and **Coordinator**. All are read-only; the coordinator may delegate to the leaf profiles. Existing saved profile arrays remain authoritative. The sub-agent menu supports creating, enabling/disabling, changing the name/description, model, provider, instructions, budgets, permissions and attached skills, and deleting a profile with confirmation.
 
-Sub-agents are **built-in specialists**, even when the primary agent is external. Each gets a separate conversation, a scoped task brief, inherited project/ancestor instructions, immutable inherited skill snapshots and its own role/additional skills. Empty model/provider values inherit the primary configuration. An inherited API key environment variable is not forwarded to a different explicitly configured provider endpoint.
+Sub-agents are **built-in specialists**, even when the primary agent is external. Each gets a separate conversation, a scoped task brief, inherited project/ancestor instructions, immutable inherited skill snapshots and its own role/additional skills. An empty model and `auto` provider inherit the primary configuration. An inherited API key environment variable is not forwarded to a different explicitly configured provider endpoint.
 
 The host intersects permissions with the parent's settings: workers cannot bypass read-only mode, command denial, plugin restrictions, step limits or the task deadline. Nested delegation is bounded by depth, lineage cycle checks, global concurrency/delegation caps and inherited absolute deadlines. `sub_agents` must be enabled on a coordinator profile, not just the root. Results return to the parent as tool output; worker tool activity and approval requests are visible in the main transcript. Esc/Stop cancels the entire task tree. This is bounded task delegation, not a new operating-system sandbox or an autonomous always-running agent service.
 
@@ -142,24 +149,4 @@ cargo test
 cargo clippy --all-targets
 ```
 
-### Validation in the restricted development environment
-
-Current verification: **152 tests passed, 0 failed**, plus `cargo check --all-targets`
-and `cargo build`, using the actual application/library sources in an isolated
-GitHub-sourced offline Cargo harness. Coverage includes nested delegation, bounded
-briefs, inherited rules/skills, progress, deadlines, stalls/orphans, subtree
-cancellation, generated functions, masked input, local credential persistence,
-environment override, credential-file aliases, and loopback HTTPS Bearer auth,
-error redaction and cross-origin redirect refusal. The real editor/App are used,
-not stand-ins. Python 3 and OpenSSL support the integration fixtures.
-
-This is supplemental verification, **not a production locked-dependency build**.
-The environment's crates.io connection fails before dependencies can be fetched.
-The harness uses different dependency versions, Linux-only normalization,
-compatibility adjustments, fancy-regex rather than Oniguruma, and reduced optional
-UI features. Unlike the earlier 121-test harness, this run **includes Rustls TLS**
-and local certificate verification. It does not prove the deployed router works
-with an actual account: no real `ROUTER_API_KEY` was supplied and no authenticated
-live completion was attempted. Run `cargo test --locked` and the normal CI checks
-with registry access before release. No compiler/vendor caches, binaries or test
-certificates are included in the repository.
+Integration fixtures require Python 3; HTTPS fixtures also use OpenSSL. Run the production locked-dependency build and tests on the intended platforms before release. A live authenticated router request is a separate check from the local mock tests.

@@ -1,6 +1,8 @@
 //! Phone-screen behavior: compact layout, soft wrap, touch toolbar and taps,
 //! driven through the real renderer on a headless backend.
 
+mod common;
+
 use std::path::PathBuf;
 
 use ratatui::Terminal;
@@ -53,6 +55,9 @@ fn find(term: &Terminal<TestBackend>, needle: &str) -> Option<(u16, u16)> {
 
 #[test]
 fn phone_portrait_uses_compact_layout_with_wrap_and_toolbar() {
+    if common::isolate("phone_portrait_uses_compact_layout_with_wrap_and_toolbar") {
+        return;
+    }
     let root = project();
     let mut app = App::new(
         root.clone(),
@@ -112,6 +117,9 @@ fn sel_len(app: &App) -> usize {
 
 #[test]
 fn sticky_modifiers_latch_for_one_key_or_lock() {
+    if common::isolate("sticky_modifiers_latch_for_one_key_or_lock") {
+        return;
+    }
     use termed::app::Latch;
     let root = project();
     let mut app = App::new(
@@ -166,6 +174,9 @@ fn sticky_modifiers_latch_for_one_key_or_lock() {
 
 #[test]
 fn box_mode_edits_a_column_on_every_line() {
+    if common::isolate("box_mode_edits_a_column_on_every_line") {
+        return;
+    }
     let root = project();
     std::fs::write(root.join("cols.txt"), "alpha\nbeta\ngamma\n").unwrap();
     let mut app = App::new(
@@ -215,6 +226,9 @@ fn box_mode_edits_a_column_on_every_line() {
 
 #[test]
 fn toolbar_pages_and_rotation_restore_desktop_layout() {
+    if common::isolate("toolbar_pages_and_rotation_restore_desktop_layout") {
+        return;
+    }
     let root = project();
     let mut app = App::new(
         root.clone(),

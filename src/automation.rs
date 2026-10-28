@@ -1420,6 +1420,12 @@ mod tests {
 
     #[test]
     fn preview_plugins_and_text_write_requests_cannot_corrupt_zip_files() {
+        if crate::test_support::isolate_unit(
+            module_path!(),
+            "preview_plugins_and_text_write_requests_cannot_corrupt_zip_files",
+        ) {
+            return;
+        }
         let mut app = app("preview");
         let path = app.explorer.root.join("archive.zip");
         zip::ZipWriter::new(std::fs::File::create(&path).unwrap())
@@ -1449,6 +1455,12 @@ mod tests {
 
     #[test]
     fn plugins_require_approval_and_keep_the_original_target_when_tabs_change() {
+        if crate::test_support::isolate_unit(
+            module_path!(),
+            "plugins_require_approval_and_keep_the_original_target_when_tabs_change",
+        ) {
+            return;
+        }
         if crate::agent::which("python3").is_none() {
             return;
         }
@@ -1484,6 +1496,12 @@ mod tests {
 
     #[test]
     fn closing_an_untitled_buffer_does_not_retarget_an_approved_plugin() {
+        if crate::test_support::isolate_unit(
+            module_path!(),
+            "closing_an_untitled_buffer_does_not_retarget_an_approved_plugin",
+        ) {
+            return;
+        }
         if crate::agent::which("python3").is_none() {
             return;
         }
@@ -1510,6 +1528,12 @@ mod tests {
 
     #[test]
     fn untitled_plugin_context_survives_tab_index_changes() {
+        if crate::test_support::isolate_unit(
+            module_path!(),
+            "untitled_plugin_context_survives_tab_index_changes",
+        ) {
+            return;
+        }
         if crate::agent::which("python3").is_none() {
             return;
         }
@@ -1533,6 +1557,12 @@ mod tests {
 
     #[test]
     fn rejection_stop_and_disabled_capabilities_fail_closed() {
+        if crate::test_support::isolate_unit(
+            module_path!(),
+            "rejection_stop_and_disabled_capabilities_fail_closed",
+        ) {
+            return;
+        }
         if crate::agent::which("python3").is_none() {
             return;
         }
@@ -1582,6 +1612,12 @@ mod tests {
 
     #[test]
     fn plugin_errors_are_not_reported_as_success() {
+        if crate::test_support::isolate_unit(
+            module_path!(),
+            "plugin_errors_are_not_reported_as_success",
+        ) {
+            return;
+        }
         if crate::agent::which("python3").is_none() {
             return;
         }
@@ -1599,6 +1635,12 @@ mod tests {
 
     #[test]
     fn disabled_skills_are_not_listed_or_read_and_live_buffers_are_readable() {
+        if crate::test_support::isolate_unit(
+            module_path!(),
+            "disabled_skills_are_not_listed_or_read_and_live_buffers_are_readable",
+        ) {
+            return;
+        }
         let mut app = app("skills");
         crate::skills::create(&app.explorer.root, "style").unwrap();
         app.preferences.disabled_skills.push("style".into());
@@ -1696,6 +1738,12 @@ mod supervision_tests {
     }
     #[test]
     fn lineage_deadlines_cycle_depth_and_global_budget_are_enforced_before_start() {
+        if crate::test_support::isolate_unit(
+            module_path!(),
+            "lineage_deadlines_cycle_depth_and_global_budget_are_enforced_before_start",
+        ) {
+            return;
+        }
         let mut a = app();
         let (parent, _) = inject(&mut a, Source::Main, "coordinator");
         let options = a.source_options(Source::Sub(parent)).unwrap();
@@ -1748,6 +1796,12 @@ mod supervision_tests {
     }
     #[test]
     fn external_root_waiting_on_mcp_work_is_not_silently_replayed() {
+        if crate::test_support::isolate_unit(
+            module_path!(),
+            "external_root_waiting_on_mcp_work_is_not_silently_replayed",
+        ) {
+            return;
+        }
         let mut a = app();
         a.agent.spec = Some(crate::agent::AgentSpec {
             name: "test external".into(),
@@ -1757,15 +1811,15 @@ mod supervision_tests {
             builtin: false,
         });
         a.agent.state = State::Working;
-        a.agent.model = Some("opencode/big-pickle".into());
+        a.agent.model = Some("mock/first-free".into());
         a.agent.models = vec![
-            ("opencode/big-pickle".into(), "First".into()),
+            ("mock/first-free".into(), "First".into()),
             ("test/other-free".into(), "Second".into()),
         ];
         a.agent.stall_after = Duration::ZERO;
         let (_, reply) = inject(&mut a, Source::Main, "coordinator");
         a.pump_agent();
-        assert_eq!(a.agent.model.as_deref(), Some("opencode/big-pickle"));
+        assert_eq!(a.agent.model.as_deref(), Some("mock/first-free"));
         assert_eq!(a.agent.state, State::Working);
         assert_eq!(a.automation.task_count(), 1);
         assert!(
@@ -1780,6 +1834,12 @@ mod supervision_tests {
 
     #[test]
     fn cancellation_replies_to_every_caller_and_closes_descendant_approvals() {
+        if crate::test_support::isolate_unit(
+            module_path!(),
+            "cancellation_replies_to_every_caller_and_closes_descendant_approvals",
+        ) {
+            return;
+        }
         let mut a = app();
         let (parent, p_rx) = inject(&mut a, Source::Main, "coordinator");
         let (child, c_rx) = inject(&mut a, Source::Sub(parent), "reviewer");
@@ -1822,6 +1882,12 @@ mod supervision_tests {
     }
     #[test]
     fn waiting_parents_are_not_stalled_but_leaf_stalls_and_deadlines_terminalize() {
+        if crate::test_support::isolate_unit(
+            module_path!(),
+            "waiting_parents_are_not_stalled_but_leaf_stalls_and_deadlines_terminalize",
+        ) {
+            return;
+        }
         let mut a = app();
         let (parent, _) = inject(&mut a, Source::Main, "coordinator");
         let (child, rx) = inject(&mut a, Source::Sub(parent), "reviewer");
@@ -1886,6 +1952,12 @@ mod supervision_tests {
     }
     #[test]
     fn root_completion_reaps_uncollected_workers_and_worker_status_is_subtree_scoped() {
+        if crate::test_support::isolate_unit(
+            module_path!(),
+            "root_completion_reaps_uncollected_workers_and_worker_status_is_subtree_scoped",
+        ) {
+            return;
+        }
         let mut a = app();
         let (parent, rx) = inject(&mut a, Source::Main, "coordinator");
         let (child, _) = inject(&mut a, Source::Sub(parent), "reviewer");
@@ -1936,6 +2008,12 @@ mod supervision_tests {
     }
     #[test]
     fn concurrency_limits_fail_fast_and_empty_input_cannot_reset_budgets() {
+        if crate::test_support::isolate_unit(
+            module_path!(),
+            "concurrency_limits_fail_fast_and_empty_input_cannot_reset_budgets",
+        ) {
+            return;
+        }
         let mut a = app();
         a.agent.options.max_concurrent_tasks = 1;
         let (_id, _rx) = inject(&mut a, Source::Main, "coordinator");
@@ -1961,6 +2039,12 @@ mod supervision_tests {
     }
     #[test]
     fn generated_functions_are_scoped_and_dispatch_checks_capabilities() {
+        if crate::test_support::isolate_unit(
+            module_path!(),
+            "generated_functions_are_scoped_and_dispatch_checks_capabilities",
+        ) {
+            return;
+        }
         let mut a = app();
         let definition = json!({"name":"fn_trim","description":"Trim text","input_schema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]},"input":"/text","steps":[{"op":"trim"}]});
         call(&mut a, Source::Main, "define_function", definition).unwrap();
@@ -1994,6 +2078,12 @@ mod context_guard_tests {
     use super::*;
     #[test]
     fn missing_required_skills_preserve_the_unsent_goal_instead_of_omitting_instructions() {
+        if crate::test_support::isolate_unit(
+            module_path!(),
+            "missing_required_skills_preserve_the_unsent_goal_instead_of_omitting_instructions",
+        ) {
+            return;
+        }
         let root =
             std::env::temp_dir().join(format!("termed-missing-skill-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
@@ -2008,6 +2098,12 @@ mod context_guard_tests {
     }
     #[test]
     fn root_deadline_cancels_the_turn_even_without_workers_and_closes_open_cards() {
+        if crate::test_support::isolate_unit(
+            module_path!(),
+            "root_deadline_cancels_the_turn_even_without_workers_and_closes_open_cards",
+        ) {
+            return;
+        }
         let root =
             std::env::temp_dir().join(format!("termed-root-deadline-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
@@ -2038,6 +2134,12 @@ mod context_guard_tests {
     }
     #[test]
     fn root_command_approval_exempts_idle_stalls_but_not_the_absolute_deadline() {
+        if crate::test_support::isolate_unit(
+            module_path!(),
+            "root_command_approval_exempts_idle_stalls_but_not_the_absolute_deadline",
+        ) {
+            return;
+        }
         let root =
             std::env::temp_dir().join(format!("termed-root-approval-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
@@ -2068,6 +2170,12 @@ mod context_guard_tests {
 
     #[test]
     fn required_context_rejects_missing_skills_and_never_silently_truncates() {
+        if crate::test_support::isolate_unit(
+            module_path!(),
+            "required_context_rejects_missing_skills_and_never_silently_truncates",
+        ) {
+            return;
+        }
         assert!(crate::skills::required_context(&[], &["missing".into()]).is_err());
         assert_eq!(crate::skills::required_context(&[], &[]).unwrap(), "");
     }

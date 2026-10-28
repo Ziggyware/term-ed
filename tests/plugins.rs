@@ -1,6 +1,8 @@
 //! Plugins: discovery, the JSON-RPC host, VS Code manifests and the
 //! bundled plugins, driven through a real `App` and real subprocesses.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -126,6 +128,9 @@ fn python() -> bool {
 
 #[test]
 fn a_local_plugin_is_found_and_listed() {
+    if common::isolate("a_local_plugin_is_found_and_listed") {
+        return;
+    }
     let _guard = lock();
     let root = project("discover");
     write_upper_plugin(&root);
@@ -154,6 +159,9 @@ fn a_local_plugin_is_found_and_listed() {
 
 #[test]
 fn bundled_plugins_ship_with_the_binary() {
+    if common::isolate("bundled_plugins_ship_with_the_binary") {
+        return;
+    }
     let _guard = lock();
     if !python() {
         return;
@@ -188,6 +196,9 @@ fn names(host: &Host) -> Vec<String> {
 
 #[test]
 fn a_plugin_command_edits_the_buffer_and_toasts() {
+    if common::isolate("a_plugin_command_edits_the_buffer_and_toasts") {
+        return;
+    }
     let _guard = lock();
     if !python() {
         return;
@@ -233,6 +244,9 @@ fn a_plugin_command_edits_the_buffer_and_toasts() {
 
 #[test]
 fn a_plugin_keybinding_runs_without_the_palette() {
+    if common::isolate("a_plugin_keybinding_runs_without_the_palette") {
+        return;
+    }
     let _guard = lock();
     if !python() {
         return;
@@ -263,6 +277,9 @@ fn a_plugin_keybinding_runs_without_the_palette() {
 
 #[test]
 fn a_vscode_extension_is_listed_with_the_reason_it_cannot_run() {
+    if common::isolate("a_vscode_extension_is_listed_with_the_reason_it_cannot_run") {
+        return;
+    }
     let _guard = lock();
     let root = project("vscode");
     let dir = root.join(".termed/plugins/vscode-prettier");
@@ -327,6 +344,9 @@ fn a_vscode_extension_is_listed_with_the_reason_it_cannot_run() {
 
 #[test]
 fn disabled_plugins_are_remembered() {
+    if common::isolate("disabled_plugins_are_remembered") {
+        return;
+    }
     let _guard = lock();
     let root = project("toggle");
     write_upper_plugin(&root);
@@ -363,6 +383,9 @@ fn disabled_plugins_are_remembered() {
 
 #[test]
 fn failed_plugin_preference_writes_leave_the_live_plugin_enabled() {
+    if common::isolate("failed_plugin_preference_writes_leave_the_live_plugin_enabled") {
+        return;
+    }
     let _guard = lock();
     let root = project("toggle-write-error");
     write_upper_plugin(&root);
@@ -382,6 +405,9 @@ fn failed_plugin_preference_writes_leave_the_live_plugin_enabled() {
 
 #[test]
 fn the_host_api_answers_the_documented_methods() {
+    if common::isolate("the_host_api_answers_the_documented_methods") {
+        return;
+    }
     let _guard = lock();
     let root = project("api");
     let app = App::new(
@@ -402,6 +428,9 @@ fn the_host_api_answers_the_documented_methods() {
 
 #[test]
 fn the_keyboard_bindings_do_not_collide() {
+    if common::isolate("the_keyboard_bindings_do_not_collide") {
+        return;
+    }
     let _guard = lock();
     let root = project("keys-mgr");
     let mut app = App::new(
