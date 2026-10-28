@@ -2,6 +2,10 @@
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
+    ImageZoomIn,
+    ImageZoomOut,
+    ImageFit,
+    OpenArchiveFile,
     QuickOpen,
     CommandPalette,
     NewFile,
@@ -25,6 +29,10 @@ pub enum Command {
     FindInFiles,
     ReplaceInFiles,
     Plugins,
+    Settings,
+    AgentSettings,
+    SubAgents,
+    Skills,
     FindNext,
     FindPrev,
     GotoLine,
@@ -77,6 +85,10 @@ macro_rules! cmds {
 }
 
 cmds! {
+    ImageZoomIn, "Image: Zoom In", "+";
+    ImageZoomOut, "Image: Zoom Out", "-";
+    ImageFit, "Image: Fit to View", "0";
+    OpenArchiveFile, "Archive: Open Selected ZIP as File", "Shift+Enter (Explorer)";
     QuickOpen, "Go to File...", "Ctrl+P";
     CommandPalette, "Show All Commands", "Ctrl+Shift+P / F1";
     NewFile, "File: New File", "Ctrl+N";
@@ -100,6 +112,10 @@ cmds! {
     FindInFiles, "Edit: Find in Files", "Ctrl+Shift+F";
     ReplaceInFiles, "Edit: Replace in Files", "Ctrl+Shift+H";
     Plugins, "Plugins: Manage Plugins", "Ctrl+Alt+P";
+    Settings, "Preferences: Settings", "Ctrl+,";
+    AgentSettings, "Agent: Configure AI Agent", "";
+    SubAgents, "Agent: Manage Sub-agents", "";
+    Skills, "Skills: Manage Skills", "";
     FindNext, "Edit: Find Next", "F3";
     FindPrev, "Edit: Find Previous", "Shift+F3";
     GotoLine, "Go to Line...", "Ctrl+G";

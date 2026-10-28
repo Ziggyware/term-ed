@@ -3,6 +3,7 @@
 
 mod agent_panel;
 mod editor_view;
+mod image_canvas;
 mod overlay;
 pub mod util;
 
@@ -113,7 +114,14 @@ pub fn draw(frame: &mut Frame, app: &mut App, truecolor: bool) {
         if crumbs_h > 0 {
             render_breadcrumbs(buf, crumbs, app);
         }
-        cursor = editor_view::render(buf, editor, app);
+        if app
+            .editor()
+            .is_some_and(|e| matches!(e.doc.preview, Some(crate::document::Preview::Image(_))))
+        {
+            image_canvas::render(buf, editor, app);
+        } else {
+            cursor = editor_view::render(buf, editor, app);
+        }
         if app.find.visible
             && let Some(c) = overlay::render_find(buf, editor, app)
         {
@@ -189,9 +197,16 @@ fn render_title(buf: &mut Buffer, area: Rect, app: &mut App) {
             area.right(),
         );
     }
-    // Menu (opens the command palette, like VS's menu bar search).
+    // Real entry points for search, plugins and persistent preferences.
     x += 1;
-    for m in ["File", "Edit", "Selection", "View", "Go", "Help"] {
+    for (m, command) in [
+        ("File", Command::CommandPalette),
+        ("Edit", Command::CommandPalette),
+        ("View", Command::CommandPalette),
+        ("Search", Command::FindInFiles),
+        ("Plugins", Command::Plugins),
+        ("Settings", Command::Settings),
+    ] {
         let start = x;
         x = put(
             buf,
@@ -201,17 +216,16 @@ fn render_title(buf: &mut Buffer, area: Rect, app: &mut App) {
             fgbg(pal.sidebar_dim, pal.titlebar_bg),
             area.right(),
         );
-        app.layout.click_items.push((
-            Rect::new(start, area.y, x - start, 1),
-            Command::CommandPalette,
-        ));
+        app.layout
+            .click_items
+            .push((Rect::new(start, area.y, x - start, 1), command));
     }
     // Centered search box.
     let label = match app.editor() {
         Some(e) => format!("{}  —  {}", e.doc.name(), app.explorer.root_name()),
         None => app.explorer.root_name(),
     };
-    let right_w = 10;
+    let right_w = if area.width >= 120 { 20 } else { 10 };
     let avail = area.right().saturating_sub(x + 2 + right_w);
     let w = (area.width / 3).clamp(24, 60).min(avail);
     let centered = area.x + (area.width.saturating_sub(w)) / 2;
@@ -231,11 +245,15 @@ fn render_title(buf: &mut Buffer, area: Rect, app: &mut App) {
         app.layout.title_search = r;
     }
     // Right: agent button + window-ish controls.
-    let right = " ─  □  ✕ ";
+    let right = if area.width >= 120 {
+        " ─  □  ✕ "
+    } else {
+        ""
+    };
     let rx = area.right().saturating_sub(width(right));
     let ai = " ✦ Agent ";
     let ax = rx.saturating_sub(width(ai) + 1);
-    if ax > bx + w {
+    if ax >= x + 1 {
         let (abg, afg) = if app.show_agent {
             (pal.accent, pal.accent_fg)
         } else {
@@ -521,7 +539,14 @@ fn render_sidebar(buf: &mut Buffer, area: Rect, app: &mut App) {
                 list.right(),
             );
             x += 1;
-            (icons::folder_icon(open, nerd), fgbg(pal.sidebar_fg, row_bg))
+            if entry.is_archive {
+                (
+                    icons::file_icon(&entry.name, nerd),
+                    fgbg(pal.sidebar_fg, row_bg),
+                )
+            } else {
+                (icons::folder_icon(open, nerd), fgbg(pal.sidebar_fg, row_bg))
+            }
         } else {
             x += 2;
             let fg_c = if is_active {
@@ -531,7 +556,7 @@ fn render_sidebar(buf: &mut Buffer, area: Rect, app: &mut App) {
             };
             (icons::file_icon(&entry.name, nerd), fgbg(fg_c, row_bg))
         };
-        if !entry.is_dir || nerd {
+        if !entry.is_dir || entry.is_archive || nerd {
             x = put(
                 buf,
                 x,
@@ -548,9 +573,15 @@ fn render_sidebar(buf: &mut Buffer, area: Rect, app: &mut App) {
         } else {
             name_style
         };
-        let room = list
-            .right()
-            .saturating_sub(x + if is_dirty { 3 } else { 1 }) as usize;
+        let room = list.right().saturating_sub(
+            x + if entry.is_archive {
+                5
+            } else if is_dirty {
+                3
+            } else {
+                1
+            },
+        ) as usize;
         put(
             buf,
             x,
@@ -559,6 +590,16 @@ fn render_sidebar(buf: &mut Buffer, area: Rect, app: &mut App) {
             style,
             list.right(),
         );
+        if entry.is_archive && list.width >= 8 {
+            put(
+                buf,
+                list.right().saturating_sub(4),
+                y,
+                "ZIP",
+                fgbg(pal.sidebar_dim, row_bg),
+                list.right(),
+            );
+        }
         if is_dirty {
             put(
                 buf,
@@ -888,33 +929,54 @@ fn render_status(buf: &mut Buffer, area: Rect, app: &mut App) {
     // Right: clickable segments; low-priority ones drop out on narrow screens.
     let mut segs: Vec<(String, Option<Command>, u8)> = Vec::new();
     if let Some(e) = app.editor() {
-        let (line, _) = e.cursor();
-        let col = e.cursor_display_col() + 1;
-        let sel_len = e.sel.end() - e.sel.start();
-        let pos = match (compact, sel_len) {
-            (true, 0) => format!("{}:{col}", line + 1),
-            (true, n) => format!("{}:{col} ({n})", line + 1),
-            (false, 0) => format!("Ln {}, Col {col}", line + 1),
-            (false, n) => format!("Ln {}, Col {col} ({n} selected)", line + 1),
-        };
-        segs.push((pos, Some(Command::GotoLine), 9));
-        segs.push((
-            e.doc.indent.label(),
-            Some(Command::ConvertIndentToSpaces),
-            3,
-        ));
-        segs.push(("UTF-8".into(), None, 1));
-        segs.push((
-            e.doc.line_ending.label().into(),
-            Some(Command::ToggleLineEnding),
-            4,
-        ));
-        let lang = if compact {
-            e.language().to_string()
+        if let Some(preview) = &e.doc.preview {
+            match preview {
+                crate::document::Preview::Image(image) => {
+                    let (w, h) = image.dimensions();
+                    segs.push((format!("{} · {w}×{h}", image.format), None, 9));
+                    segs.push(("Read-only".into(), Some(Command::SaveAs), 8));
+                }
+                crate::document::Preview::Archive(index) => {
+                    segs.push((format!("ZIP · {} entries", index.entries.len()), None, 9));
+                    segs.push(("Overview · Read-only".into(), Some(Command::SaveAs), 8));
+                }
+            }
         } else {
-            format!("{{ }} {}", e.language())
-        };
-        segs.push((lang, Some(Command::SelectLanguage), 8));
+            if e.doc
+                .path
+                .as_ref()
+                .is_some_and(|p| crate::archive::member_path(p).is_some())
+            {
+                segs.push(("ZIP member".into(), None, 6));
+            }
+            let (line, _) = e.cursor();
+            let col = e.cursor_display_col() + 1;
+            let sel_len = e.sel.end() - e.sel.start();
+            let pos = match (compact, sel_len) {
+                (true, 0) => format!("{}:{col}", line + 1),
+                (true, n) => format!("{}:{col} ({n})", line + 1),
+                (false, 0) => format!("Ln {}, Col {col}", line + 1),
+                (false, n) => format!("Ln {}, Col {col} ({n} selected)", line + 1),
+            };
+            segs.push((pos, Some(Command::GotoLine), 9));
+            segs.push((
+                e.doc.indent.label(),
+                Some(Command::ConvertIndentToSpaces),
+                3,
+            ));
+            segs.push(("UTF-8".into(), None, 1));
+            segs.push((
+                e.doc.line_ending.label().into(),
+                Some(Command::ToggleLineEnding),
+                4,
+            ));
+            let lang = if compact {
+                e.language().to_string()
+            } else {
+                format!("{{ }} {}", e.language())
+            };
+            segs.push((lang, Some(Command::SelectLanguage), 8));
+        }
     }
     segs.push((
         format!("◐ {}", app.theme.name),

@@ -53,7 +53,11 @@ pub fn file_icon(name: &str, nerd: bool) -> Icon {
         }
         (_, "sql") => ("\u{e706}", "●", "#DAD8D8"),
         (_, "lock") => ("\u{f023}", "■", "#888888"),
-        (_, "png")
+        (_, "zip") => ("\u{f410}", "▤", "#E5BC76"),
+        (_, "bmp")
+        | (_, "tif")
+        | (_, "tiff")
+        | (_, "png")
         | (_, "jpg")
         | (_, "jpeg")
         | (_, "gif")

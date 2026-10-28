@@ -69,7 +69,7 @@ pub struct ThemeEntry {
 }
 
 pub fn theme_names() -> Vec<&'static str> {
-    let mut v = vec!["Visual Studio Dark", "Termed Neon"];
+    let mut v = vec!["Visual Studio Dark", "Termed Neon", "Termed Studio"];
     v.extend(EMBEDDED.iter().map(|(n, _)| *n));
     v
 }
@@ -93,6 +93,9 @@ pub fn load(name: &str) -> Option<ThemeEntry> {
     let lower = name.to_lowercase();
     if lower == "visual studio dark" || lower == "vs" || lower == "vs-dark" {
         return Some(visual_studio_dark());
+    }
+    if lower == "termed studio" || lower == "studio" {
+        return Some(termed_studio());
     }
     if lower == "termed neon" || lower == "neon" {
         return Some(termed_neon());
@@ -365,6 +368,54 @@ fn visual_studio_dark() -> ThemeEntry {
         syntax,
         palette,
     }
+}
+
+/// Restrained layered surfaces, readable secondary text and a single cool
+/// accent. Opt-in: existing themes and user preferences are left unchanged.
+fn termed_studio() -> ThemeEntry {
+    let mut theme = visual_studio_dark();
+    theme.name = "Termed Studio".into();
+    theme.syntax.name = Some("Termed Studio".into());
+    theme.syntax.settings = settings("#111722", "#DFE7F3", "#1B2536", "#34466B", "#B4C3FF");
+    let p = &mut theme.palette;
+    p.bg = hex("#111722");
+    p.fg = hex("#DFE7F3");
+    p.titlebar_bg = hex("#0D121C");
+    p.sidebar_bg = hex("#171F2D");
+    p.sidebar_fg = p.fg;
+    p.sidebar_dim = hex("#A7B4C9");
+    p.sidebar_selected = hex("#2C3C5C");
+    p.tabbar_bg = hex("#0D121C");
+    p.tab_inactive_bg = p.tabbar_bg;
+    p.tab_active_bg = p.bg;
+    p.tab_inactive_fg = p.sidebar_dim;
+    p.tab_active_fg = hex("#F1F5FF");
+    p.line_highlight = hex("#1B2536");
+    p.selection = hex("#34466B");
+    p.accent = hex("#A7BAFF");
+    p.accent_fg = hex("#101827");
+    p.status_bg = hex("#1C2940");
+    p.status_fg = p.fg;
+    p.border = hex("#394A66");
+    p.popup_bg = hex("#1B2536");
+    p.popup_fg = p.fg;
+    p.popup_dim = p.sidebar_dim;
+    p.popup_selected = hex("#34466B");
+    p.input_bg = hex("#27344B");
+    p.match_fg = hex("#BCD3FF");
+    p.gutter_fg = hex("#7D8CA4");
+    p.gutter_fg_active = p.fg;
+    p.indent_guide = hex("#2B374D");
+    p.indent_guide_active = hex("#8C9CB5");
+    p.whitespace = hex("#7D8CA4");
+    p.scrollbar_track = p.bg;
+    p.scrollbar_thumb = hex("#607190");
+    p.minimap_viewport = hex("#27344B");
+    p.warning = hex("#F5CE8A");
+    p.error = hex("#FF9B9B");
+    p.success = hex("#9AD6BA");
+    p.logo = [hex("#9BBEFF"), hex("#C7B5FF")];
+    theme
 }
 
 /// A high-contrast "terminal hacker" theme: deep black, phosphor greens and cyans.

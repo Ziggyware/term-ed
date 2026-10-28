@@ -330,8 +330,49 @@ pub fn which_program(program: &str) -> Option<PathBuf> {
     None
 }
 
-fn split_command(s: &str) -> Vec<String> {
-    s.split_whitespace().map(str::to_string).collect()
+pub fn split_command(s: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut started = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if quote == Some('\'') {
+            if c == '\'' {
+                quote = None;
+            } else {
+                word.push(c);
+            }
+        } else if Some(c) == quote {
+            quote = None;
+        } else if c == '\\'
+            && chars.peek().is_some_and(|next| {
+                *next == '\\'
+                    || *next == '"'
+                    || (quote.is_none() && (*next == '\'' || next.is_whitespace()))
+            })
+        {
+            word.push(chars.next().unwrap());
+        } else if quote.is_none() && matches!(c, '\'' | '"') {
+            quote = Some(c);
+            started = true;
+        } else if quote.is_none() && c.is_whitespace() {
+            if started {
+                args.push(std::mem::take(&mut word));
+                started = false;
+            }
+        } else {
+            word.push(c);
+            started = true;
+        }
+    }
+    if quote.is_some() {
+        return Vec::new();
+    }
+    if started {
+        args.push(word);
+    }
+    args
 }
 
 /// Parse a binding like `ctrl+alt+shift+s` or `f5`.
@@ -404,8 +445,8 @@ fn config_file() -> PathBuf {
 }
 
 /// Names listed in `plugins.json` as disabled.
-fn load_disabled() -> HashSet<String> {
-    let Ok(text) = std::fs::read_to_string(config_file()) else {
+fn load_disabled(path: &Path) -> HashSet<String> {
+    let Ok(text) = std::fs::read_to_string(path) else {
         return HashSet::new();
     };
     let Ok(v) = serde_json::from_str::<Value>(&text) else {
@@ -423,15 +464,16 @@ fn load_disabled() -> HashSet<String> {
 }
 
 /// Persist the disabled list, keeping the file human-editable.
-fn save_disabled(names: &HashSet<String>) -> std::io::Result<()> {
-    let path = config_file();
+fn save_disabled(path: &Path, names: &HashSet<String>) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let mut list: Vec<&String> = names.iter().collect();
     list.sort();
     let text = serde_json::to_string_pretty(&json!({ "disabled": list })).unwrap_or_default();
-    std::fs::write(path, text + "\n")
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, text + "\n")?;
+    std::fs::rename(tmp, path)
 }
 
 // ================================================================ bundled
@@ -524,6 +566,12 @@ pub enum Msg {
     },
     /// stderr or an unparsable line; useful in the log/toast.
     Junk { plugin: usize, line: String },
+    /// A command completed (including its JSON-RPC error, if any).
+    Response {
+        plugin: usize,
+        id: u64,
+        result: Result<Value, String>,
+    },
     /// The process ended.
     Exited { plugin: usize, code: Option<i32> },
 }
@@ -532,6 +580,8 @@ pub enum Msg {
 pub struct Host {
     pub plugins: Vec<Plugin>,
     pub root: PathBuf,
+    /// Persist to the same file this host loaded, even if the environment changes.
+    config_path: PathBuf,
     procs: HashMap<usize, Worker>,
     rx: Receiver<(usize, Value)>,
     tx: Sender<(usize, Value)>,
@@ -548,6 +598,7 @@ impl Host {
         let mut host = Self {
             plugins: Vec::new(),
             root,
+            config_path: config_file(),
             procs: HashMap::new(),
             rx,
             tx,
@@ -562,12 +613,13 @@ impl Host {
     /// Find plugins again; running processes are stopped first.
     pub fn reload(&mut self) {
         for (_, mut p) in self.procs.drain() {
-            let _ = p.child.kill();
-            let _ = p.child.wait();
+            crate::process_guard::terminate(&mut p.child);
         }
         self.plugins.clear();
+        self.pending.clear();
+        while self.rx.try_recv().is_ok() {}
         self.start_errors.clear();
-        let disabled = load_disabled();
+        let disabled = load_disabled(&self.config_path);
         let mut seen = HashSet::new();
         let mut dirs = search_dirs(&self.root);
         if let Ok(bundled) = install_bundled() {
@@ -642,7 +694,7 @@ impl Host {
         let Some(plugin) = self.plugins.get(pi) else {
             return;
         };
-        if !plugin.runnable() {
+        if !plugin.enabled || !plugin.runnable() {
             return;
         }
         let argv = plugin.argv.clone();
@@ -653,6 +705,7 @@ impl Host {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        crate::process_guard::configure(&mut cmd);
         match cmd.spawn() {
             Ok(mut child) => {
                 let Some(stdin) = child.stdin.take() else {
@@ -751,30 +804,52 @@ impl Host {
 
     /// Run a command: start the plugin if needed and send the request.
     pub fn run(&mut self, pi: usize, ci: usize, file: Option<&Path>) {
-        let Some(plugin) = self.plugins.get(pi) else {
-            return;
-        };
-        let Some(cmd) = plugin.commands.get(ci) else {
-            return;
-        };
-        let id = cmd.id.clone();
+        let _ = self.run_request(pi, ci, file, json!({}));
+    }
+
+    pub fn busy_plugin(&self, pi: usize) -> bool {
+        self.pending.values().any(|(owner, _)| *owner == pi)
+    }
+
+    /// Run a validated command and return its request ID so AI callers can
+    /// await the actual response, not mistake process startup for success.
+    pub fn run_request(
+        &mut self,
+        pi: usize,
+        ci: usize,
+        file: Option<&Path>,
+        arguments: Value,
+    ) -> Result<u64, String> {
+        let plugin = self.plugins.get(pi).ok_or("Plugin not found")?;
+        if !plugin.enabled || !plugin.runnable() {
+            return Err("Plugin is disabled or cannot run".into());
+        }
+        if self.busy_plugin(pi) {
+            return Err("Plugin already has a command in progress".into());
+        }
+        let id = plugin
+            .commands
+            .get(ci)
+            .ok_or("Plugin command not found")?
+            .id
+            .clone();
         self.start(pi);
+        if let Some(error) = self.start_errors.get(&pi) {
+            return Err(format!("Cannot start plugin: {error}"));
+        }
+        if !self.running_plugin(pi) {
+            return Err("Plugin did not start".into());
+        }
         let rid = self.next_id;
         self.next_id += 1;
         self.pending.insert(rid, (pi, id.clone()));
         self.write(
             pi,
-            json!({
-                "jsonrpc": "2.0",
-                "id": rid,
-                "method": "command",
-                "params": {
-                    "id": id,
-                    "root": self.root.to_string_lossy(),
-                    "file": file.map(|f| f.to_string_lossy().into_owned()),
-                }
-            }),
+            json!({"jsonrpc":"2.0","id":rid,"method":"command",
+            "params":{"id":id,"root":self.root.to_string_lossy(),
+                "file":file.map(|f| f.to_string_lossy().into_owned()),"arguments":arguments}}),
         );
+        Ok(rid)
     }
 
     /// Answer a plugin's request.
@@ -813,9 +888,23 @@ impl Host {
                     params: v.get("params").cloned().unwrap_or(Value::Null),
                 });
             } else if let Some(id) = id {
-                // A command finished. Plugins report problems with
-                // `ui.toast` themselves, so nothing to do here.
-                self.pending.remove(&id);
+                if self.pending.get(&id).is_some_and(|(owner, _)| *owner == pi) {
+                    self.pending.remove(&id);
+                    let result = if let Some(error) = v.get("error") {
+                        Err(error
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Plugin command failed")
+                            .to_string())
+                    } else {
+                        Ok(v.get("result").cloned().unwrap_or(Value::Null))
+                    };
+                    out.push(Msg::Response {
+                        plugin: pi,
+                        id,
+                        result,
+                    });
+                }
             }
         }
         // Reap dead processes so the manager can show them as stopped.
@@ -836,30 +925,38 @@ impl Host {
 
     /// Stop a running plugin.
     pub fn stop(&mut self, pi: usize) {
+        self.pending.retain(|_, (owner, _)| *owner != pi);
         if let Some(mut p) = self.procs.remove(&pi) {
-            let _ = p.child.kill();
-            let _ = p.child.wait();
+            crate::process_guard::terminate(&mut p.child);
         }
     }
 
     /// Enable/disable a plugin and remember the choice.
     pub fn set_enabled(&mut self, pi: usize, enabled: bool) {
-        let Some(p) = self.plugins.get_mut(pi) else {
-            return;
+        let _ = self.try_set_enabled(pi, enabled);
+    }
+
+    pub fn try_set_enabled(&mut self, pi: usize, enabled: bool) -> std::io::Result<()> {
+        let Some(p) = self.plugins.get(pi) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Plugin not found",
+            ));
         };
-        p.enabled = enabled;
-        if !enabled {
-            self.stop(pi);
-        }
-        let mut disabled = load_disabled();
-        let key = slug(&self.plugins[pi].name);
+        let mut disabled = load_disabled(&self.config_path);
+        let key = slug(&p.name);
         if enabled {
             disabled.remove(&key);
-            disabled.remove(&self.plugins[pi].name);
+            disabled.remove(&p.name);
         } else {
             disabled.insert(key);
         }
-        let _ = save_disabled(&disabled);
+        save_disabled(&self.config_path, &disabled)?;
+        self.plugins[pi].enabled = enabled;
+        if !enabled {
+            self.stop(pi);
+        }
+        Ok(())
     }
 
     /// `true` while any plugin process is running (keeps the UI ticking).
@@ -892,8 +989,7 @@ impl Drop for Host {
     fn drop(&mut self) {
         // Do not leave plugin processes behind when the editor quits.
         for (_, mut p) in self.procs.drain() {
-            let _ = p.child.kill();
-            let _ = p.child.wait();
+            crate::process_guard::terminate(&mut p.child);
         }
     }
 }
@@ -1065,6 +1161,9 @@ for line in sys.stdin:
                         assert_eq!(params["message"], "hi do");
                     }
                     methods.push((method, id));
+                }
+                Msg::Response { result, .. } => {
+                    assert_eq!(result.expect("command succeeded")["ok"], true);
                 }
                 Msg::Exited { .. } => panic!("plugin exited"),
                 Msg::Junk { line, .. } => panic!("junk: {line}"),

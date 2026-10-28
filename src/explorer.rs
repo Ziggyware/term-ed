@@ -11,6 +11,7 @@ pub struct Entry {
     pub path: PathBuf,
     pub name: String,
     pub is_dir: bool,
+    pub is_archive: bool,
     pub depth: usize,
 }
 
@@ -21,6 +22,7 @@ pub struct Explorer {
     pub selected: usize,
     pub scroll: usize,
     listings: HashMap<PathBuf, Vec<(String, bool)>>,
+    pub errors: Vec<String>,
 }
 
 fn walker(dir: &Path, depth: usize) -> WalkBuilder {
@@ -44,6 +46,7 @@ impl Explorer {
             selected: 0,
             scroll: 0,
             listings: HashMap::new(),
+            errors: Vec::new(),
         };
         e.rebuild();
         e
@@ -60,6 +63,22 @@ impl Explorer {
         if let Some(v) = self.listings.get(dir) {
             return v.clone();
         }
+        let archive = if crate::archive::is_zip(dir) && dir.is_file() {
+            Some((dir.to_path_buf(), String::new()))
+        } else {
+            crate::archive::member_path(dir).map(|m| (m.archive, m.member))
+        };
+        if let Some((file, prefix)) = archive {
+            let v = match crate::archive::Index::open(&file) {
+                Ok(index) => index.children(&prefix),
+                Err(error) => {
+                    self.errors.push(format!("Cannot browse ZIP: {error:#}"));
+                    Vec::new()
+                }
+            };
+            self.listings.insert(dir.to_path_buf(), v.clone());
+            return v;
+        }
         let mut v: Vec<(String, bool)> = walker(dir, 1)
             .build()
             .flatten()
@@ -67,7 +86,9 @@ impl Explorer {
             .map(|e| {
                 (
                     e.file_name().to_string_lossy().into_owned(),
-                    e.file_type().is_some_and(|t| t.is_dir()),
+                    e.file_type().is_some_and(|t| t.is_dir())
+                        || (e.file_type().is_some_and(|t| t.is_file())
+                            && crate::archive::is_zip(e.path())),
                 )
             })
             .collect();
@@ -81,6 +102,7 @@ impl Explorer {
 
     pub fn refresh(&mut self) {
         self.listings.clear();
+        self.errors.clear();
         self.rebuild();
     }
 
@@ -101,6 +123,7 @@ impl Explorer {
                 path: path.clone(),
                 name,
                 is_dir,
+                is_archive: is_dir && crate::archive::is_zip(&path) && path.is_file(),
                 depth,
             });
             if open {

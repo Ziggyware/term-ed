@@ -12,7 +12,7 @@
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,6 +23,7 @@ use serde_json::{Value, json};
 
 use crate::aep::AepPatch;
 use crate::agui::AGUIHub;
+use crate::config::{AgentConfig, CommandPolicy};
 use crate::decisions::{
     DecisionContext, DecisionEngine, ModelSelector, PermissionPolicy, PermissionVerdict,
     default_engine,
@@ -36,11 +37,19 @@ fn gateway() -> String {
 }
 /// Kilo's router across its free models.
 pub const DEFAULT_MODEL: &str = "kilo-auto/free";
-const MAX_STEPS: usize = 30;
 
 /// Start the agent thread. `out` receives the JSON-RPC messages an external
 /// agent would print; the returned sender takes the messages we'd write to it.
 pub fn spawn(cwd: PathBuf, out: impl Fn(Value) + Send + Sync + 'static) -> Sender<Value> {
+    spawn_configured(cwd, AgentConfig::default(), String::new(), out)
+}
+
+pub fn spawn_configured(
+    cwd: PathBuf,
+    options: AgentConfig,
+    skill_context: String,
+    out: impl Fn(Value) + Send + Sync + 'static,
+) -> Sender<Value> {
     let (to_agent, inbox) = channel::<Value>();
     let (work_tx, work_rx) = channel::<Value>();
     let (reply_tx, reply_rx) = channel::<Value>();
@@ -57,16 +66,27 @@ pub fn spawn(cwd: PathBuf, out: impl Fn(Value) + Send + Sync + 'static) -> Sende
                     let _ = reply_tx.send(msg);
                 }
                 Some(_) => {
+                    if method == Some("session/prompt") {
+                        c2.store(false, Ordering::SeqCst);
+                    }
                     if work_tx.send(msg).is_err() {
                         break;
                     }
                 }
             }
         }
+        c2.store(true, Ordering::SeqCst);
     });
     let out: Arc<dyn Fn(Value) + Send + Sync> = Arc::new(out);
     std::thread::spawn(move || {
         let mut w = Worker::new(cwd, out, reply_rx, cancel);
+        if !options.model.is_empty() {
+            w.model = options.model.clone();
+        } else if options.uses_router() {
+            w.model = crate::provider::ROUTER_MODEL.into();
+        }
+        w.options = options;
+        w.skill_context = skill_context;
         for msg in work_rx {
             w.handle(msg);
         }
@@ -77,7 +97,9 @@ pub fn spawn(cwd: PathBuf, out: impl Fn(Value) + Send + Sync + 'static) -> Sende
 fn http() -> ureq::Agent {
     let mut cfg = ureq::Agent::config_builder()
         .http_status_as_error(false)
+        .max_redirects(0)
         .timeout_connect(Some(Duration::from_secs(20)))
+        .timeout_global(Some(Duration::from_secs(120)))
         .user_agent(concat!("termed/", env!("CARGO_PKG_VERSION")));
     // Bundled Mozilla roots work everywhere (incl. Android). If the system
     // points at its own bundle (corporate/MITM proxies), trust that instead.
@@ -107,7 +129,13 @@ pub fn free_models(http: &ureq::Agent) -> Vec<(String, String)> {
         DEFAULT_MODEL.to_string(),
         "Auto (best free model)".to_string(),
     )];
-    let Ok(resp) = http.get(format!("{}/models", gateway())).call() else {
+    let Ok(resp) = http
+        .get(format!("{}/models", gateway()))
+        .config()
+        .max_redirects(5)
+        .build()
+        .call()
+    else {
         return out;
     };
     let Ok(text) = resp.into_body().read_to_string() else {
@@ -139,53 +167,149 @@ pub fn free_models(http: &ureq::Agent) -> Vec<(String, String)> {
     out
 }
 
-fn tools_schema() -> Value {
+fn tools_schema(options: &AgentConfig) -> Value {
     let f = |name: &str, desc: &str, props: Value, req: &[&str]| {
         json!({"type":"function","function":{"name":name,"description":desc,
             "parameters":{"type":"object","properties":props,"required":req}}})
     };
-    json!([
+    let mut tools = vec![
         f(
             "list_files",
             "List files in a directory of the project (recursive, respects .gitignore).",
             json!({"path":{"type":"string","description":"Directory relative to the project root; default '.'"}}),
-            &[]
+            &[],
         ),
         f(
             "read_file",
             "Read a text file. Optionally a line range (1-based, inclusive).",
             json!({"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"}}),
-            &["path"]
+            &["path"],
         ),
         f(
             "search",
             "Search file contents with a regular expression. Returns file:line: text.",
             json!({"pattern":{"type":"string"},"path":{"type":"string","description":"Directory to search; default '.'"}}),
-            &["pattern"]
+            &["pattern"],
         ),
         f(
             "edit_file",
             "Replace old_text with new_text in a file. old_text must match exactly once; include enough surrounding lines to make it unique.",
             json!({"path":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}}),
-            &["path", "old_text", "new_text"]
+            &["path", "old_text", "new_text"],
         ),
         f(
             "write_file",
             "Create a file or overwrite it completely.",
             json!({"path":{"type":"string"},"content":{"type":"string"}}),
-            &["path", "content"]
+            &["path", "content"],
         ),
         f(
             "run_command",
             "Run a shell command in the project root (the user must approve it). Use for builds and tests.",
             json!({"command":{"type":"string"}}),
-            &["command"]
+            &["command"],
         ),
-    ])
+    ];
+    tools.retain(|tool| {
+        let name = tool
+            .pointer("/function/name")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        !(options.read_only && matches!(name, "edit_file" | "write_file" | "run_command")
+            || options.commands == CommandPolicy::Deny && name == "run_command")
+    });
+    tools.extend(crate::tool_bridge::tools(options).into_iter().map(|t| {
+        json!({"type":"function","function":{"name":t.name,"description":t.description,"parameters":t.input_schema}})
+    }));
+    json!(tools)
+}
+
+fn compact_history(history: &mut Vec<Value>, system_bytes: usize) {
+    const BUDGET: usize = 320 * 1024;
+    let size = |h: &Vec<Value>| h.iter().map(|v| v.to_string().len()).sum::<usize>() + system_bytes;
+    if size(history) <= BUDGET {
+        return;
+    }
+    let mut removed = false;
+    if let Some(i) = history.iter().rposition(|v| v["role"] == "user") {
+        if i > 0 {
+            history.drain(..i);
+            removed = true;
+        }
+    }
+    while size(history) > BUDGET {
+        let Some(next) = history
+            .iter()
+            .enumerate()
+            .skip(2)
+            .find_map(|(i, v)| (v["role"] == "assistant").then_some(i))
+        else {
+            break;
+        };
+        history.drain(1..next);
+        removed = true;
+    }
+    if removed {
+        if let Some(first) = history.first_mut() {
+            let content = first["content"].as_str().unwrap_or("");
+            if !content.starts_with("[Context window:") {
+                first["content"] = json!(format!(
+                    "[Context window: older complete exchanges were omitted. The current goal/brief and inherited instructions are retained. Re-read needed evidence instead of assuming omitted results.]\n{content}"
+                ));
+            }
+        }
+    }
+}
+
+/// OpenAI sends indexed fragments; NoKey Router sends complete, unindexed
+/// calls in one event. Preserve each function separately in either format.
+fn merge_tool_calls(
+    calls: &mut Vec<(String, String, String)>,
+    delta: &Value,
+) -> Result<(), String> {
+    for (position, call) in delta
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let index = match call.get("index") {
+            None => position as u64,
+            Some(v) => v
+                .as_u64()
+                .ok_or("Tool call index must be a nonnegative integer")?,
+        };
+        if index >= 16 {
+            return Err("Model returned too many tool calls (limit 16)".into());
+        }
+        let i = index as usize;
+        while calls.len() <= i {
+            calls.push(Default::default());
+        }
+        if let Some(id) = call.get("id").and_then(Value::as_str) {
+            if id.len() > 128 {
+                return Err("Tool call ID is too long".into());
+            }
+            calls[i].0 = id.into();
+        }
+        if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
+            calls[i].1.push_str(name);
+        }
+        if let Some(args) = call.pointer("/function/arguments").and_then(Value::as_str) {
+            calls[i].2.push_str(args);
+        }
+        if calls[i].1.len() > 128 || calls[i].2.len() > 64 * 1024 {
+            return Err("Model tool call exceeds its size limit".into());
+        }
+    }
+    Ok(())
 }
 
 struct Worker {
     cwd: PathBuf,
+    options: AgentConfig,
+    skill_context: String,
     out: Arc<dyn Fn(Value) + Send + Sync>,
     replies: Receiver<Value>,
     cancel: Arc<AtomicBool>,
@@ -193,6 +317,7 @@ struct Worker {
     model: String,
     models: Vec<(String, String)>,
     history: Vec<Value>,
+    dynamic_tools: Vec<Value>,
     next_id: u64,
     always_allow_commands: bool,
     policy: PermissionPolicy,
@@ -214,7 +339,10 @@ impl Worker {
         cancel: Arc<AtomicBool>,
     ) -> Self {
         let decisions = default_engine();
-        let auto_allow_thresh = if std::env::var("TERMED_AUTO_ALLOW").map(|v| v == "0").unwrap_or(false) {
+        let auto_allow_thresh = if std::env::var("TERMED_AUTO_ALLOW")
+            .map(|v| v == "0")
+            .unwrap_or(false)
+        {
             0.0
         } else {
             0.20
@@ -224,7 +352,9 @@ impl Worker {
         let agui = AGUIHub::new();
 
         Self {
-            cwd,
+            cwd: crate::search::absolute_path(&cwd),
+            options: AgentConfig::default(),
+            skill_context: String::new(),
             out,
             replies,
             cancel,
@@ -232,6 +362,7 @@ impl Worker {
             model: std::env::var("TERMED_FREE_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into()),
             models: Vec::new(),
             history: Vec::new(),
+            dynamic_tools: Vec::new(),
             next_id: 1000,
             always_allow_commands: false,
             policy,
@@ -282,8 +413,15 @@ impl Worker {
                     self.cwd = PathBuf::from(c);
                 }
                 self.history.clear();
+                self.always_allow_commands = false;
                 if self.models.is_empty() {
-                    self.models = free_models(&self.http);
+                    self.models = if self.options.uses_router() {
+                        crate::provider::router_models()
+                    } else if self.options.endpoint.is_empty() {
+                        free_models(&self.http)
+                    } else {
+                        vec![(self.model.clone(), self.model.clone())]
+                    };
                 }
                 if !self.models.iter().any(|(v, _)| *v == self.model) {
                     self.models.insert(0, (self.model.clone(), self.model.clone()));
@@ -297,7 +435,6 @@ impl Worker {
                 self.respond(&id, json!({"configOptions":self.config_options()}));
             }
             "session/prompt" => {
-                self.cancel.store(false, Ordering::SeqCst);
                 let reason = self.turn(&p);
                 self.respond(&id, json!({"stopReason":reason}));
             }
@@ -321,11 +458,25 @@ impl Worker {
             } else {
                 std::env::consts::OS
             }
+        ) + &format!(
+            "\n\nInherited project/ancestor rules (higher priority than the specialist role):\n{}\n\nCurrent role instructions:\n{}\n{}\n{}",
+            self.options.inherited_instructions.join("\n\n"),
+            self.options.instructions,
+            self.skill_context,
+            if self.options.read_only {
+                "Read-only mode: do not change files or execute commands."
+            } else {
+                "Plugin tools operate on live unsaved editor buffers. Read their results; never overwrite plugin edits with stale disk content. Use list_skills/read_skill for relevant instructions and list_sub_agents/delegate_task for focused specialist work."
+            }
         )
     }
 
     /// One user turn: loop model → tools until the model stops calling tools.
     fn turn(&mut self, p: &Value) -> &'static str {
+        self.dynamic_tools.clear();
+        if let Some(context) = p.get("_termedSkillContext").and_then(Value::as_str) {
+            self.skill_context = context.to_string();
+        }
         let mut text = String::new();
         for b in p
             .get("prompt")
@@ -359,7 +510,7 @@ impl Worker {
         self.history
             .push(json!({"role":"user","content":text.trim()}));
         let mut tried_models = vec![self.model.clone()];
-        for _ in 0..MAX_STEPS {
+        for _ in 0..self.options.max_steps {
             if self.cancel.load(Ordering::SeqCst) {
                 return "cancelled";
             }
@@ -413,10 +564,16 @@ impl Worker {
                                 "update":{"sessionUpdate":"config_option_update","configOptions":self.config_options()}}}));
                         }
                         _ => {
-                            let hint = if status == Some(429) {
-                                "The free models' hourly limit was reached (200 requests per hour). Try again a bit later."
-                            } else {
-                                "Could not reach the free model service. Check your internet connection and try again."
+                            let hint = match status {
+                                Some(401 | 403) => {
+                                    "Authentication failed. Check the provider key or saved ROUTER_API_KEY in AI settings."
+                                }
+                                Some(429) => {
+                                    "The provider rate limit was reached. Wait before trying again."
+                                }
+                                _ => {
+                                    "Provider request failed. Check the connection, context size and provider configuration."
+                                }
                             };
                             self.notice(&format!("{hint} ({msg})"), true);
                             return "end_turn";
@@ -431,75 +588,143 @@ impl Worker {
 
     /// One model call. Ok(true) = tools ran, call the model again.
     fn step(&mut self) -> Result<bool, Step> {
-        let mut messages = vec![json!({"role":"system","content":self.system_prompt()})];
+        let system = self.system_prompt();
+        compact_history(&mut self.history, system.len());
+        let mut messages = vec![json!({"role":"system","content":system})];
         messages.extend(self.history.iter().cloned());
-        let body = json!({
-            "model": self.model,
-            "messages": messages,
-            "tools": tools_schema(),
-            "stream": true,
-            "stream_options": {"include_usage": true},
-        });
-        let resp = self
+        let mut schemas = tools_schema(&self.options)
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if self.options.generated_tools {
+            schemas.extend(self.dynamic_tools.clone());
+        }
+        let body = json!({"model":self.model,"messages":messages,"tools":schemas,
+            "max_tokens":self.options.max_output_tokens,"stream":true,"stream_options":{"include_usage":true}}).to_string();
+        if body.len() > 480 * 1024 {
+            return Err(Step::Failed("Context exceeds the safe request budget. Split this task or shorten instructions/attached skills; no instructions or current objective were silently removed.".into(), Some(413)));
+        }
+        let endpoint = crate::provider::endpoint(&self.options);
+        let key = crate::provider::authorization(&self.options, &endpoint)
+            .map_err(|e| Step::Failed(e, Some(401)))?;
+        let clean = |s: &str| crate::provider::sanitize(s, key.as_ref());
+        let mut request = self
             .http
-            .post(format!("{}/chat/completions", gateway()))
+            .post(format!("{endpoint}/chat/completions"))
+            .config()
+            .max_redirects(
+                if key.is_none() && !self.options.uses_router() && self.options.endpoint.is_empty()
+                {
+                    5
+                } else {
+                    0
+                },
+            )
+            .build()
             .header("Content-Type", "application/json")
             .header("HTTP-Referer", "https://github.com/Ziggyware/termed")
-            .header("X-Title", "termed")
-            .send(body.to_string())
-            .map_err(|e| Step::Failed(e.to_string(), None))?;
+            .header("X-Title", "termed");
+        if let Some(key) = &key {
+            request = request.header("Authorization", format!("Bearer {}", key.expose()));
+        }
+        let resp = request
+            .send(body)
+            .map_err(|e| Step::Failed(clean(&e.to_string()), None))?;
         let status = resp.status().as_u16();
         if status != 200 {
-            let text = resp.into_body().read_to_string().unwrap_or_default();
-            let msg = serde_json::from_str::<Value>(&text)
+            let mut text = String::new();
+            let _ = resp
+                .into_body()
+                .into_reader()
+                .take(16 * 1024)
+                .read_to_string(&mut text);
+            let message = serde_json::from_str::<Value>(&text)
                 .ok()
                 .and_then(|v| {
                     v.pointer("/error/message")
                         .and_then(Value::as_str)
-                        .map(String::from)
+                        .map(str::to_string)
                 })
                 .unwrap_or_else(|| format!("HTTP {status}"));
-            return Err(Step::Failed(msg, Some(status)));
+            return Err(Step::Failed(clean(&message), Some(status)));
         }
-        let reader = BufReader::new(resp.into_body().into_reader());
+        let mut reader = BufReader::new(resp.into_body().into_reader());
         let mut content = String::new();
-        // Tool calls arrive in pieces, keyed by index.
         let mut calls: Vec<(String, String, String)> = Vec::new();
-        for line in reader.lines() {
+        let mut bytes = 0;
+        let mut finished = false;
+        loop {
             if self.cancel.load(Ordering::SeqCst) {
                 return Err(Step::Cancelled);
             }
-            let Ok(line) = line else {
-                return Err(Step::Failed("connection lost".into(), None));
-            };
+            let mut line = String::new();
+            let read = std::io::Read::take(&mut reader, 512 * 1024 + 1)
+                .read_line(&mut line)
+                .map_err(|_| {
+                    Step::Failed(
+                        "Connection lost while reading a model response".into(),
+                        None,
+                    )
+                })?;
+            if read == 0 {
+                break;
+            }
+            bytes += read;
+            if read > 512 * 1024 || bytes > 2 * 1024 * 1024 {
+                return Err(Step::Failed(
+                    "Model stream exceeded its size limit".into(),
+                    Some(502),
+                ));
+            }
             let Some(data) = line.strip_prefix("data:") else {
                 continue;
             };
             let data = data.trim();
             if data == "[DONE]" {
+                finished = true;
                 break;
             }
-            let Ok(v) = serde_json::from_str::<Value>(data) else {
-                continue;
-            };
-            if let Some(err) = v.get("error") {
-                let msg = err
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("model error")
-                    .to_string();
-                let code = err.get("code").and_then(Value::as_u64).map(|c| c as u16);
-                return Err(Step::Failed(msg, code.or(Some(502))));
+            let v: Value = serde_json::from_str(data)
+                .map_err(|_| Step::Failed("Malformed model stream event".into(), Some(502)))?;
+            if let Some(error) = v.get("error") {
+                return Err(Step::Failed(
+                    clean(
+                        error
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Model error"),
+                    ),
+                    Some(502),
+                ));
             }
             if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
                 let used = u.get("total_tokens").and_then(Value::as_u64).unwrap_or(0);
                 self.update(json!({"sessionUpdate":"usage_update","used":used,"size":0,"cost":{"amount":0,"currency":"USD"}}));
             }
-            let Some(delta) = v.pointer("/choices/0/delta") else {
+            // Some OpenAI-compatible servers send a full message in an SSE event.
+            let delta = v
+                .pointer("/choices/0/delta")
+                .or_else(|| v.pointer("/choices/0/message"));
+            let Some(delta) = delta else {
                 continue;
             };
+            if let Some(reason) = v
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+            {
+                if reason == "length" || reason == "content_filter" {
+                    return Err(Step::Failed(
+                        format!(
+                            "Model stopped with {reason}; partial tool calls were not executed. Adjust the output budget or task."
+                        ),
+                        Some(413),
+                    ));
+                }
+                finished = true;
+            }
             if let Some(r) = delta
-                .get("reasoning")
+                .get("reasoning_content")
+                .or_else(|| delta.get("reasoning"))
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
             {
@@ -513,52 +738,43 @@ impl Worker {
                 content.push_str(c);
                 self.update(json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":c}}));
             }
-            for tc in delta
-                .get("tool_calls")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                let i = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                while calls.len() <= i {
-                    calls.push(Default::default());
-                }
-                if let Some(id) = tc.get("id").and_then(Value::as_str) {
-                    calls[i].0 = id.to_string();
-                }
-                if let Some(n) = tc.pointer("/function/name").and_then(Value::as_str) {
-                    calls[i].1.push_str(n);
-                }
-                if let Some(a) = tc.pointer("/function/arguments").and_then(Value::as_str) {
-                    calls[i].2.push_str(a);
-                }
-            }
+            merge_tool_calls(&mut calls, delta).map_err(|e| Step::Failed(e, Some(502)))?;
+        }
+        // Never execute partially received arguments or silently treat an empty
+        // response as success. This also prevents unsafe retry of partial calls.
+        if !finished {
+            return Err(Step::Failed("Model stream ended before a completion marker; no partial tool calls were executed".into(),Some(502)));
         }
         calls.retain(|c| !c.1.is_empty());
+        if calls.is_empty() && content.trim().is_empty() {
+            return Err(Step::Failed(
+                "Model returned neither an answer nor tool calls".into(),
+                Some(502),
+            ));
+        }
         let mut assistant = json!({"role":"assistant","content":content});
         if !calls.is_empty() {
-            for (k, c) in calls.iter_mut().enumerate() {
-                if c.0.is_empty() {
-                    c.0 = format!("call_{}_{k}", self.next_id);
+            for (i, call) in calls.iter_mut().enumerate() {
+                if call.0.is_empty() {
+                    call.0 = format!("call_{}_{i}", self.next_id);
                 }
             }
-            assistant["tool_calls"] = Value::Array(
-                calls
-                    .iter()
-                    .map(|(id, name, args)| json!({"id":id,"type":"function","function":{"name":name,"arguments":args}}))
-                    .collect(),
-            );
+            assistant["tool_calls"]=json!(calls.iter().map(|(id,name,args)|json!({"id":id,"type":"function","function":{"name":name,"arguments":args}})).collect::<Vec<_>>());
         }
         self.history.push(assistant);
         if calls.is_empty() {
             return Ok(false);
         }
-        for (id, name, args) in calls {
+        for (id, name, arguments) in calls {
             if self.cancel.load(Ordering::SeqCst) {
                 return Err(Step::Cancelled);
             }
-            let args: Value = serde_json::from_str(&args).unwrap_or(json!({}));
-            let result = self.run_tool(&id, &name, &args);
+            let result = match serde_json::from_str::<Value>(&arguments) {
+                Ok(args) if args.is_object() => self.run_tool(&id, &name, &args),
+                _ => format!(
+                    "Error: {name} requires valid JSON object arguments; nothing was executed"
+                ),
+            };
             self.history
                 .push(json!({"role":"tool","tool_call_id":id,"content":result}));
         }
@@ -567,27 +783,7 @@ impl Worker {
 
     /// Resolve a model-supplied path inside the project (never outside it).
     fn resolve(&self, p: &str) -> Result<PathBuf, String> {
-        let rel = Path::new(p.trim());
-        let joined = if rel.is_absolute() {
-            rel.to_path_buf()
-        } else {
-            self.cwd.join(rel)
-        };
-        let mut clean = PathBuf::new();
-        for c in joined.components() {
-            match c {
-                Component::ParentDir => {
-                    clean.pop();
-                }
-                Component::CurDir => {}
-                other => clean.push(other.as_os_str()),
-            }
-        }
-        if clean.starts_with(&self.cwd) {
-            Ok(clean)
-        } else {
-            Err(format!("{p} is outside the project"))
-        }
+        crate::config::workspace_path(&self.cwd, p.trim())
     }
 
     fn rel(&self, p: &Path) -> String {
@@ -631,6 +827,29 @@ impl Worker {
 
     fn run_tool(&mut self, id: &str, name: &str, a: &Value) -> String {
         let s = |k: &str| a.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+        if self.options.read_only
+            && matches!(
+                name,
+                "edit_file" | "write_file" | "run_command" | "run_plugin"
+            )
+        {
+            self.tool_start(id, name, "other", None);
+            self.tool_end(
+                id,
+                false,
+                vec![Self::text_block("Denied: this agent is read-only")],
+            );
+            return "Error: this agent is read-only".into();
+        }
+        if name == "run_command" && self.options.commands == CommandPolicy::Deny {
+            self.tool_start(id, name, "execute", None);
+            self.tool_end(
+                id,
+                false,
+                vec![Self::text_block("Commands are disabled in agent settings")],
+            );
+            return "Error: commands are disabled".into();
+        }
         let r = match name {
             "list_files" => self.list_files(id, &s("path")),
             "read_file" => self.read_file(id, &s("path"), a),
@@ -638,6 +857,17 @@ impl Worker {
             "edit_file" => self.edit_file(id, &s("path"), &s("old_text"), &s("new_text")),
             "write_file" => self.write_file(id, &s("path"), &s("content")),
             "run_command" => self.run_command(id, &s("command")),
+            host if crate::tool_bridge::tools(&self.options)
+                .iter()
+                .any(|t| t.name == host)
+                || self.options.generated_tools
+                    && self
+                        .dynamic_tools
+                        .iter()
+                        .any(|t| t["function"]["name"] == host) =>
+            {
+                self.host_tool(id, host, a)
+            }
             other => {
                 self.tool_start(id, other, "other", None);
                 Err(format!("unknown tool {other}"))
@@ -648,6 +878,67 @@ impl Worker {
             Err(e) => {
                 self.tool_end(id, false, vec![Self::text_block(&e)]);
                 format!("Error: {e}")
+            }
+        }
+    }
+
+    fn host_tool(&mut self, id: &str, name: &str, arguments: &Value) -> Result<String, String> {
+        self.tool_start(
+            id,
+            &format!(
+                "{}{}",
+                name.replace('_', " "),
+                arguments
+                    .get("agent")
+                    .and_then(Value::as_str)
+                    .map(|s| format!(" · {s}"))
+                    .unwrap_or_default()
+            ),
+            "other",
+            None,
+        );
+        self.next_id += 1;
+        let rid = self.next_id;
+        self.send(
+            json!({"jsonrpc":"2.0","id":rid,"method":"termed/tools/call",
+            "params":{"name":name,"arguments":arguments}}),
+        );
+        let started = Instant::now();
+        loop {
+            if self.cancel.load(Ordering::SeqCst) {
+                return Err("Cancelled".into());
+            }
+            if started.elapsed() > Duration::from_secs(self.options.task_timeout_secs + 30) {
+                return Err("Editor tool timed out".into());
+            }
+            match self.replies.recv_timeout(Duration::from_millis(100)) {
+                Ok(v) if v.get("id").and_then(Value::as_u64) == Some(rid) => {
+                    if let Some(error) = v.pointer("/error/message").and_then(Value::as_str) {
+                        return Err(error.into());
+                    }
+                    let value = v.get("result").cloned().unwrap_or(Value::Null);
+                    if name == "define_function" && self.options.generated_tools {
+                        if let Some(schema) = value.get("dynamic_function") {
+                            if self.dynamic_tools.len() < 16 {
+                                self.dynamic_tools.push(schema.clone());
+                            }
+                        }
+                    }
+                    if name == "list_functions" && self.options.generated_tools {
+                        if let Some(schemas) = value.as_array() {
+                            self.dynamic_tools = schemas.iter().take(16).cloned().collect();
+                        }
+                    }
+                    let text = value
+                        .as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| value.to_string());
+                    let shown: String = text.chars().take(6000).collect();
+                    self.tool_end(id, true, vec![Self::text_block(&shown)]);
+                    return Ok(text);
+                }
+                Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(_) => return Err("Editor disconnected".into()),
             }
         }
     }
@@ -666,7 +957,10 @@ impl Worker {
             .build()
             .flatten()
         {
-            if e.file_name() == ".git" || !e.file_type().is_some_and(|t| t.is_file()) {
+            if e.file_name() == ".git"
+                || !e.file_type().is_some_and(|t| t.is_file())
+                || crate::credentials::is_private_path(e.path())
+            {
                 continue;
             }
             files.push(self.rel(e.path()));
@@ -692,6 +986,11 @@ impl Worker {
     fn read_file(&self, id: &str, path: &str, a: &Value) -> Result<String, String> {
         let p = self.resolve(path)?;
         self.tool_start(id, &format!("Read {}", self.rel(&p)), "read", Some(&p));
+        if std::fs::metadata(&p).map_err(|e| e.to_string())?.len() > 2 * 1024 * 1024 {
+            return Err(
+                "Text tool read exceeds 2 MiB; use a smaller file or editor excerpt".into(),
+            );
+        }
         let text = std::fs::read_to_string(&p).map_err(|e| format!("cannot read {path}: {e}"))?;
         let start = a
             .get("start_line")
@@ -711,7 +1010,11 @@ impl Worker {
             .unwrap_or(&[])
             .join("\n");
         if body.len() > 60_000 {
-            body.truncate(60_000);
+            let mut end = 60_000;
+            while !body.is_char_boundary(end) {
+                end -= 1;
+            }
+            body.truncate(end);
             body.push_str("\n… (truncated; read a line range)");
         }
         self.tool_end(id, true, vec![]);
@@ -724,7 +1027,12 @@ impl Worker {
         self.tool_start(id, &format!("Search \"{pattern}\""), "search", None);
         let mut hits = Vec::new();
         'files: for e in ignore::WalkBuilder::new(&dir).build().flatten() {
-            if !e.file_type().is_some_and(|t| t.is_file()) {
+            if !e.file_type().is_some_and(|t| t.is_file())
+                || crate::credentials::is_private_path(e.path())
+            {
+                continue;
+            }
+            if std::fs::metadata(e.path()).is_ok_and(|m| m.len() > 2 * 1024 * 1024) {
                 continue;
             }
             let Ok(text) = std::fs::read_to_string(e.path()) else {
@@ -798,7 +1106,10 @@ impl Worker {
             session_history_summary: String::new(),
             metadata: json!({ "path": rel, "lines": updated.lines().count() }),
         };
-        if let Ok(res) = self.decisions.ask_noul("Did the edit apply cleanly and keep document valid?", &judge_ctx) {
+        if let Ok(res) = self.decisions.ask_noul(
+            "Did the edit apply cleanly and keep document valid?",
+            &judge_ctx,
+        ) {
             self.agui.emit(
                 "decision:evaluated",
                 "builtin",
@@ -824,6 +1135,7 @@ impl Worker {
     fn write_file(&self, id: &str, path: &str, content: &str) -> Result<String, String> {
         let p = self.resolve(path)?;
         let rel = self.rel(&p);
+        crate::document::ensure_text_target(&p).map_err(|e| e.to_string())?;
         let old = std::fs::read_to_string(&p).ok();
         self.tool_start(
             id,
@@ -866,7 +1178,7 @@ impl Worker {
                     if choice == "always" {
                         self.always_allow_commands = true;
                     }
-                    return choice != "no";
+                    return matches!(choice, "once" | "always");
                 }
                 Ok(_) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -879,7 +1191,9 @@ impl Worker {
         self.tool_start(id, &format!("Run `{command}`"), "execute", None);
 
         // Jev-governed permission risk evaluation
-        let verdict = self.policy.evaluate_command(command, &self.cwd.to_string_lossy());
+        let verdict = self
+            .policy
+            .evaluate_command(command, &self.cwd.to_string_lossy());
         self.agui.emit(
             "decision:evaluated",
             "builtin",
@@ -897,10 +1211,22 @@ impl Worker {
 
         match verdict {
             PermissionVerdict::AutoAllow { .. } => {
-                // Low risk command auto-allowed (e.g. read/test commands)
+                if self.options.commands == CommandPolicy::Ask
+                    && !self.permission(id, &format!("run `{command}`"))
+                {
+                    self.tool_end(id, false, vec![Self::text_block("Rejected by the user.")]);
+                    return Ok("The user rejected this command.".into());
+                }
             }
             PermissionVerdict::Block { score, reason } => {
-                self.tool_end(id, false, vec![Self::text_block(&format!("Blocked by policy (risk {:.2}): {reason}", score))]);
+                self.tool_end(
+                    id,
+                    false,
+                    vec![Self::text_block(&format!(
+                        "Blocked by policy (risk {:.2}): {reason}",
+                        score
+                    ))],
+                );
                 return Ok(format!("Command blocked by Jev risk policy: {reason}"));
             }
             PermissionVerdict::PromptUser { score, rationale } => {
@@ -912,52 +1238,78 @@ impl Worker {
             }
         }
         let started = Instant::now();
-        let mut child = Command::new("sh")
+        let mut process = Command::new("sh");
+        process
             .arg("-c")
             .arg(command)
             .current_dir(&self.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("cannot run: {e}"))?;
-        // Collect output on threads so a chatty command can't block on a full pipe.
-        let take = |r: Option<Box<dyn std::io::Read + Send>>| {
+            .stderr(Stdio::piped());
+        crate::process_guard::configure(&mut process);
+        let mut child = process.spawn().map_err(|e| format!("cannot run: {e}"))?;
+        // Drain without unbounded allocation. Never join forever if an
+        // intentionally daemonized process escaped with an output pipe open.
+        let take = |reader: Option<Box<dyn std::io::Read + Send>>| {
+            let (tx, rx) = channel();
             std::thread::spawn(move || {
-                let mut s = String::new();
-                if let Some(mut r) = r {
-                    let _ = r.read_to_string(&mut s);
+                let mut tail = Vec::new();
+                if let Some(mut reader) = reader {
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        match reader.read(&mut chunk) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                tail.extend_from_slice(&chunk[..n]);
+                                if tail.len() > 8000 {
+                                    tail.drain(..tail.len() - 8000);
+                                }
+                            }
+                        }
+                    }
                 }
-                s
-            })
+                let _ = tx.send(String::from_utf8_lossy(&tail).into_owned());
+            });
+            rx
         };
-        let out_t = take(
+        let out_rx = take(
             child
                 .stdout
                 .take()
                 .map(|r| Box::new(r) as Box<dyn std::io::Read + Send>),
         );
-        let err_t = take(
+        let err_rx = take(
             child
                 .stderr
                 .take()
                 .map(|r| Box::new(r) as Box<dyn std::io::Read + Send>),
         );
         let status = loop {
-            if let Ok(Some(s)) = child.try_wait() {
-                break Some(s);
+            if let Ok(Some(status)) = child.try_wait() {
+                break Some(status);
             }
             if self.cancel.load(Ordering::SeqCst) || started.elapsed() > Duration::from_secs(120) {
-                let _ = child.kill();
-                let _ = child.wait();
+                crate::process_guard::terminate(&mut child);
                 break None;
             }
             std::thread::sleep(Duration::from_millis(50));
         };
-        let mut out = out_t.join().unwrap_or_default();
-        out.push_str(&err_t.join().unwrap_or_default());
+        // Even a successfully exited shell must not leave background jobs.
+        crate::process_guard::kill_group(&child);
+        let mut out = out_rx
+            .recv_timeout(Duration::from_millis(500))
+            .unwrap_or_else(|_| "[stdout pipe still held open by an escaped process]".into());
+        out.push_str(
+            &err_rx
+                .recv_timeout(Duration::from_millis(500))
+                .unwrap_or_else(|_| "[stderr pipe still held open by an escaped process]".into()),
+        );
         if out.len() > 8000 {
-            out = format!("…{}", &out[out.len() - 8000..]);
+            let mut start = out.len() - 8000;
+            while !out.is_char_boundary(start) {
+                start += 1;
+            }
+            out = format!("…{}", &out[start..]);
         }
         let code = match status {
             Some(s) => format!("exit code {}", s.code().unwrap_or(-1)),
@@ -993,6 +1345,27 @@ mod tests {
             rx,
             Arc::new(AtomicBool::new(false)),
         )
+    }
+
+    #[test]
+    fn text_write_tool_does_not_replace_binary_previews() {
+        let dir =
+            std::env::temp_dir().join(format!("termed-builtin-binary-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut w = worker(&dir);
+        for (name, bytes) in [
+            ("image.dat", &b"GIF89a\x01\0\x01\0"[..]),
+            ("archive.dat", &b"PK\x03\x04\0\0\0\0"[..]),
+        ] {
+            std::fs::write(dir.join(name), bytes).unwrap();
+            let result = w.run_tool(
+                "binary",
+                "write_file",
+                &json!({"path":name,"content":"not pixels"}),
+            );
+            assert!(result.starts_with("Error: Cannot overwrite"), "{result}");
+            assert_eq!(std::fs::read(dir.join(name)).unwrap(), bytes);
+        }
     }
 
     #[test]
@@ -1037,5 +1410,126 @@ mod tests {
             w.run_tool("6", "list_files", &json!({}))
                 .contains("new/b.txt")
         );
+    }
+}
+
+#[cfg(test)]
+mod configured_tests {
+    use super::*;
+
+    #[test]
+    fn read_only_schemas_and_dispatch_both_restrict_tools() {
+        let options = AgentConfig {
+            read_only: true,
+            sub_agents: false,
+            ..Default::default()
+        };
+        let tools = tools_schema(&options);
+        for name in [
+            "edit_file",
+            "write_file",
+            "run_command",
+            "run_plugin",
+            "delegate_task",
+        ] {
+            assert!(
+                !tools
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|t| t["function"]["name"] == name)
+            );
+        }
+        let (_tx, rx) = channel();
+        let mut worker = Worker::new(
+            std::env::temp_dir(),
+            Arc::new(|_| {}),
+            rx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        worker.options = options;
+        for name in ["edit_file", "write_file", "run_command", "run_plugin"] {
+            assert!(
+                worker
+                    .run_tool("denied", name, &json!({}))
+                    .contains("read-only")
+            );
+        }
+        worker.options.read_only = false;
+        worker.options.commands = CommandPolicy::Deny;
+        assert!(
+            worker
+                .run_tool("denied", "run_command", &json!({"command":"echo never"}))
+                .contains("disabled")
+        );
+    }
+}
+
+#[cfg(test)]
+mod router_stream_tests {
+    use super::*;
+    #[test]
+    fn complete_unindexed_router_calls_do_not_merge_and_fragments_still_work() {
+        let mut calls = Vec::new();
+        merge_tool_calls(
+            &mut calls,
+            &json!({"tool_calls":[
+                {"id":"a","function":{"name":"read_file","arguments":"{\"path\":\"a\"}"}},
+                {"id":"b","function":{"name":"search","arguments":"{\"pattern\":\"b\"}"}}
+            ]}),
+        )
+        .unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].1, "read_file");
+        assert_eq!(calls[1].1, "search");
+        let mut fragments = Vec::new();
+        merge_tool_calls(&mut fragments,&json!({"tool_calls":[{"index":0,"id":"c","function":{"name":"read_","arguments":"{\"pa"}}]})).unwrap();
+        merge_tool_calls(&mut fragments,&json!({"tool_calls":[{"index":0,"function":{"name":"file","arguments":"th\":\"a\"}"}}]})).unwrap();
+        assert_eq!(fragments[0].1, "read_file");
+        assert_eq!(
+            serde_json::from_str::<Value>(&fragments[0].2).unwrap(),
+            json!({"path":"a"})
+        );
+        assert!(
+            merge_tool_calls(
+                &mut fragments,
+                &json!({"tool_calls":[{"index":1_000_000_000}]})
+            )
+            .is_err()
+        );
+        assert!(merge_tool_calls(&mut fragments, &json!({"tool_calls":[{"index":-1}]})).is_err());
+    }
+    #[test]
+    fn compaction_preserves_current_goal_and_does_not_orphan_tool_results() {
+        let mut history = vec![
+            json!({"role":"user","content":"old conversation"}),
+            json!({"role":"assistant","content":"x".repeat(340*1024)}),
+            json!({"role":"user","content":"CURRENT-GOAL"}),
+            json!({"role":"assistant","tool_calls":[{"id":"old"}],"content":"x".repeat(340*1024)}),
+            json!({"role":"tool","tool_call_id":"old","content":"old evidence"}),
+            json!({"role":"assistant","tool_calls":[{"id":"new"}]}),
+            json!({"role":"tool","tool_call_id":"new","content":"fresh evidence"}),
+        ];
+        compact_history(&mut history, 1000);
+        assert_eq!(history.len(), 3);
+        assert!(
+            history[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("CURRENT-GOAL")
+        );
+        assert!(history[0]["content"].as_str().unwrap().contains("omitted"));
+        assert_eq!(history[1]["tool_calls"][0]["id"], "new");
+        assert_eq!(history[2]["tool_call_id"], "new");
+    }
+    #[test]
+    fn provider_errors_redact_the_resolved_key() {
+        let key = crate::credentials::secret_from_environment("test-secret-sentinel").unwrap();
+        let clean = crate::provider::sanitize(
+            "Invalid test-secret-sentinel, echoed test-secret-sentinel",
+            Some(&key),
+        );
+        assert!(!clean.contains("test-secret-sentinel"));
+        assert!(clean.contains("[REDACTED]"));
     }
 }

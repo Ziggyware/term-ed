@@ -95,7 +95,16 @@ impl Indent {
     }
 }
 
+pub enum Preview {
+    Image(crate::image_view::ImageView),
+    Archive(crate::archive::Index),
+}
+
 pub struct Document {
+    pub preview: Option<Preview>,
+    archive_stamp: Option<crate::archive::MemberVersion>,
+    /// Stable for this buffer's lifetime, even when tabs move or paths change.
+    pub(crate) id: u64,
     pub rope: Rope,
     pub path: Option<PathBuf>,
     pub line_ending: LineEnding,
@@ -121,13 +130,106 @@ impl Document {
     }
 
     pub fn open(path: &Path) -> Result<Self> {
-        let bytes = if path.exists() {
-            fs::read(path).with_context(|| format!("reading {}", path.display()))?
+        if path.is_file() && crate::archive::is_zip(path) {
+            let index = crate::archive::Index::open(path)?;
+            let mut doc = Self::from_text(&index.summary(path), Some(path.to_path_buf()));
+            doc.preview = Some(Preview::Archive(index));
+            return Ok(doc);
+        }
+        let (bytes, stamp) = if let Some(member) = crate::archive::member_path(path) {
+            let (bytes, stamp) = crate::archive::read_member(&member)?;
+            (bytes, Some(stamp))
+        } else if path.exists() {
+            // Never allocate an unbounded binary blob simply to discover it
+            // is an image. Text documents keep the same input budget.
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            fs::File::open(path)?
+                .take(crate::image_view::MAX_IMAGE_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() > crate::image_view::MAX_IMAGE_BYTES {
+                anyhow::bail!("File exceeds the 32 MB open limit");
+            }
+            (bytes, None)
         } else {
-            Vec::new()
+            (Vec::new(), None)
         };
-        let text = String::from_utf8_lossy(&bytes).into_owned();
-        Ok(Self::from_text(&text, Some(path.to_path_buf())))
+        let mut doc = if (crate::image_view::image_extension(path)
+            && (!bytes.is_empty() || path.exists() || stamp.is_some()))
+            || image::guess_format(&bytes).is_ok()
+        {
+            let preview = crate::image_view::ImageView::decode(bytes)?;
+            let mut doc = Self::from_text("", Some(path.to_path_buf()));
+            doc.preview = Some(Preview::Image(preview));
+            doc
+        } else {
+            if bytes.contains(&0) {
+                anyhow::bail!(
+                    "Binary file is not a supported image or ZIP; it was not opened as text"
+                );
+            }
+            let text = std::str::from_utf8(&bytes)
+                .context("File is not UTF-8 text or a supported image")?;
+            Self::from_text(text, Some(path.to_path_buf()))
+        };
+        doc.archive_stamp = stamp;
+        Ok(doc)
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.preview.is_some()
+    }
+
+    /// Save As for a binary preview exports the original bytes, never a text
+    /// listing or a decoded/re-encoded approximation of the image.
+    pub fn export_preview(&self, path: &Path) -> Result<()> {
+        if crate::archive::member_path(path).is_some() {
+            anyhow::bail!("Export to a regular filesystem path, not inside a ZIP");
+        }
+        if self.path.as_ref().is_some_and(|p| same_file(p, path))
+            || self
+                .path
+                .as_ref()
+                .and_then(|p| crate::archive::member_path(p))
+                .is_some_and(|p| same_file(&p.archive, path))
+        {
+            anyhow::bail!("Choose a different path for the exported file");
+        }
+        match &self.preview {
+            Some(Preview::Image(image)) => {
+                fs::write(path, &image.original)?;
+            }
+            Some(Preview::Archive(index)) => {
+                let source = self.path.as_ref().context("ZIP has no path")?;
+                if crate::archive::Stamp::read(source)? != index.stamp {
+                    anyhow::bail!("ZIP changed on disk; reopen before exporting");
+                }
+                fs::copy(source, path)?;
+            }
+            None => anyhow::bail!("Not a binary preview"),
+        }
+        Ok(())
+    }
+
+    pub fn save_as(&mut self, path: &Path) -> Result<()> {
+        if self.is_read_only() {
+            return self.export_preview(path);
+        }
+        let stamp = if self.path.as_deref() == Some(path) && self.archive_stamp.is_some() {
+            self.archive_stamp.clone()
+        } else {
+            crate::archive::member_path(path)
+                .map(|m| crate::archive::member_version(&m))
+                .transpose()?
+        };
+        let old_path = self.path.replace(path.to_path_buf());
+        let old_stamp = std::mem::replace(&mut self.archive_stamp, stamp);
+        if let Err(e) = self.save() {
+            self.path = old_path;
+            self.archive_stamp = old_stamp;
+            return Err(e);
+        }
+        Ok(())
     }
 
     pub fn from_text(text: &str, path: Option<PathBuf>) -> Self {
@@ -138,7 +240,11 @@ impl Document {
         };
         let normalized = text.replace("\r\n", "\n");
         let indent = detect_indent(&normalized);
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self {
+            preview: None,
+            archive_stamp: None,
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             rope: Rope::from_str(&normalized),
             path,
             line_ending,
@@ -169,20 +275,42 @@ impl Document {
     }
 
     pub fn save(&mut self) -> Result<()> {
+        if self.is_read_only() {
+            anyhow::bail!("Preview is read-only; use Save As to export the original file");
+        }
         self.commit();
         let path = self.path.clone().context("document has no path")?;
-        let mut text = self.rope.to_string();
-        self.saved_text = text.clone();
-        if self.line_ending == LineEnding::CrLf {
-            text = text.replace('\n', "\r\n");
+        let baseline = self.rope.to_string();
+        let text = if self.line_ending == LineEnding::CrLf {
+            baseline.replace('\n', "\r\n")
+        } else {
+            baseline.clone()
+        };
+        let member = crate::archive::member_path(&path);
+        if self.archive_stamp.is_some() && member.is_none() {
+            anyhow::bail!("ZIP container is missing or no longer a file; your edits were kept");
         }
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-            && !parent.exists()
-        {
-            fs::create_dir_all(parent)?;
+        if let Some(member) = member {
+            let stamp = self
+                .archive_stamp
+                .clone()
+                .context("Reopen the ZIP member before saving")?;
+            self.archive_stamp = Some(crate::archive::write_member(
+                &member,
+                &stamp,
+                text.as_bytes(),
+            )?);
+        } else {
+            ensure_text_target(&path)?;
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+                && !parent.exists()
+            {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
         }
-        fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+        self.saved_text = baseline;
         self.saved_rev = self.rev;
         self.version += 1;
         Ok(())
@@ -198,6 +326,9 @@ impl Document {
     /// Flag the document as needing a save without changing its text
     /// (e.g. after switching line endings).
     pub fn mark_modified(&mut self) {
+        if self.is_read_only() {
+            return;
+        }
         self.saved_rev = u64::MAX;
         self.version += 1;
     }
@@ -218,6 +349,9 @@ impl Document {
     /// Start a transaction. Consecutive transactions of the same kind are merged
     /// (so typing a word undoes as one unit, like Visual Studio).
     pub fn begin(&mut self, kind: EditKind, sel: Selection) {
+        if self.is_read_only() {
+            return;
+        }
         if let Some(p) = &self.pending {
             let mergeable = kind != EditKind::Other
                 && p.kind == kind
@@ -265,6 +399,9 @@ impl Document {
     }
 
     pub fn insert(&mut self, at: usize, text: &str) {
+        if self.is_read_only() {
+            return;
+        }
         if text.is_empty() {
             return;
         }
@@ -278,6 +415,9 @@ impl Document {
     }
 
     pub fn remove(&mut self, start: usize, end: usize) {
+        if self.is_read_only() {
+            return;
+        }
         let end = end.min(self.rope.len_chars());
         if start >= end {
             return;
@@ -298,6 +438,9 @@ impl Document {
     }
 
     pub fn undo(&mut self) -> Option<Selection> {
+        if self.is_read_only() {
+            return None;
+        }
         self.commit();
         let t = self.undo.pop()?;
         for c in t.changes.iter().rev() {
@@ -320,6 +463,9 @@ impl Document {
     }
 
     pub fn redo(&mut self) -> Option<Selection> {
+        if self.is_read_only() {
+            return None;
+        }
         self.commit();
         let t = self.redo.pop()?;
         for c in &t.changes {
@@ -425,6 +571,49 @@ fn detect_indent(text: &str) -> Indent {
     } else {
         Indent::Spaces(4)
     }
+}
+
+/// Text-only writes must not silently replace an image or its ZIP container,
+/// including aliases whose extension no longer identifies the binary format.
+pub(crate) fn ensure_text_target(path: &Path) -> Result<()> {
+    if path
+        .ancestors()
+        .skip(1)
+        .any(|p| crate::archive::is_zip(p) && !p.exists())
+    {
+        anyhow::bail!("ZIP container is missing; choose an existing ZIP or a regular directory");
+    }
+    if !path.is_file() {
+        return Ok(());
+    }
+    use std::io::Read;
+    let mut prefix = Vec::new();
+    fs::File::open(path)?.take(32).read_to_end(&mut prefix)?;
+    if crate::archive::is_zip(path)
+        || image::guess_format(&prefix).is_ok()
+        || [b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"]
+            .iter()
+            .any(|m| prefix.starts_with(*m))
+    {
+        anyhow::bail!(
+            "Cannot overwrite an image or ZIP with text; choose a text file or a ZIP member path"
+        );
+    }
+    Ok(())
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    if crate::search::absolute_path(a) == crate::search::absolute_path(b) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(a), Ok(b)) = (fs::metadata(a), fs::metadata(b)) {
+            return a.dev() == b.dev() && a.ino() == b.ino();
+        }
+    }
+    false
 }
 
 #[cfg(test)]

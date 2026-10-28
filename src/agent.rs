@@ -16,6 +16,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::config::AgentConfig;
 use serde_json::{Value, json};
 
 /// How to launch an agent.
@@ -82,7 +83,7 @@ pub fn detect_agents() -> Vec<AgentSpec> {
     if chosen.as_deref() == Some("builtin") {
         out.push(builtin_spec());
     } else if let Some(cmd) = chosen {
-        let mut parts = cmd.split_whitespace().map(String::from);
+        let mut parts = crate::plugin::split_command(&cmd).into_iter();
         if let Some(program) = parts.next() {
             let args: Vec<String> = parts.collect();
             // `python3 my_agent.py` is better named after the script.
@@ -221,6 +222,17 @@ pub enum AgentEvent {
         content: String,
     },
     TurnEnded,
+    /// Built-in and ACP extensions call live editor automation tools here.
+    HostTool {
+        rpc_id: Value,
+        name: String,
+        arguments: Value,
+    },
+    /// A host-owned permission card (not a request to the ACP process).
+    LocalPermission {
+        id: String,
+        option: Option<String>,
+    },
 }
 
 enum Inbound {
@@ -241,6 +253,10 @@ enum Pending {
 
 pub struct Agent {
     pub available: Vec<AgentSpec>,
+    pub options: AgentConfig,
+    pub skill_context: String,
+    pub mcp_servers: Vec<Value>,
+    local_events: VecDeque<AgentEvent>,
     pub spec: Option<AgentSpec>,
     pub state: State,
     pub entries: Vec<Entry>,
@@ -292,6 +308,10 @@ impl Agent {
         let available = detect_agents();
         let (tx, rx) = channel();
         Self {
+            options: AgentConfig::default(),
+            skill_context: String::new(),
+            mcp_servers: Vec::new(),
+            local_events: VecDeque::new(),
             spec: available.first().cloned(),
             state: if available.is_empty() {
                 State::NoAgent
@@ -335,6 +355,42 @@ impl Agent {
         }
     }
 
+    /// Configure before starting a session. Unknown external backends fail
+    /// explicitly instead of silently switching providers.
+    pub fn configure(&mut self, options: AgentConfig, skill_context: String) -> Result<(), String> {
+        options.validate().map_err(|e| e.to_string())?;
+        let available = detect_agents();
+        let spec = match options.backend.as_str() {
+            "auto" if options.uses_router() => Some(builtin_spec()),
+            "auto" => available.first().cloned(),
+            "builtin" => Some(builtin_spec()),
+            "custom" => {
+                let argv = crate::plugin::split_command(&options.command);
+                Some(AgentSpec {
+                    name: base_name(&argv[0]),
+                    program: argv[0].clone(),
+                    args: argv[1..].to_vec(),
+                    free: false,
+                    builtin: false,
+                })
+            }
+            name => Some(
+                available
+                    .iter()
+                    .find(|a| a.name == name)
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!("Agent {name} is not installed; choose another backend in Settings")
+                    })?,
+            ),
+        };
+        self.options = options;
+        self.skill_context = skill_context;
+        self.available = available;
+        self.spec = spec;
+        Ok(())
+    }
+
     pub fn name(&self) -> String {
         if !self.agent_title.is_empty() {
             return self.agent_title.clone();
@@ -350,6 +406,18 @@ impl Agent {
             self.state,
             State::Working | State::Starting | State::Installing
         )
+    }
+
+    pub fn idle_for(&self) -> Duration {
+        self.last_activity.elapsed()
+    }
+
+    /// Host work/approval is real activity, but never extends the absolute
+    /// supervision deadline. It also prevents silently replaying a turn after
+    /// a host tool may already have performed side effects.
+    pub(crate) fn host_progress(&mut self) {
+        self.last_activity = Instant::now();
+        self.turn_updates = self.turn_updates.saturating_add(1);
     }
 
     pub fn running(&self) -> bool {
@@ -384,11 +452,20 @@ impl Agent {
             self.state = State::NoAgent;
             return;
         };
+        // Old process readers must not inject late replies into a new session.
+        let (tx, rx) = channel();
+        self.tx = tx;
+        self.rx = rx;
         if spec.builtin {
             let tx = self.tx.clone();
-            self.builtin_tx = Some(crate::builtin_agent::spawn(self.cwd.clone(), move |v| {
-                let _ = tx.send(Inbound::Message(v));
-            }));
+            self.builtin_tx = Some(crate::builtin_agent::spawn_configured(
+                self.cwd.clone(),
+                self.options.clone(),
+                self.skill_context.clone(),
+                move |v| {
+                    let _ = tx.send(Inbound::Message(v));
+                },
+            ));
             self.state = State::Starting;
             self.handshake();
             return;
@@ -399,6 +476,7 @@ impl Agent {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        crate::process_guard::configure(&mut cmd);
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -443,7 +521,8 @@ impl Agent {
                 "protocolVersion": 1,
                 "clientCapabilities": {
                     "fs": { "readTextFile": true, "writeTextFile": true },
-                    "terminal": false
+                    "terminal": false,
+                    "_meta": { "termed": { "automationTools": true } }
                 },
                 "clientInfo": { "name": "termed", "version": env!("CARGO_PKG_VERSION") }
             }),
@@ -451,13 +530,34 @@ impl Agent {
         );
     }
 
+    pub fn close_open_tools(&mut self, prefix: Option<&str>) {
+        for entry in &mut self.entries {
+            match entry {
+                Entry::Tool(tool)
+                    if prefix.is_none_or(|p| tool.id.starts_with(p))
+                        && matches!(tool.status, ToolStatus::Pending | ToolStatus::Running) =>
+                {
+                    tool.status = ToolStatus::Failed
+                }
+                Entry::Permission(card) if prefix.is_none() && card.chosen.is_none() => {
+                    card.chosen = Some("Cancelled".into())
+                }
+                _ => {}
+            }
+        }
+    }
+
     pub fn stop(&mut self) {
+        self.close_open_tools(None);
         if let Some(mut c) = self.child.take() {
-            let _ = c.kill();
-            let _ = c.wait();
+            crate::process_guard::terminate(&mut c);
         }
         self.stdin = None;
-        self.builtin_tx = None;
+        if let Some(tx) = self.builtin_tx.take() {
+            let _ = tx.send(json!({"jsonrpc":"2.0","method":"session/cancel","params":{}}));
+        }
+        self.queued = None;
+        self.local_events.clear();
         self.session_id = None;
         self.pending.clear();
         if !matches!(self.state, State::NoAgent | State::Installing) {
@@ -481,6 +581,10 @@ impl Agent {
 
     /// Fresh conversation in the same agent.
     pub fn new_chat(&mut self) {
+        // Do not queue a new conversation behind a still-running old turn.
+        if self.is_working() {
+            self.stop();
+        }
         self.entries.clear();
         self.usage = None;
         self.scroll = 0;
@@ -554,6 +658,12 @@ impl Agent {
         self.entries.push(Entry::User(text.to_string()));
         self.scroll = 0;
         let mut blocks = vec![json!({ "type": "text", "text": text })];
+        if self.spec.as_ref().is_some_and(|s| !s.builtin) {
+            let instructions = format!("{}{}", self.options.instructions, self.skill_context);
+            if !instructions.trim().is_empty() {
+                blocks.push(json!({"type":"text","text":format!("User-configured agent instructions:\n{instructions}")}));
+            }
+        }
         blocks.extend(context);
         self.turn_started = Some(Instant::now());
         if self.session_id.is_some() && self.state == State::Ready {
@@ -578,7 +688,7 @@ impl Agent {
         self.last_prompt = Some(blocks.clone());
         self.request(
             "session/prompt",
-            json!({ "sessionId": sid, "prompt": blocks }),
+            json!({ "sessionId": sid, "prompt": blocks, "_termedSkillContext": self.skill_context }),
             Pending::Prompt,
         );
     }
@@ -630,7 +740,15 @@ impl Agent {
                 .unwrap_or_else(|| "Cancelled".into()),
         );
         let rpc = p.rpc_id.clone();
-        self.respond(rpc, json!({ "outcome": outcome }));
+        self.host_progress();
+        if let Some(id) = rpc.as_str().filter(|id| id.starts_with("termed-host/")) {
+            self.local_events.push_back(AgentEvent::LocalPermission {
+                id: id.to_string(),
+                option: option.map(String::from),
+            });
+        } else {
+            self.respond(rpc, json!({ "outcome": outcome }));
+        }
     }
 
     // ------------------------------------------------------------ JSON-RPC
@@ -667,10 +785,12 @@ impl Agent {
     }
 
     pub fn respond(&mut self, id: Value, result: Value) {
+        self.host_progress();
         self.write(json!({ "jsonrpc": "2.0", "id": id, "result": result }));
     }
 
     pub fn respond_error(&mut self, id: Value, message: &str) {
+        self.host_progress();
         self.write(
             json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32603, "message": message } }),
         );
@@ -680,7 +800,7 @@ impl Agent {
         let cwd = self.cwd.to_string_lossy().into_owned();
         self.request(
             "session/new",
-            json!({ "cwd": cwd, "mcpServers": [] }),
+            json!({ "cwd": cwd, "mcpServers": self.mcp_servers }),
             Pending::NewSession,
         );
     }
@@ -689,7 +809,14 @@ impl Agent {
     /// silently. If a turn has produced nothing at all for `stall_after`,
     /// switch to another free model and resend, so it "just works".
     fn check_stall(&mut self) -> bool {
+        // Built-in requests already have transport bounds and provider failover;
+        // overwatch owns their task/idle deadlines. Do not cancel a legitimate
+        // buffered router response using the external ACP's short stall heuristic.
+        if self.spec.as_ref().is_some_and(|s| s.builtin) {
+            return false;
+        }
         if self.state != State::Working
+            || self.pending_permission().is_some()
             || self.turn_updates > 0
             || self.retry_after_cancel
             || self.last_activity.elapsed() < self.stall_after
@@ -712,7 +839,9 @@ impl Agent {
                 .or_else(|| {
                     self.models
                         .iter()
-                        .find(|(v, _)| crate::app::is_free_model(v) && !self.busy_models.contains(v))
+                        .find(|(v, _)| {
+                            crate::app::is_free_model(v) && !self.busy_models.contains(v)
+                        })
                         .cloned()
                 })
         } else {
@@ -763,8 +892,8 @@ impl Agent {
     /// Process everything the agent sent since the last call. Returns the
     /// editor-side actions to perform and whether anything changed.
     pub fn poll(&mut self) -> (Vec<AgentEvent>, bool) {
-        let mut events = Vec::new();
-        let mut changed = self.check_stall();
+        let mut events: Vec<_> = self.local_events.drain(..).collect();
+        let mut changed = !events.is_empty();
         while let Ok(msg) = self.rx.try_recv() {
             changed = true;
             match msg {
@@ -791,6 +920,8 @@ impl Agent {
                 }
             }
         }
+        // Drain incoming activity before deciding the model has gone silent.
+        changed |= self.check_stall();
         (events, changed)
     }
 
@@ -847,6 +978,7 @@ impl Agent {
             }
             // Request from the agent.
             (Some(m), Some(id)) => {
+                self.host_progress();
                 let p = v.get("params").cloned().unwrap_or(Value::Null);
                 match m.as_str() {
                     "session/request_permission" => {
@@ -879,6 +1011,17 @@ impl Agent {
                             chosen: None,
                         }));
                         self.scroll = 0;
+                    }
+                    "termed/tools/call" => {
+                        events.push(AgentEvent::HostTool {
+                            rpc_id: id,
+                            name: p
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                            arguments: p.get("arguments").cloned().unwrap_or(json!({})),
+                        });
                     }
                     "fs/read_text_file" => {
                         let path =
@@ -944,6 +1087,9 @@ impl Agent {
                 self.session_id = r.get("sessionId").and_then(Value::as_str).map(String::from);
                 self.read_models(&r);
                 self.state = State::Ready;
+                if !self.options.model.is_empty() {
+                    self.set_model(&self.options.model.clone());
+                }
                 if let Some(blocks) = self.queued.take() {
                     self.send_prompt(blocks);
                 }
@@ -1387,6 +1533,46 @@ mod tests {
             Entry::Permission(p) => assert_eq!(p.chosen.as_deref(), Some("Allow once")),
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn approval_and_host_replies_refresh_idle_time_without_replaying_tool_side_effects() {
+        let mut a = agent();
+        a.spec = Some(AgentSpec {
+            name: "test external".into(),
+            program: String::new(),
+            args: vec![],
+            free: true,
+            builtin: false,
+        });
+        a.model = Some("opencode/big-pickle".into());
+        a.models = vec![
+            ("opencode/big-pickle".into(), "First".into()),
+            ("test/other-free".into(), "Second".into()),
+        ];
+        a.stall_after = Duration::from_secs(1);
+        a.last_activity = Instant::now() - Duration::from_secs(10);
+        a.entries.push(Entry::Permission(PermissionCard {
+            rpc_id: json!(7),
+            title: "Review a command".into(),
+            options: vec![("ok".into(), "Allow once".into(), "allow_once".into())],
+            chosen: None,
+        }));
+        assert!(!a.check_stall(), "User approval is not a stalled provider");
+        a.choose(0, Some("ok"));
+        assert!(a.idle_for() < Duration::from_secs(1));
+        assert!(a.turn_updates > 0);
+        a.last_activity = Instant::now() - Duration::from_secs(10);
+        assert!(
+            !a.check_stall(),
+            "Do not replay a turn that has used host tools"
+        );
+        a.respond(json!(8), json!({"output":"child completed"}));
+        assert!(a.idle_for() < Duration::from_secs(1));
+        a.last_activity = Instant::now() - Duration::from_secs(10);
+        a.respond_error(json!(9), "Child cancelled");
+        assert!(a.idle_for() < Duration::from_secs(1));
+        assert_eq!(a.model.as_deref(), Some("opencode/big-pickle"));
     }
 
     #[test]

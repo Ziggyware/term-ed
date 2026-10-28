@@ -720,6 +720,9 @@ impl Editor {
     }
 
     pub fn insert_text(&mut self, text: &str) {
+        if self.doc.is_read_only() {
+            return;
+        }
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         self.begin(EditKind::Other);
         self.delete_selection();
@@ -732,6 +735,9 @@ impl Editor {
     /// Paste a whole-line clipboard entry above the caret line (VS behavior
     /// for text copied without a selection).
     pub fn insert_lines_above(&mut self, text: &str) {
+        if self.doc.is_read_only() {
+            return;
+        }
         self.begin(EditKind::Other);
         let (line, col) = self.cursor();
         let at = self.doc.line_start(line);
@@ -747,6 +753,9 @@ impl Editor {
     }
 
     pub fn type_char(&mut self, c: char) {
+        if self.doc.is_read_only() {
+            return;
+        }
         let pairs = [
             ('(', ')'),
             ('[', ']'),
@@ -826,6 +835,9 @@ impl Editor {
     }
 
     pub fn newline(&mut self) {
+        if self.doc.is_read_only() {
+            return;
+        }
         self.begin(EditKind::Other);
         self.delete_selection();
         let at = self.sel.head;
@@ -871,6 +883,9 @@ impl Editor {
     }
 
     pub fn backspace(&mut self) {
+        if self.doc.is_read_only() {
+            return;
+        }
         if !self.sel.is_empty() {
             self.begin(EditKind::Other);
             self.delete_selection();
@@ -913,6 +928,9 @@ impl Editor {
     }
 
     pub fn delete_forward(&mut self) {
+        if self.doc.is_read_only() {
+            return;
+        }
         self.begin(EditKind::Deleting);
         if self.sel.is_empty() {
             let at = self.sel.head;
@@ -924,6 +942,9 @@ impl Editor {
     }
 
     pub fn delete_word(&mut self, forward: bool) {
+        if self.doc.is_read_only() {
+            return;
+        }
         if !self.sel.is_empty() {
             self.backspace();
             return;
@@ -949,6 +970,9 @@ impl Editor {
 
     /// Tab key: indent selected lines, or insert an indent unit at the caret.
     pub fn tab_key(&mut self) {
+        if self.doc.is_read_only() {
+            return;
+        }
         let (sl, el) = self.selected_lines();
         if self.sel.is_empty() || sl == el && !self.sel_spans_line() {
             self.begin(EditKind::Typing);
@@ -976,6 +1000,9 @@ impl Editor {
     }
 
     pub fn indent_lines(&mut self, indent: bool) {
+        if self.doc.is_read_only() {
+            return;
+        }
         let (sl, el) = self.selected_lines();
         let unit = self.doc.indent.unit();
         let n = unit.chars().count();
@@ -1014,6 +1041,9 @@ impl Editor {
     }
 
     pub fn toggle_comment(&mut self) {
+        if self.doc.is_read_only() {
+            return;
+        }
         let (open, close) = comment_token(self.language());
         let (sl, el) = self.selected_lines();
         let lines: Vec<String> = (sl..=el).map(|l| self.doc.line_str(l)).collect();
@@ -1090,6 +1120,9 @@ impl Editor {
 
     /// Alt+Up/Down: move the selected lines.
     pub fn move_lines(&mut self, down: bool) {
+        if self.doc.is_read_only() {
+            return;
+        }
         let (sl, el) = self.selected_lines();
         let last = self.doc.len_lines().saturating_sub(1);
         if (!down && sl == 0) || (down && el >= last) {
@@ -1132,6 +1165,9 @@ impl Editor {
     }
 
     pub fn duplicate_lines(&mut self, down: bool) {
+        if self.doc.is_read_only() {
+            return;
+        }
         let (sl, el) = self.selected_lines();
         let block: Vec<String> = (sl..=el).map(|l| self.doc.line_str(l)).collect();
         let text = block.join("\n");
@@ -1149,6 +1185,9 @@ impl Editor {
     }
 
     pub fn delete_lines(&mut self) {
+        if self.doc.is_read_only() {
+            return;
+        }
         let (sl, el) = self.selected_lines();
         let (_, col) = self.cursor();
         self.begin(EditKind::Other);
@@ -1168,6 +1207,9 @@ impl Editor {
     }
 
     pub fn insert_line(&mut self, below: bool) {
+        if self.doc.is_read_only() {
+            return;
+        }
         let (line, _) = self.cursor();
         let text = self.doc.line_str(line);
         let indent: String = text
@@ -1229,6 +1271,9 @@ impl Editor {
 
     /// Replace the char range with text as a single undo step.
     pub fn replace_range(&mut self, start: usize, end: usize, text: &str) {
+        if self.doc.is_read_only() {
+            return;
+        }
         self.begin(EditKind::Other);
         self.doc.remove(start, end);
         self.doc.insert(start, text);
@@ -1239,6 +1284,9 @@ impl Editor {
     /// Replace the whole buffer in one undo step, keeping the caret where it
     /// was as closely as possible. Used by Replace in Files.
     pub fn replace_document(&mut self, text: &str) {
+        if self.doc.is_read_only() {
+            return;
+        }
         let head = self.sel.head;
         let old_len = self.doc.rope.len_chars();
         self.begin(EditKind::Other);
@@ -1250,6 +1298,9 @@ impl Editor {
 
     /// Replace many ranges (sorted, non-overlapping) in one undo step.
     pub fn replace_all(&mut self, ranges: &[(usize, usize)], text: &str) {
+        if self.doc.is_read_only() {
+            return;
+        }
         if ranges.is_empty() {
             return;
         }
@@ -1341,6 +1392,9 @@ impl Editor {
 
     /// Replace the box on every line with `pieces[i]` (or `pieces[0]` everywhere).
     fn box_replace(&mut self, pieces: &[&str]) {
+        if self.doc.is_read_only() {
+            return;
+        }
         let Some(b) = self.block else { return };
         let (top, bottom) = b.lines();
         let (left, right) = b.cols();
@@ -1386,11 +1440,17 @@ impl Editor {
 
     /// Type into every line of the box (column editing).
     pub fn box_type(&mut self, text: &str) {
+        if self.doc.is_read_only() {
+            return;
+        }
         self.box_replace(&[text]);
     }
 
     /// Backspace: delete the box, or the char before each caret.
     pub fn box_backspace(&mut self) {
+        if self.doc.is_read_only() {
+            return;
+        }
         let Some(b) = self.block else { return };
         if !b.is_carets() {
             self.box_replace(&[""]);
@@ -1411,6 +1471,9 @@ impl Editor {
 
     /// Delete: delete the box, or the char after each caret.
     pub fn box_delete(&mut self) {
+        if self.doc.is_read_only() {
+            return;
+        }
         let Some(b) = self.block else { return };
         if b.is_carets() {
             self.block = Some(BoxSel {
@@ -1423,6 +1486,9 @@ impl Editor {
 
     /// Paste: one clipboard line per box line when the counts match.
     pub fn box_paste(&mut self, text: &str) {
+        if self.doc.is_read_only() {
+            return;
+        }
         let Some(b) = self.block else { return };
         let (top, bottom) = b.lines();
         let text = text.strip_suffix('\n').unwrap_or(text);
@@ -1443,6 +1509,9 @@ impl Editor {
     /// marked as matching disk, while the change bars keep showing what
     /// changed since you last saved.
     pub fn apply_external(&mut self, new: &str) {
+        if self.doc.is_read_only() {
+            return;
+        }
         let new = new.replace("\r\n", "\n");
         let old = self.doc.rope.to_string();
         if old == new {

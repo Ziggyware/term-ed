@@ -26,6 +26,15 @@ use termed::{highlight, theme, ui};
 struct Args {
     /// Files or a directory to open.
     paths: Vec<PathBuf>,
+    /// Use the authenticated NoKey Router with the saved local key.
+    #[arg(long)]
+    router: bool,
+    /// Save ROUTER_API_KEY locally (environment, hidden terminal input or stdin) and exit.
+    #[arg(long, conflicts_with = "router_logout")]
+    router_login: bool,
+    /// Remove the saved local router key and exit (does not unset the environment).
+    #[arg(long)]
+    router_logout: bool,
     /// Color theme (see --list-themes).
     #[arg(
         short,
@@ -53,10 +62,26 @@ struct Args {
     /// Start the AG-UI streaming server & visual editor on the specified port.
     #[arg(long, env = "TERMED_AGUI_PORT")]
     agui_port: Option<u16>,
+    /// Internal authenticated MCP stdio relay for external ACP agents.
+    #[arg(long, hide = true)]
+    mcp_bridge: Option<String>,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(address) = &args.mcp_bridge {
+        return termed::tool_bridge::run_stdio(address);
+    }
+    if args.router_login {
+        termed::credentials::import_from_terminal()?;
+        eprintln!("Router key saved in private user configuration (not workspace settings).");
+        return Ok(());
+    }
+    if args.router_logout {
+        termed::credentials::Store::default().remove()?;
+        eprintln!("Saved router key removed. An exported ROUTER_API_KEY still takes precedence.");
+        return Ok(());
+    }
     // `let _ =` on writes: piping into `head` must not panic on a closed pipe.
     if args.list_themes {
         let mut out = stdout().lock();
@@ -91,13 +116,17 @@ fn main() -> Result<()> {
             files.push(p.clone());
         }
     }
-    if args.paths.len() == 1
-        && files.len() == 1
-        && let Some(parent) = std::path::absolute(&files[0])?.parent()
-        && !root.starts_with(parent)
-        && !parent.starts_with(&root)
-    {
-        root = parent.to_path_buf();
+    if args.paths.len() == 1 && files.len() == 1 {
+        let path = std::path::absolute(&files[0])?;
+        let container = termed::archive::member_path(&path).map_or(path, |m| m.archive);
+        if let Some(parent) = container.parent()
+            && !root.starts_with(parent)
+            && !parent.starts_with(&root)
+        {
+            // Settings, plugins and skills need a real workspace directory,
+            // not the virtual parent of an explicitly opened ZIP member.
+            root = parent.to_path_buf();
+        }
     }
 
     let truecolor = std::env::var("COLORTERM")
@@ -110,6 +139,12 @@ fn main() -> Result<()> {
     // Warm up the grammar set so the first frame is instant.
     let _ = highlight::syntax_set();
     let mut app = App::new(root, files, &args.theme, args.nerd_font);
+    if args.router {
+        app.preferences.agent.use_router();
+        app.agent
+            .configure(app.preferences.agent.clone(), String::new())
+            .map_err(anyhow::Error::msg)?;
+    }
 
     if let Some(port) = args.agui_port {
         let _ = termed::agui::spawn_agui_server(port, app.agent.agui.clone());
