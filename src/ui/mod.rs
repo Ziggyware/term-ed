@@ -17,7 +17,7 @@ use crate::app::{App, Focus, Latch, Layout, TOOLBAR_PAGES, Tool};
 use crate::commands::Command;
 use crate::icons;
 use crate::theme::mix;
-use util::{bold, ellipsize, fg, fgbg, fill, put, width};
+use util::{bold, ellipsize, fg, fgbg, fill, put, put_char, width};
 
 pub fn draw(frame: &mut Frame, app: &mut App, truecolor: bool) {
     let area = frame.area();
@@ -188,11 +188,11 @@ fn render_title(buf: &mut Buffer, area: Rect, app: &mut App) {
     let mut x = area.x;
     for (i, ch) in logo.chars().enumerate() {
         let c = mix(pal.logo[0], pal.logo[1], i as f32 / (n - 1.0));
-        x = put(
+        x = put_char(
             buf,
             x,
             area.y,
-            &ch.to_string(),
+            ch,
             bold(fgbg(c, pal.titlebar_bg)),
             area.right(),
         );
@@ -1066,11 +1066,11 @@ fn render_welcome(buf: &mut Buffer, area: Rect, app: &mut App) {
                 } else {
                     mix(c, pal.bg, 0.45)
                 };
-                put(
+                put_char(
                     buf,
                     lx + i as u16,
                     top + row as u16,
-                    &ch.to_string(),
+                    ch,
                     fgbg(c, pal.bg),
                     area.right(),
                 );

@@ -6,7 +6,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 
-use super::util::{fill, put};
+use super::util::{fill, put, put_char};
 use crate::app::{App, Focus};
 use crate::document::Indent;
 use crate::editor::{Editor, LineChange, Seg, char_width};
@@ -22,10 +22,10 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
     let show_numbers = app.settings.line_numbers;
     let focus_editor = app.focus == Focus::Editor;
     app.update_find();
-    let find_matches = if app.find.visible {
-        app.find.matches.clone()
+    let find_matches: &[(usize, usize)] = if app.find.visible {
+        app.find.matches.as_slice()
     } else {
-        Vec::new()
+        &[]
     };
     let find_current = app.find.current;
     let indent_guides = app.settings.indent_guides;
@@ -111,7 +111,11 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
 
     let sel = e.sel;
     let block = e.block;
-    let changes: Vec<LineChange> = e.line_changes().to_vec();
+    let _ = e.line_changes();
+    let changes: &[LineChange] = e
+        .diff_cache
+        .as_ref()
+        .map_or(&[], |(_, cached)| cached.as_slice());
     let bracket_pair = e.bracket_pair();
     let word_refs = reference_ranges(e, h);
     let unit = match e.doc.indent {
@@ -188,7 +192,7 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
             line,
             line_start,
             sel_range: (!sel.is_empty()).then(|| (sel.start(), sel.end())),
-            finds: &find_matches,
+            finds: find_matches,
             find_current,
             refs: &word_refs,
             bracket_pair,
@@ -279,7 +283,7 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
     if minimap_w > 0 {
         render_minimap(buf, minimap, e, &pal, mm_top);
     }
-    render_scrollbar(buf, scrollbar, e, &pal, &find_matches, &changes);
+    render_scrollbar(buf, scrollbar, e, &pal, find_matches, changes);
 
     caret.filter(|_| focus_editor)
 }
@@ -298,6 +302,19 @@ struct LineCtx<'a> {
     render_ws: bool,
     /// Display-column range of a box selection on this line.
     box_cols: Option<(usize, usize)>,
+}
+
+fn put_spaces(buf: &mut Buffer, mut x: u16, y: u16, mut count: usize, style: Style, max_x: u16) {
+    const SPACES: &str = "                                                                ";
+    while count > 0 && x < max_x {
+        let n = count.min(SPACES.len());
+        let next = put(buf, x, y, &SPACES[..n], style, max_x);
+        if next == x {
+            break;
+        }
+        x = next;
+        count -= n;
+    }
 }
 
 /// Draw one visual row: the chars of `seg`, with display column `origin`
@@ -397,19 +414,10 @@ fn draw_line(
 
         // Glyph.
         let show_ws = selected || ctx.render_ws;
-        let glyph: String = match ch {
-            '\t' => {
-                if show_ws {
-                    let mut s = "→".to_string();
-                    s.push_str(&" ".repeat(w.saturating_sub(1)));
-                    s
-                } else {
-                    " ".repeat(w)
-                }
-            }
-            ' ' if show_ws => "·".into(),
-            c if (c as u32) < 0x20 => char::from_u32(0x2400 + c as u32).unwrap_or('?').to_string(),
-            c => c.to_string(),
+        let glyph = match ch {
+            ' ' if show_ws => '·',
+            c if (c as u32) < 0x20 => char::from_u32(0x2400 + c as u32).unwrap_or('?'),
+            c => c,
         };
         if matches!(ch, ' ' | '\t') && show_ws {
             style = style.fg(pal.whitespace);
@@ -418,25 +426,24 @@ fn draw_line(
         // Clip against horizontal scroll.
         if dcol + w > origin {
             if dcol >= origin {
-                put(
-                    buf,
-                    (left + dcol - origin) as u16,
-                    y,
-                    &glyph,
-                    style,
-                    area.right(),
-                );
+                let x = (left + dcol - origin) as u16;
+                if ch == '\t' {
+                    let (x, blanks) = if show_ws {
+                        (
+                            put_char(buf, x, y, '→', style, area.right()),
+                            w.saturating_sub(1),
+                        )
+                    } else {
+                        (x, w)
+                    };
+                    put_spaces(buf, x, y, blanks, style, area.right());
+                } else {
+                    put_char(buf, x, y, glyph, style, area.right());
+                }
             } else {
                 // Partially scrolled-off wide char / tab: paint the visible part blank.
                 let visible = dcol + w - origin;
-                put(
-                    buf,
-                    left as u16,
-                    y,
-                    &" ".repeat(visible),
-                    style,
-                    area.right(),
-                );
+                put_spaces(buf, left as u16, y, visible, style, area.right());
             }
         }
         dcol += w;
@@ -453,7 +460,9 @@ fn reference_ranges(e: &Editor, h: usize) -> Vec<(usize, usize)> {
         return Vec::new();
     };
     let word = e.doc.rope.slice(s..en).to_string();
-    if word.chars().count() < 2 || word.chars().all(|c| c.is_ascii_digit()) {
+    let wchars: Vec<char> = word.chars().collect();
+    let n = wchars.len();
+    if n < 2 || wchars.iter().all(|c| c.is_ascii_digit()) {
         return Vec::new();
     }
     let mut out = Vec::new();
@@ -462,8 +471,6 @@ fn reference_ranges(e: &Editor, h: usize) -> Vec<(usize, usize)> {
         let text = e.doc.line_str(line);
         let base = e.doc.line_start(line);
         let chars: Vec<char> = text.chars().collect();
-        let wchars: Vec<char> = word.chars().collect();
-        let n = wchars.len();
         let mut i = 0;
         while i + n <= chars.len() {
             if chars[i..i + n] == wchars[..] {
@@ -630,11 +637,11 @@ fn render_minimap(buf: &mut Buffer, area: Rect, e: &Editor, pal: &Palette, top: 
             if bits != 0 {
                 let ch = char::from_u32(0x2800 + bits).unwrap_or(' ');
                 let c = mix(color.unwrap_or(pal.fg), row_bg, 0.3);
-                put(
+                put_char(
                     buf,
                     x0 + cx as u16,
                     y,
-                    &ch.to_string(),
+                    ch,
                     Style::default().fg(c).bg(row_bg),
                     area.right(),
                 );

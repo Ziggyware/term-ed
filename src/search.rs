@@ -9,6 +9,7 @@
 //! The walker reuses ripgrep's [`ignore`] crate, so `.gitignore` is honored,
 //! and the search itself is line based, like the editor's find bar.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -70,23 +71,22 @@ impl Query {
 /// One parsed entry of the filter string.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Glob {
-    /// Separators normalized to `/`.
-    text: String,
+    pattern: GlobPattern,
     /// A trailing `/` or `\` in the filter: the pattern names a directory.
     dir: bool,
 }
 
 impl Glob {
-    /// Match a project-relative path. Patterns apply to the file name and to
-    /// the path, and to any trailing part of the path, so `src/*.rs` works
-    /// anywhere in the tree and `*.cs` matches at every depth.
+    /// Match the complete path and every path tail. Testing tails includes the
+    /// file name, so a separate allocation and match for the name is unnecessary.
     fn matches(&self, rel: &str) -> bool {
-        let name = rel.rsplit('/').next().unwrap_or(rel);
-        if glob_match(&self.text, name) || glob_match(&self.text, rel) {
+        let text: Vec<char> = rel.chars().map(fold).collect();
+        if self.pattern.matches_chars(&text) {
             return true;
         }
-        rel.match_indices('/')
-            .any(|(i, _)| glob_match(&self.text, &rel[i + 1..]))
+        text.iter()
+            .enumerate()
+            .any(|(i, c)| *c == '/' && self.pattern.matches_chars(&text[i + 1..]))
     }
 }
 
@@ -227,7 +227,8 @@ fn parse_entries(spec: &str) -> Vec<(bool, Glob)> {
         if text.is_empty() {
             continue;
         }
-        out.push((exclude, Glob { text, dir }));
+        let pattern = GlobPattern::parse(&text);
+        out.push((exclude, Glob { pattern, dir }));
     }
     out
 }
@@ -258,99 +259,235 @@ fn fold(c: char) -> char {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ClassMember {
+    Literal(char),
+    Range(char, char),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum GlobToken {
+    Literal(char),
+    Any,
+    Star,
+    DoubleStar,
+    /// `**/` matches either nothing or any prefix ending in `/`.
+    DoubleStarSlash,
+    Class {
+        negate: bool,
+        members: Vec<ClassMember>,
+    },
+}
+
+impl GlobToken {
+    fn is_variable(&self) -> bool {
+        matches!(
+            self,
+            Self::Star | Self::DoubleStar | Self::DoubleStarSlash
+        )
+    }
+
+    fn matches_one(&self, c: char) -> bool {
+        match self {
+            Self::Literal(want) => c == *want,
+            Self::Any => c != '/',
+            Self::Class { negate, members } => {
+                c != '/'
+                    && members.iter().any(|member| match member {
+                        ClassMember::Literal(want) => c == *want,
+                        ClassMember::Range(start, end) => c >= *start && c <= *end,
+                    }) != *negate
+            }
+            Self::Star | Self::DoubleStar | Self::DoubleStarSlash => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GlobPattern {
+    tokens: Vec<GlobToken>,
+}
+
+impl GlobPattern {
+    fn parse(pattern: &str) -> Self {
+        let chars: Vec<char> = pattern.chars().map(fold).collect();
+        let mut tokens = Vec::with_capacity(chars.len());
+        let mut i = 0;
+        while i < chars.len() {
+            match chars[i] {
+                '*' => {
+                    let start = i;
+                    while i < chars.len() && chars[i] == '*' {
+                        i += 1;
+                    }
+                    if i - start == 1 {
+                        tokens.push(GlobToken::Star);
+                    } else if chars.get(i) == Some(&'/') {
+                        tokens.push(GlobToken::DoubleStarSlash);
+                        i += 1;
+                    } else {
+                        tokens.push(GlobToken::DoubleStar);
+                    }
+                }
+                '?' => {
+                    tokens.push(GlobToken::Any);
+                    i += 1;
+                }
+                '[' => {
+                    if let Some((class, consumed)) = parse_class(&chars[i..]) {
+                        tokens.push(class);
+                        i += consumed;
+                    } else {
+                        tokens.push(GlobToken::Literal('['));
+                        i += 1;
+                    }
+                }
+                c => {
+                    tokens.push(GlobToken::Literal(c));
+                    i += 1;
+                }
+            }
+        }
+        Self { tokens }
+    }
+
+    fn matches(&self, text: &str) -> bool {
+        let text: Vec<char> = text.chars().map(fold).collect();
+        self.matches_chars(&text)
+    }
+
+    /// Rolling NFA simulation: O(pattern × text) time, O(text) space, no
+    /// recursion, and a hard state budget for adversarial filter strings.
+    fn matches_chars(&self, text: &[char]) -> bool {
+        const MAX_STATES: usize = 200_000;
+
+        let Some(first) = self.tokens.iter().position(GlobToken::is_variable) else {
+            return text.len() == self.tokens.len()
+                && self
+                    .tokens
+                    .iter()
+                    .zip(text)
+                    .all(|(token, c)| token.matches_one(*c));
+        };
+        let last = self
+            .tokens
+            .iter()
+            .rposition(GlobToken::is_variable)
+            .unwrap_or(first);
+        let suffix = self.tokens.len() - last - 1;
+        if first + suffix > text.len()
+            || !self.tokens[..first]
+                .iter()
+                .zip(text)
+                .all(|(token, c)| token.matches_one(*c))
+            || !self.tokens[last + 1..]
+                .iter()
+                .zip(&text[text.len() - suffix..])
+                .all(|(token, c)| token.matches_one(*c))
+        {
+            return false;
+        }
+        let tokens = &self.tokens[first..=last];
+        let text = &text[first..text.len() - suffix];
+        let width = text.len() + 1;
+        let mut current = vec![false; width];
+        let mut next = vec![false; width];
+        let mut budget = MAX_STATES;
+        current[0] = true;
+
+        for token in tokens {
+            if width > budget {
+                return false;
+            }
+            budget -= width;
+            next.fill(false);
+            match token {
+                GlobToken::Literal(want) => {
+                    for j in 1..width {
+                        next[j] = current[j - 1] && text[j - 1] == *want;
+                    }
+                }
+                GlobToken::Any => {
+                    for j in 1..width {
+                        next[j] = current[j - 1] && text[j - 1] != '/';
+                    }
+                }
+                GlobToken::Class { negate, members } => {
+                    for j in 1..width {
+                        let c = text[j - 1];
+                        next[j] = current[j - 1]
+                            && c != '/'
+                            && {
+                                let matched = members.iter().any(|member| match member {
+                                    ClassMember::Literal(want) => c == *want,
+                                    ClassMember::Range(start, end) => c >= *start && c <= *end,
+                                });
+                                matched != *negate
+                            };
+                    }
+                }
+                GlobToken::Star => {
+                    next[0] = current[0];
+                    for j in 1..width {
+                        next[j] = current[j] || (text[j - 1] != '/' && next[j - 1]);
+                    }
+                }
+                GlobToken::DoubleStar => {
+                    let mut reachable = false;
+                    for j in 0..width {
+                        reachable |= current[j];
+                        next[j] = reachable;
+                    }
+                }
+                GlobToken::DoubleStarSlash => {
+                    next.copy_from_slice(&current);
+                    let mut reachable = false;
+                    for j in 1..width {
+                        reachable |= current[j - 1];
+                        if text[j - 1] == '/' && reachable {
+                            next[j] = true;
+                        }
+                    }
+                }
+            }
+            std::mem::swap(&mut current, &mut next);
+        }
+        current[text.len()]
+    }
+}
+
+/// Parse a `[...]` class at the front of `pattern`, returning its token and
+/// consumed character count. An unterminated class is handled literally.
+fn parse_class(pattern: &[char]) -> Option<(GlobToken, usize)> {
+    let mut i = 1;
+    let negate = matches!(pattern.get(i), Some('!' | '^'));
+    if negate {
+        i += 1;
+    }
+    let mut members = Vec::new();
+    let mut first = true;
+    while i < pattern.len() {
+        if pattern[i] == ']' && !first {
+            return Some((GlobToken::Class { negate, members }, i + 1));
+        }
+        first = false;
+        if i + 2 < pattern.len() && pattern[i + 1] == '-' && pattern[i + 2] != ']' {
+            members.push(ClassMember::Range(pattern[i], pattern[i + 2]));
+            i += 3;
+        } else {
+            members.push(ClassMember::Literal(pattern[i]));
+            i += 1;
+        }
+    }
+    None
+}
+
 /// Match one glob against one path fragment.
 ///
 /// `*` and `?` never cross a `/`, `**` does, and `[abc]` / `[a-z]` / `[!a-z]`
 /// character classes are supported.
 pub fn glob_match(pattern: &str, text: &str) -> bool {
-    let p: Vec<char> = pattern.chars().map(fold).collect();
-    let t: Vec<char> = text.chars().map(fold).collect();
-    let mut budget = 200_000u32;
-    gm(&p, &t, &mut budget)
-}
-
-fn gm(p: &[char], t: &[char], budget: &mut u32) -> bool {
-    if *budget == 0 {
-        // Pathological pattern: stop rather than hang the editor.
-        return false;
-    }
-    *budget -= 1;
-    let Some(&first) = p.first() else {
-        return t.is_empty();
-    };
-    match first {
-        '*' if p.get(1) == Some(&'*') => {
-            let mut i = 2;
-            while p.get(i) == Some(&'*') {
-                i += 1;
-            }
-            let rest = &p[i..];
-            // `**/` may also match no directory at all, so `**/x` finds `x`.
-            if rest.first() == Some(&'/') && gm(&rest[1..], t, budget) {
-                return true;
-            }
-            (0..=t.len()).any(|k| gm(rest, &t[k..], budget))
-        }
-        '*' => {
-            let rest = &p[1..];
-            let mut k = 0;
-            loop {
-                if gm(rest, &t[k..], budget) {
-                    return true;
-                }
-                if k >= t.len() || t[k] == '/' {
-                    return false;
-                }
-                k += 1;
-            }
-        }
-        '?' => !t.is_empty() && t[0] != '/' && gm(&p[1..], &t[1..], budget),
-        '[' => match class(p, t, budget) {
-            Some(m) => m,
-            // Unterminated class: treat the bracket literally.
-            None => !t.is_empty() && t[0] == '[' && gm(&p[1..], &t[1..], budget),
-        },
-        c => !t.is_empty() && t[0] == c && gm(&p[1..], &t[1..], budget),
-    }
-}
-
-/// Match a `[...]` class at the front of `p`; `None` if it never closes.
-fn class(p: &[char], t: &[char], budget: &mut u32) -> Option<bool> {
-    let mut i = 1;
-    let negate = matches!(p.get(i), Some('!' | '^'));
-    if negate {
-        i += 1;
-    }
-    let mut matched = false;
-    let mut first = true;
-    let mut target = t.first().copied();
-    if target == Some('/') {
-        // A class never matches a path separator (as with `*` and `?`).
-        target = None;
-    }
-    while i < p.len() {
-        if p[i] == ']' && !first {
-            let ok = target.is_some() && matched != negate;
-            let skip = if target.is_some() { 1 } else { 0 };
-            return Some(ok && gm(&p[i + 1..], &t[skip..], budget));
-        }
-        first = false;
-        if i + 2 < p.len() && p[i + 1] == '-' && p[i + 2] != ']' {
-            if let Some(c) = target
-                && c >= p[i]
-                && c <= p[i + 2]
-            {
-                matched = true;
-            }
-            i += 3;
-        } else {
-            if target == Some(p[i]) {
-                matched = true;
-            }
-            i += 1;
-        }
-    }
-    None
+    GlobPattern::parse(pattern).matches(text)
 }
 
 // ================================================================ files
@@ -397,12 +534,11 @@ impl TextFile {
     }
 
     pub fn write(&self, text: &str) -> std::io::Result<()> {
-        let out = if self.crlf && !text.contains("\r\n") {
-            text.replace('\n', "\r\n")
+        if self.crlf && !text.contains("\r\n") {
+            std::fs::write(&self.path, text.replace('\n', "\r\n"))
         } else {
-            text.to_string()
-        };
-        std::fs::write(&self.path, out)
+            std::fs::write(&self.path, text)
+        }
     }
 }
 
@@ -644,13 +780,19 @@ fn collect_hits(out: &mut Results, path: &Path, rel: String, text: &str, re: &Re
     let mut hits = Vec::new();
     'lines: for (line_no, raw) in text.split('\n').enumerate() {
         let line = raw.strip_suffix('\r').unwrap_or(raw);
+        let mut scanned_byte = 0;
+        let mut scanned_char = 0;
         for m in re.find_iter(line).filter(|m| m.start() != m.end()) {
             if out.matches >= MAX_MATCHES || hits.len() >= MAX_MATCHES_PER_FILE {
                 out.truncated = true;
                 break 'lines;
             }
-            let start = line[..m.start()].chars().count();
-            let end = start + line[m.start()..m.end()].chars().count();
+            scanned_char += line[scanned_byte..m.start()].chars().count();
+            let start = scanned_char;
+            let matched_chars = line[m.start()..m.end()].chars().count();
+            let end = start + matched_chars;
+            scanned_char = end;
+            scanned_byte = m.end();
             hits.push(Hit {
                 line: line_no,
                 start,
@@ -692,17 +834,18 @@ pub fn replace_in_text(
         }
         let (new, n) = replace_in_line(line, re, replacement, literal);
         count += n;
-        if n > 0 {
-            out.push_str(&new);
-        } else {
-            out.push_str(line);
-        }
+        out.push_str(new.as_ref());
     }
     (out, count)
 }
 
-fn replace_in_line(line: &str, re: &Regex, replacement: &str, literal: bool) -> (String, usize) {
-    let mut out = String::with_capacity(line.len());
+fn replace_in_line<'a>(
+    line: &'a str,
+    re: &Regex,
+    replacement: &str,
+    literal: bool,
+) -> (Cow<'a, str>, usize) {
+    let mut out = String::new();
     let mut last = 0;
     let mut count = 0;
     for caps in re.captures_iter(line) {
@@ -712,22 +855,23 @@ fn replace_in_line(line: &str, re: &Regex, replacement: &str, literal: bool) -> 
         if m.start() == m.end() {
             continue;
         }
+        if count == 0 {
+            out.reserve(line.len());
+        }
         out.push_str(&line[last..m.start()]);
         if literal {
             out.push_str(replacement);
         } else {
-            let mut dst = String::new();
-            caps.expand(replacement, &mut dst);
-            out.push_str(&dst);
+            caps.expand(replacement, &mut out);
         }
         last = m.end();
         count += 1;
     }
     if count == 0 {
-        return (line.to_string(), 0);
+        return (Cow::Borrowed(line), 0);
     }
     out.push_str(&line[last..]);
-    (out, count)
+    (Cow::Owned(out), count)
 }
 
 /// Replace only the match that starts at `start_char` on `line`. Used by the
@@ -740,24 +884,25 @@ pub fn replace_at(
     replacement: &str,
     literal: bool,
 ) -> Option<String> {
-    for m in re.find_iter(line) {
-        if m.start() == m.end() {
-            continue;
-        }
-        if line[..m.start()].chars().count() != start_char {
-            continue;
-        }
-        let rep = if literal {
-            replacement.to_string()
-        } else {
-            let caps = re.captures_at(line, m.start())?;
-            let mut dst = String::new();
-            caps.expand(replacement, &mut dst);
-            dst
-        };
-        return Some(format!("{}{}{}", &line[..m.start()], rep, &line[m.end()..]));
+    let start_byte = line
+        .char_indices()
+        .map(|(byte, _)| byte)
+        .chain(std::iter::once(line.len()))
+        .nth(start_char)?;
+    let m = re.find_at(line, start_byte)?;
+    if m.start() != start_byte || m.start() == m.end() {
+        return None;
     }
-    None
+    let mut out = String::with_capacity(line.len().saturating_add(replacement.len()));
+    out.push_str(&line[..m.start()]);
+    if literal {
+        out.push_str(replacement);
+    } else {
+        let caps = re.captures_at(line, m.start())?;
+        caps.expand(replacement, &mut out);
+    }
+    out.push_str(&line[m.end()..]);
+    Some(out)
 }
 
 // ================================================================ tests
@@ -812,6 +957,44 @@ mod tests {
     }
 
     #[test]
+    fn glob_double_star_slash_and_malformed_classes_are_total() {
+        assert!(glob_match("src/**/main.rs", "src/main.rs"));
+        assert!(glob_match("src/**/main.rs", "src/a/b/main.rs"));
+        assert!(!glob_match("src/**/main.rs", "src/a/b/main.rs.bak"));
+        assert!(glob_match("**/*.rs", "main.rs"));
+        assert!(glob_match("é?", "é界"));
+        assert!(!glob_match("?", "/"));
+        assert!(glob_match("[]]", "]"));
+        assert!(glob_match("[abc", "[abc"));
+    }
+
+    #[test]
+    fn long_literal_globs_bypass_the_wildcard_budget() {
+        let literal = "a".repeat(1_000);
+        assert!(glob_match(&literal, &literal));
+        assert!(glob_match(&format!("*{literal}"), &literal));
+    }
+
+    #[test]
+    fn adversarial_globs_stop_within_the_state_budget() {
+        let pattern = "*a".repeat(1_000);
+        assert!(!glob_match(&pattern, &"a".repeat(999)));
+    }
+
+    #[test]
+    fn hit_columns_advance_once_through_unicode_lines() {
+        let mut out = Results::default();
+        let re = Regex::new("é").unwrap();
+        collect_hits(&mut out, Path::new("unicode.txt"), "unicode.txt".into(), "aé éé", &re);
+        let columns: Vec<(usize, usize)> = out.files[0]
+            .matches
+            .iter()
+            .map(|hit| (hit.start, hit.end))
+            .collect();
+        assert_eq!(columns, vec![(1, 2), (3, 4), (4, 5)]);
+    }
+
+    #[test]
     fn exclusions_apply_at_any_depth() {
         let f = FilterSet::parse("!build/");
         assert!(!f.matches_file("build/out.js"));
@@ -840,6 +1023,11 @@ mod tests {
             "foo bar foo"
         );
         assert!(replace_at("foo", 2, &re, "bar", true).is_none());
+        assert_eq!(
+            replace_at("é foo foo", 6, &re, "bar", true).unwrap(),
+            "é foo bar"
+        );
+        assert!(replace_at("foo", usize::MAX, &re, "bar", true).is_none());
     }
 
     #[test]

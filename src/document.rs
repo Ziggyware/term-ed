@@ -1,5 +1,6 @@
 //! Text document: a rope buffer plus undo/redo history and file metadata.
 
+use std::borrow::Cow;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -281,10 +282,10 @@ impl Document {
         self.commit();
         let path = self.path.clone().context("document has no path")?;
         let baseline = self.rope.to_string();
-        let text = if self.line_ending == LineEnding::CrLf {
-            baseline.replace('\n', "\r\n")
+        let text: Cow<'_, str> = if self.line_ending == LineEnding::CrLf {
+            Cow::Owned(baseline.replace('\n', "\r\n"))
         } else {
-            baseline.clone()
+            Cow::Borrowed(&baseline)
         };
         let member = crate::archive::member_path(&path);
         if self.archive_stamp.is_some() && member.is_none() {
@@ -308,7 +309,8 @@ impl Document {
             {
                 fs::create_dir_all(parent)?;
             }
-            fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+            fs::write(&path, text.as_bytes())
+                .with_context(|| format!("writing {}", path.display()))?;
         }
         self.saved_text = baseline;
         self.saved_rev = self.rev;
