@@ -3,6 +3,7 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::theme::{mix, rgb};
@@ -21,12 +22,18 @@ pub fn fill(buf: &mut Buffer, area: Rect, bg: Color) {
 
 /// Write `s` at (x, y), clipped at `max_x`. Returns the x after the text.
 pub fn put(buf: &mut Buffer, x: u16, y: u16, s: &str, style: Style, max_x: u16) -> u16 {
-    if x >= max_x || y >= buf.area.bottom() || x < buf.area.left() {
+    let max_x = max_x.min(buf.area.right());
+    if x >= max_x || x < buf.area.left() || y < buf.area.top() || y >= buf.area.bottom() {
         return x;
     }
-    let max_x = max_x.min(buf.area.right());
     let (nx, _) = buf.set_stringn(x, y, s, (max_x - x) as usize, style);
     nx
+}
+
+/// Write one glyph through its stack-encoded UTF-8 representation.
+pub fn put_char(buf: &mut Buffer, x: u16, y: u16, c: char, style: Style, max_x: u16) -> u16 {
+    let mut encoded = [0; 4];
+    put(buf, x, y, c.encode_utf8(&mut encoded), style, max_x)
 }
 
 pub fn width(s: &str) -> u16 {
@@ -68,33 +75,53 @@ pub fn shadow(buf: &mut Buffer, area: Rect) {
     }
 }
 
-/// Greedy word wrap to `max` columns (long words are hard-broken).
+/// Greedy word wrap to `max` terminal columns. Long words are hard-broken at
+/// grapheme boundaries; an individually wider grapheme remains intact.
 pub fn wrap_text(s: &str, max: usize) -> Vec<String> {
     let max = max.max(1);
     let mut lines = Vec::new();
     let mut cur = String::new();
+    let mut cur_width = 0usize;
     for word in s.split_whitespace() {
-        let mut word = word.to_string();
+        let mut rest = word;
+        let mut rest_width = UnicodeWidthStr::width(rest);
         loop {
-            let cw = UnicodeWidthStr::width(cur.as_str());
-            let ww = UnicodeWidthStr::width(word.as_str());
-            let need = if cur.is_empty() { ww } else { cw + 1 + ww };
-            if need <= max {
-                if !cur.is_empty() {
+            let separator = usize::from(!cur.is_empty());
+            let needed = cur_width
+                .saturating_add(separator)
+                .saturating_add(rest_width);
+            if needed <= max {
+                if separator == 1 {
                     cur.push(' ');
+                    cur_width += 1;
                 }
-                cur.push_str(&word);
+                cur.push_str(rest);
+                cur_width += rest_width;
                 break;
             }
             if !cur.is_empty() {
                 lines.push(std::mem::take(&mut cur));
+                cur_width = 0;
                 continue;
             }
-            // Word longer than a whole line.
-            let cut: String = word.chars().take(max).collect();
-            word = word.chars().skip(max).collect();
-            lines.push(cut);
-            if word.is_empty() {
+
+            let mut cut = 0;
+            let mut cut_width = 0usize;
+            for (index, grapheme) in rest.grapheme_indices(true) {
+                let grapheme_width = UnicodeWidthStr::width(grapheme);
+                if cut_width > 0 && cut_width.saturating_add(grapheme_width) > max {
+                    break;
+                }
+                cut = index + grapheme.len();
+                cut_width = cut_width.saturating_add(grapheme_width);
+                if cut_width >= max {
+                    break;
+                }
+            }
+            lines.push(rest[..cut].to_string());
+            rest = &rest[cut..];
+            rest_width = rest_width.saturating_sub(cut_width);
+            if rest.is_empty() {
                 break;
             }
         }
@@ -114,14 +141,14 @@ pub fn ellipsize(s: &str, max: usize) -> String {
         return String::new();
     }
     let mut out = String::new();
-    let mut w = 0;
-    for c in s.chars() {
-        let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-        if w + cw + 1 > max {
+    let mut w = 0usize;
+    for grapheme in s.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if w.saturating_add(grapheme_width).saturating_add(1) > max {
             break;
         }
-        out.push(c);
-        w += cw;
+        out.push_str(grapheme);
+        w += grapheme_width;
     }
     out.push('…');
     out
@@ -162,4 +189,31 @@ fn to_256(c: Color) -> Color {
     } else {
         cube
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrapping_hard_breaks_by_display_columns() {
+        assert_eq!(wrap_text("界界界", 4).join("|"), "界界|界");
+        assert_eq!(wrap_text("abcdef", 3).join("|"), "abc|def");
+        assert!(wrap_text("ab 界界界 cd", 4)
+            .iter()
+            .all(|line| UnicodeWidthStr::width(line.as_str()) <= 4));
+    }
+
+    #[test]
+    fn wrapping_and_ellipsizing_preserve_graphemes() {
+        let grapheme = "e\u{301}";
+        assert_eq!(
+            wrap_text(&format!("{grapheme}{grapheme}"), 1).join("|"),
+            format!("{grapheme}|{grapheme}")
+        );
+        assert_eq!(
+            ellipsize(&format!("{grapheme}xy"), 2),
+            format!("{grapheme}…")
+        );
+    }
 }

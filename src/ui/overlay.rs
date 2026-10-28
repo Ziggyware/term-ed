@@ -7,7 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, BorderType, Borders, Widget};
 use unicode_width::UnicodeWidthChar;
 
-use super::util::{bold, ellipsize, fg, fgbg, fill, put, shadow, width, wrap_text};
+use super::util::{bold, ellipsize, fg, fgbg, fill, put, put_char, shadow, width, wrap_text};
 use crate::app::{App, Focus, PaletteMode, ToastKind};
 use crate::icons;
 use crate::theme::mix;
@@ -332,7 +332,7 @@ pub fn render_palette(buf: &mut Buffer, screen: Rect, app: &mut App) -> Option<P
             } else {
                 fgbg(pal.popup_fg, bg)
             };
-            x = put(buf, x, y, &ch.to_string(), st, max_x);
+            x = put_char(buf, x, y, ch, st, max_x);
         }
         if p.mode == PaletteMode::Themes && *label == app.theme.name {
             put(buf, x + 1, y, "✓", fgbg(pal.success, bg), max_x);
@@ -598,7 +598,7 @@ fn put_hit_text(
         }
         let off = i - from;
         let st = if off >= s && off < e { hl } else { base };
-        let nx = put(buf, cx, y, &ch.to_string(), st, max_x);
+        let nx = put_char(buf, cx, y, *ch, st, max_x);
         cx = if nx > cx { nx } else { cx + 1 };
     }
 }
