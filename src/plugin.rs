@@ -1097,6 +1097,12 @@ mod tests {
 
     #[test]
     fn bundled_plugins_are_embedded_and_written() {
+        if crate::test_support::isolate_unit(
+            module_path!(),
+            "bundled_plugins_are_embedded_and_written",
+        ) {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("termed-bundled-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // SAFETY: single-threaded test setting an env var for this process.
@@ -1114,6 +1120,9 @@ mod tests {
 
     #[test]
     fn plugin_runs_and_talks_json_rpc() {
+        if crate::test_support::isolate_unit(module_path!(), "plugin_runs_and_talks_json_rpc") {
+            return;
+        }
         let root = std::env::temp_dir().join(format!("termed-plugin-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let dir = root.join(".termed/plugins/echo");
@@ -1184,6 +1193,9 @@ for line in sys.stdin:
     /// really edits the buffer. Runs the files from the repo, not the cache.
     #[test]
     fn text_tools_sorts_the_buffer() {
+        if crate::test_support::isolate_unit(module_path!(), "text_tools_sorts_the_buffer") {
+            return;
+        }
         let dir = Path::new("plugins/text-tools");
         if !dir.is_dir() {
             return; // not running from the crate root

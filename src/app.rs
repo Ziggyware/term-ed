@@ -400,7 +400,6 @@ pub struct Layout {
 pub enum AgentTarget {
     OpenFile(PathBuf, Option<u32>),
     Permission(usize, String),
-    Install,
     Retry,
     NewChat,
     Close,
@@ -545,6 +544,15 @@ impl App {
         if let Some(error) = config_error {
             app.management.load_error = Some(error.clone());
             app.toast(format!("Settings not loaded: {error}"), ToastKind::Error);
+        } else if crate::config::user_settings_path().exists()
+            && crate::config::settings_path(&root).exists()
+            && search::absolute_path(&crate::config::user_settings_path())
+                != search::absolute_path(&crate::config::settings_path(&root))
+        {
+            app.toast(
+                "User settings active; legacy workspace restrictions and settings are not applied",
+                ToastKind::Info,
+            );
         }
         for f in files {
             app.open_file(&f);
@@ -1710,7 +1718,9 @@ impl App {
                 .available
                 .iter()
                 .map(|a| {
-                    let hint = if a.free {
+                    let hint = if a.builtin {
+                        "built-in · provider configured in AI settings"
+                    } else if a.free {
                         "free, no account"
                     } else {
                         "may need sign-in"
@@ -2018,11 +2028,22 @@ impl App {
                     .cloned()
                 {
                     let mut prefs = self.preferences.clone();
-                    prefs.agent.backend = if spec.builtin {
-                        "builtin".into()
+                    let custom = std::env::var("TERMED_AGENT").ok().filter(|command| {
+                        let args = crate::plugin::split_command(command);
+                        args.first() == Some(&spec.program)
+                            && args.get(1..) == Some(spec.args.as_slice())
+                    });
+                    if spec.builtin {
+                        prefs.agent.backend = "builtin".into();
+                    } else if let Some(command) = custom {
+                        // A display name derived from TERMED_AGENT is not a
+                        // discoverable backend after the environment changes.
+                        // Persist the command itself for future launches.
+                        prefs.agent.backend = "custom".into();
+                        prefs.agent.command = command;
                     } else {
-                        spec.name
-                    };
+                        prefs.agent.backend = spec.name;
+                    }
                     if let Err(e) = self.save_preferences(prefs) {
                         self.toast(format!("Agent settings: {e:#}"), ToastKind::Error);
                         return;
@@ -3611,9 +3632,9 @@ impl App {
     }
 }
 
-/// OpenCode's free models: Big Pickle and the "-free" variants.
+/// Recognize provider model IDs explicitly marked as free.
 pub fn is_free_model(value: &str) -> bool {
-    value.contains("free") || value.ends_with("big-pickle")
+    value.contains("free")
 }
 
 impl App {
@@ -3808,7 +3829,6 @@ impl App {
                 }
             }
             AgentTarget::Permission(i, opt) => self.agent.choose(i, Some(&opt)),
-            AgentTarget::Install => self.agent.install(),
             AgentTarget::Retry => {
                 self.agent.available = agent::detect_agents();
                 if self.agent.spec.is_none() {

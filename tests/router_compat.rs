@@ -1,5 +1,7 @@
 //! End-to-end provider compatibility without using a live router credential.
 
+mod common;
+
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -19,6 +21,9 @@ impl Drop for Server {
 
 #[test]
 fn router_compatible_provider_handles_json_and_streamed_tool_calls() {
+    if common::isolate("router_compatible_provider_handles_json_and_streamed_tool_calls") {
+        return;
+    }
     if let Some(root) = std::env::var_os("TERMED_COMPAT_CHILD_ROOT") {
         let root = PathBuf::from(root);
         let port = std::env::var("TERMED_COMPAT_PORT").unwrap();
@@ -27,6 +32,7 @@ fn router_compatible_provider_handles_json_and_streamed_tool_calls() {
         let mut prefs = Preferences::default();
         prefs.agent = AgentConfig {
             backend: "builtin".into(),
+            provider: "custom".into(),
             endpoint: format!("http://127.0.0.1:{port}/v1"),
             api_key_env: "TERMED_COMPAT_TEST_KEY".into(),
             model: "free:code".into(),

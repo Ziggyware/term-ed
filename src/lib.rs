@@ -32,3 +32,6 @@ pub mod supervision;
 pub mod theme;
 pub mod tool_bridge;
 pub mod ui;
+
+#[cfg(test)]
+mod test_support;

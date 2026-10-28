@@ -1,6 +1,8 @@
 //! End-to-end: the agent panel against a scripted ACP agent
 //! (tests/fixtures/fake_acp_agent.py) through the real UI and protocol.
 
+mod common;
+
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -64,6 +66,9 @@ fn tap(app: &mut App, x: u16, y: u16) {
 
 #[test]
 fn agent_edits_land_in_the_editor_as_undoable_changes() {
+    if common::isolate("agent_edits_land_in_the_editor_as_undoable_changes") {
+        return;
+    }
     if std::process::Command::new("python3")
         .arg("--version")
         .output()
@@ -132,7 +137,7 @@ fn agent_edits_land_in_the_editor_as_undoable_changes() {
         "inline diff shown"
     );
     assert!(s.contains("free"), "free badge/usage shown");
-    assert_eq!(app.agent.model_label().as_deref(), Some("Big Pickle"));
+    assert_eq!(app.agent.model_label().as_deref(), Some("First free"));
 
     // The edit is on disk and in the buffer, saved, with change bars...
     assert_eq!(

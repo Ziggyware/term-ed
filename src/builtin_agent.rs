@@ -1,9 +1,8 @@
-//! termed's built-in coding agent: no install, no account, no API key.
+//! termed's built-in coding agent: no external agent installation required.
 //!
-//! It talks to the free models of Kilo Gateway (an OpenAI-compatible API
-//! that allows anonymous use of its `:free` models, rate-limited per IP) and
-//! runs a small tool-using agent loop: list, read, search, edit and create
-//! files, and run commands (each command needs your approval).
+//! It defaults to the authenticated NoKey Router and can also use compatible
+//! model providers. Its tool loop can list, read, search, edit and create files,
+//! and run commands (each command needs your approval).
 //!
 //! It is pure Rust, so it works anywhere termed runs — including Termux on
 //! Android, where Node/Bun-based agents can't be installed. It speaks the same

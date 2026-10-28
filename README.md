@@ -8,20 +8,18 @@ A terminal code editor that looks and feels like the Visual Studio C# editor, fo
 |---|---|
 | ![Command palette](docs/command-palette.png) | ![Find and replace](docs/find-neon.png) |
 
-## AI agent (free, no setup)
-
-![The agent panel fixing a bug with OpenCode's free model](docs/agent.png)
+## Built-in AI agent
 
 Press `Ctrl+K A`, click **✦ Agent** in the title bar, or tap **✦** on a phone. Then ask in plain words, or tap one of the suggestions ("Find bugs in calc.py"). The agent can read and edit your project:
 
-- **Free by default, nothing to install.** termed has a built-in agent, **termed AI**, written in Rust. It uses the free models of [Kilo Gateway](https://kilo.ai/docs/gateway/authentication), which allows anonymous use of its `:free` models with no account and no API key. Because it needs nothing else installed, it also works in **Termux on Android**. It can list, read, search, edit and create files, and run commands; every command asks for your approval first.
-- **OpenCode, if you have it.** On desktop, if [OpenCode](https://opencode.ai) is installed, termed uses it by default through the [Agent Client Protocol](https://agentclientprotocol.com); its free models also need no account. You can switch between agents with *Agent: Choose Agent*. On Android, OpenCode's npm package doesn't install, so termed AI is the default there.
-- **Free models are busy sometimes.** Shared models can be rate-limited, and one task can take several requests. The built-in agent reports provider failures and tries eligible fallback models before executing a completed tool batch; model requests have a 120-second transport bound. Overwatch enforces a 150-second idle limit and a five-minute root deadline by default, including for NoKey Router. Waiting for children or approval is not an idle stall. Tap the model name to choose one yourself; set `TERMED_FREE_MODEL` to change the legacy built-in starting model.
+- **Built-in by default, nothing to install.** termed AI is written in Rust and uses the [NoKey Router](https://nokey-router.ziggyware.deno.net) at its pinned `/v1` endpoint, with `free:code` as the default model. The client needs a router API key: choose **Settings → AI agent configuration → Save Router API Key** or run `termed --router-login` locally. See [router setup](docs/router-and-supervision.md). The agent can list, read, search, edit and create files, and commands ask for your approval by default.
+- **Settings follow you.** Menu changes save to your user configuration directory, so the same built-in AI, model and preferences are used when you open another folder. Legacy workspace settings are imported only if no user settings exist; read the [migration and safety notes](docs/agent-configuration.md#user-settings-and-migration).
+- **Free models are busy sometimes.** Availability, rate limits and tool support depend on the router and its upstreams. The agent reports provider failures; model requests have a 120-second transport bound. Overwatch enforces a 150-second idle limit and a five-minute root deadline by default. Waiting for children or approval is not an idle stall. Tap the model name to choose another supported model.
 - **Privacy.** Your prompt, the open file and the files the agent reads are sent to the free model's provider. Free models may log or train on what they receive, so don't use them with secrets or confidential code.
 - **You stay in control.** The agent's edits appear in your open files as normal edits with change bars, and one Ctrl+Z (↶) reverts an edit. Diffs show inline in the chat, and tapping a change opens the file at that spot. If the agent asks permission to run a tool, you tap Allow or Reject (or press 1–3).
 - **Context is automatic.** The open file, and your selection if there is one, are attached to every message (shown as `@ file.py:12-20` above the prompt). Unsaved files are saved first so the agent sees your latest code.
 - **Esc or ■ stops the agent and its task tree.** Partial edits remain for review; Stop resets the provider session, so restate essential context before continuing. + New starts a fresh chat.
-- **Other agents work too.** Gemini CLI (`gemini --acp`), Claude Code (`claude-agent-acp`) and Codex (`codex-acp`) are detected automatically if installed; pick one with *Agent: Choose Agent*. Note that these generally need a sign-in or paid plan. Any other ACP agent works with `TERMED_AGENT="command args"`, and `TERMED_AGENT=builtin` forces the built-in agent.
+- **Other agents work too.** Installed Gemini CLI (`gemini --acp`), Claude Code (`claude-agent-acp`) and Codex (`codex-acp`) can be selected with *Agent: Choose Agent*; they are not chosen automatically over the built-in agent and may require their own sign-in. Other ACP agents can be configured as a custom command. `TERMED_AGENT="command args"` supplies an explicit command when settings have not already selected a backend/provider.
 - **On a phone** the panel is a full-screen sheet above the touch keyboard ([screenshot](docs/agent-phone.png)).
 
 ## On a phone
@@ -109,8 +107,8 @@ Regex mode supports capture groups in the replacement (`$1`, `${name}`). Matches
 
 Open **Settings** in the desktop title bar or press **Ctrl+,**. The command palette also has **Agent: Configure AI Agent**, **Agent: Manage Sub-agents** and **Skills: Manage Skills**; on a phone, open them through **⋯**. The agent panel's **⚙** button opens AI settings.
 
-- **Persistent workspace preferences:** display options plus AI backend, model, OpenAI-compatible API URL, API-key environment variable, instructions, context, step budgets and command/plugin permissions. Menu changes save to `.termed/settings.json`, layered over user defaults.
-- **NoKey Router:** save the key through **Save Router API Key** in AI settings; this also selects the built-in router for the workspace. The key stays outside workspace settings and is sent only to the pinned HTTPS router. Alternatively, run `termed --router-login` locally, then start with `termed --router` or select **Use NoKey Router** in AI settings.
+- **Persistent user preferences:** display options plus AI backend, model, OpenAI-compatible API URL, API-key environment variable, instructions, context, step budgets and command/plugin permissions. Menu changes save to `$XDG_CONFIG_HOME/termed/settings.json` (normally `~/.config/termed/settings.json`) across folders.
+- **NoKey Router:** save the key through **Save Router API Key** in AI settings; this also selects the built-in router in user settings. The key stays in a separate private user-local file and is sent only to the pinned HTTPS router. Alternatively, run `termed --router-login` locally; `--router` is a launch-only override.
 - **On-the-fly functions:** agents can define schema-validated pure JSON/text transformation functions and call them immediately. These are task-scoped, resource-bounded implementations, not arbitrary generated code execution.
 - **AI plugin tools:** the AI can discover permitted plugins and request an exact command. Every invocation asks for approval, waits for the real result and returns messages plus live-buffer state. Edits stay undoable and unsaved. External ACP agents receive an authenticated stdio MCP bridge when they support MCP servers.
 - **Configurable sub-agents:** create and manage isolated built-in specialists with their own role, model, skills, budgets and permissions. Reviewer, Test planner and Coordinator start read-only. The coordinator can delegate to grandchildren within depth, task and deadline limits; the visible overwatch ledger tracks every result and cancels orphaned subtrees.
@@ -135,7 +133,7 @@ termed -t "Termed Studio" release.zip/src/main.rs # open a ZIP member
 termed --mobile src/main.rs # force the phone layout
 ```
 
-On Android, install [Termux](https://termux.dev), run `pkg install rust git clang`, then `cargo install --path .`. The AI agent works there out of the box.
+On Android, install [Termux](https://termux.dev), run `pkg install rust git clang`, then `cargo install --path .`. The built-in AI agent also works there after router key setup.
 
 You need a terminal with truecolor support to get the full look (Windows Terminal, iTerm2, WezTerm, kitty, Alacritty, GNOME Terminal and others). termed detects `COLORTERM=truecolor` and falls back to 256 colors when it isn't set; set `TERMED_TRUECOLOR=1` to force truecolor. Pass `--nerd-font` (or set `TERMED_NERD_FONT=1`) to use Nerd Font file icons.
 
@@ -210,7 +208,7 @@ src/
   builtin_agent.rs  built-in agent: free models over an OpenAI-compatible API, file/search/command tools
   search.rs       find/replace in files: roots, glob filters, walk, replacements
   plugin.rs       plugin host: manifests, JSON-RPC subprocesses, discovery, manager
-  config.rs       validated user/workspace preferences and inherited agent restrictions
+  config.rs       validated user preferences, legacy migration and inherited agent restrictions
   management.rs   settings, plugin, specialist and skill menus
   skills.rs       Markdown skill discovery, management and prompt context
   automation.rs   approved plugin tools, pinned buffers and bounded specialist sessions
@@ -233,4 +231,4 @@ cargo run --example snapshot -- out.html 150x42 "Visual Studio Dark" . src/main.
 cargo run --example snapshot -- phone.html 46x30 "Visual Studio Dark" . src/main.rs -- tap:1,0 swipeup:20,10 resize:100x24
 ```
 
-Validation in the restricted environment: **152 tests passed**, plus an all-targets check and build in a GitHub-sourced offline dependency harness. Real loopback HTTPS tests cover Bearer authentication, redaction and redirect refusal; a live authenticated router task and the production locked-dependency build remain unverified. See the [current verification details](docs/router-and-supervision.md#verification-and-remaining-checks) and [earlier asset verification notes](docs/assets-and-interface.md#verification).
+Tests use Python 3 for local ACP/provider fixtures; some HTTPS integration tests also require OpenSSL. Run the locked build and tests on each target platform before release.

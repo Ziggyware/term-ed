@@ -2,25 +2,25 @@
 
 ## Connect once, without putting the key in chat
 
-The built-in Rust agent supports **https://nokey-router.ziggyware.deno.net/v1**.
-The router requires `ROUTER_API_KEY` even though its upstream routing uses free
-models. No new external agent install is needed.
+The built-in Rust agent defaults to **https://nokey-router.ziggyware.deno.net/v1**
+and the `free:code` model. termed requires a `ROUTER_API_KEY`, even though the
+router's upstream routing uses free models. No external agent install is needed.
 
 **In the editor:**
 
 1. Open **Settings → AI agent configuration** (or the agent panel's **⚙**).
 2. Choose **Save Router API Key…**, enter/paste the raw key in the masked field,
    then press Enter. Esc cancels without saving. The editor saves the credential
-   locally and selects the built-in NoKey Router for this workspace, retaining
+   locally and selects the built-in NoKey Router in your user settings, retaining
    your other permissions/budgets and an already-selected router model. Do not
    put the secret in the separate **API key environment variable** field.
 3. Send a task. Authentication and provider failures appear in the transcript;
    saving a key does not validate it or start a model request.
 
-If selecting the router fails because workspace settings cannot be saved, the
+If selecting the router fails because user settings cannot be saved, the
 editor reports that separately: the key is still saved locally. Fix the settings
-and choose **Use NoKey Router**. That action can also switch an existing workspace
-to the router without re-entering the key. It selects `builtin` + `router` +
+and choose **Use NoKey Router**. That action can also switch an existing
+configuration to the router without re-entering the key. It selects `builtin` + `router` +
 `free:code` and preserves your other permissions/budgets.
 
 **From a local terminal:**
@@ -32,8 +32,8 @@ termed --router-logout   # remove the saved key and exit
 ```
 
 `--router-login` also imports an already exported `ROUTER_API_KEY`, or reads stdin
-when piped. It does not change a workspace's settings; launch with `--router` or
-choose **Use NoKey Router** in that workspace. There is deliberately **no
+when piped. It does not change settings; the router is the default, or you can
+launch with `--router` or choose **Use NoKey Router** if you selected another provider. There is deliberately **no
 key-valued command-line argument**. An existing nonempty `ROUTER_API_KEY` takes
 precedence over the saved key at runtime; the editor warns if that override is
 active when saving a key. Removing the saved file does not unset the override.
@@ -116,7 +116,7 @@ root→coordinator→reviewer tree; it contains **no secret**:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "agent": {
     "backend": "builtin",
     "provider": "router",
@@ -264,20 +264,7 @@ user-approved command/plugin workflow.
 
 ## Verification and remaining checks
 
-The current **152-test** application suite, all-targets check and build pass in
-an isolated Linux offline harness using actual source files. Tests include a
-router-shaped SSE fixture with generated functions, a coordinator/grandchild,
-inherited project rules and skills, updated unsaved buffers, plus cancellation,
-stalls, deadlines, approval/host-wait exemptions, orphan cleanup, CLI/local
-credential resolution, masked UI,
-credential aliases and real loopback HTTPS Bearer/auth-redaction/redirect checks.
-Python 3 and OpenSSL are needed for the integration fixtures.
-
-The production `Cargo.toml`/`Cargo.lock` were not relaxed for this work. The
-sandbox cannot fetch crates.io; the harness substitutes GitHub-sourced dependency
-versions and some feature/compatibility settings. Its Rustls transport **is**
-enabled, but this is not a locked production build. No real router key was
-provided, so authenticated live routing/model behavior remains unverified.
 Run `cargo test --locked`, CI/lints and a real authenticated router task before
-release. Compiler caches, vendored sources, test certificates and binaries are
-not part of this change.
+release. The automated integration fixtures use Python 3 and OpenSSL for local
+mock providers and HTTPS; those tests do not verify the deployed router or an
+actual account.

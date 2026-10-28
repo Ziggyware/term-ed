@@ -102,6 +102,7 @@ mod tests {
         assert_eq!(c.backend, "builtin");
         assert!(router_models().iter().any(|(id, _)| id == "free:code"));
         let c = AgentConfig {
+            provider: "custom".into(),
             endpoint: "http://example.invalid/v1/".into(),
             ..Default::default()
         };

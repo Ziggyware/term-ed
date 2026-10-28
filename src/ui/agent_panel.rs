@@ -258,46 +258,26 @@ fn build_rows(app: &App, w: usize, panel_bg: Color) -> Vec<Row> {
     let name = a.name();
 
     match &a.state {
-        State::NoAgent | State::Installing => {
+        State::NoAgent => {
             rows.push(Row::blank());
             rows.push(Row::text(
-                "✦ AI agent",
+                "✦ No AI agent is selected",
                 bold(Style::default().fg(pal.logo[0])),
             ));
             rows.push(Row::blank());
-            for l in wrap_text(
-                "termed uses OpenCode: free AI models, no account and no API key needed.",
+            for line in wrap_text(
+                "Select the built-in agent in AI settings; no external agent installation is needed.",
                 w,
             ) {
-                rows.push(Row::text(l, Style::default().fg(pal.fg)));
+                rows.push(Row::text(line, dim));
             }
             rows.push(Row::blank());
-            if a.state == State::Installing {
-                rows.push(Row::text(
-                    format!("{} Installing OpenCode…", spinner()),
-                    Style::default().fg(pal.accent),
-                ));
-            } else {
-                let label = " ⇣ Install OpenCode (free) ";
-                rows.push(Row {
-                    spans: vec![(label.into(), bold(fgbg(pal.accent_fg, pal.accent)))],
-                    buttons: vec![(0, width(label), AgentTarget::Install)],
-                    ..Default::default()
-                });
-            }
-            rows.push(Row::blank());
-            for l in &a.install_log {
-                for c in chunk(l, w) {
-                    rows.push(Row::text(c, dim));
-                }
-            }
-            rows.push(Row::blank());
-            for l in wrap_text(
-                "Any Agent Client Protocol agent works too (Gemini CLI, Claude Code, Codex): install it, or set TERMED_AGENT to its command.",
-                w,
-            ) {
-                rows.push(Row::text(l, dim));
-            }
+            let label = " ⚙ AI settings ";
+            rows.push(Row {
+                spans: vec![(label.into(), bold(fgbg(pal.accent_fg, pal.accent)))],
+                buttons: vec![(0, width(label), AgentTarget::Settings)],
+                ..Default::default()
+            });
             return rows;
         }
         State::Failed(msg) => {
@@ -336,10 +316,12 @@ fn build_rows(app: &App, w: usize, panel_bg: Color) -> Vec<Row> {
         }
         if a.spec.as_ref().is_some_and(|s| s.builtin) {
             rows.push(Row::blank());
-            for l in wrap_text(
-                "Free models via Kilo Gateway: no account or key. What you send may be logged by the model provider, so avoid secrets.",
-                w,
-            ) {
+            let privacy = if a.options.uses_router() {
+                "NoKey Router uses your configured router key. Prompts and project content are sent to the model provider; avoid sharing secrets."
+            } else {
+                "Prompts and project content are sent to the configured model provider; avoid sharing secrets."
+            };
+            for l in wrap_text(privacy, w) {
                 rows.push(Row::text(l, dim));
             }
         }
@@ -668,7 +650,7 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
     let right = " ⚙  + New  ✕ ";
     let rx = head.right().saturating_sub(width(right));
     if let Some(label) = app.agent.model_label() {
-        // "OpenCode Zen/Big Pickle" -> "Big Pickle".
+        // Shorten a provider-qualified model label for compact panels.
         let label = label.rsplit('/').next().unwrap_or(&label).to_string();
         let free = app.agent.model.as_deref().is_some_and(is_free_model);
         let room = rx.saturating_sub(x + 3) as usize;

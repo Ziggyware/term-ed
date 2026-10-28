@@ -1,6 +1,8 @@
 //! Find/Replace in Files: the glob filter language, project search and
 //! replacement, plus the panel driven through the real key handler.
 
+mod common;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -70,6 +72,9 @@ fn rels(app: &App) -> Vec<String> {
 
 #[test]
 fn query_options_build_the_expected_regex() {
+    if common::isolate("query_options_build_the_expected_regex") {
+        return;
+    }
     let q = Query {
         text: "CONSOLE".into(),
         ..Default::default()
@@ -98,6 +103,9 @@ fn query_options_build_the_expected_regex() {
 
 #[test]
 fn search_uses_gitignore_style_walk_and_the_glob_filter() {
+    if common::isolate("search_uses_gitignore_style_walk_and_the_glob_filter") {
+        return;
+    }
     let root = project("filter");
     let filter = FilterSet::parse(r"*.cs*;!*.csproj;!bin\");
     let results = search(&root, &Query::new("class"), &filter, &HashMap::new()).unwrap();
@@ -137,6 +145,9 @@ fn search_uses_gitignore_style_walk_and_the_glob_filter() {
 
 #[test]
 fn unsaved_editor_text_is_searched() {
+    if common::isolate("unsaved_editor_text_is_searched") {
+        return;
+    }
     let root = project("overrides");
     let path = root.join("src/Widget.cs");
     let mut overrides = HashMap::new();
@@ -156,6 +167,9 @@ fn unsaved_editor_text_is_searched() {
 
 #[test]
 fn replace_in_text_keeps_crlf_when_writing() {
+    if common::isolate("replace_in_text_keeps_crlf_when_writing") {
+        return;
+    }
     let root = project("crlf");
     let path = root.join("src/Crlf.cs");
     std::fs::write(&path, "class A { }\r\nclass B { }\r\n").unwrap();
@@ -176,6 +190,9 @@ fn replace_in_text_keeps_crlf_when_writing() {
 
 #[test]
 fn panel_searches_filters_opens_and_replaces() {
+    if common::isolate("panel_searches_filters_opens_and_replaces") {
+        return;
+    }
     let root = project("app");
     let mut app = App::new(
         root.clone(),
@@ -253,6 +270,9 @@ fn panel_searches_filters_opens_and_replaces() {
 
 #[test]
 fn revert_undoes_an_in_memory_replace() {
+    if common::isolate("revert_undoes_an_in_memory_replace") {
+        return;
+    }
     let root = project("undo");
     let mut app = App::new(
         root.clone(),
@@ -296,6 +316,9 @@ fn revert_undoes_an_in_memory_replace() {
 
 #[test]
 fn panel_renders_title_results_and_status() {
+    if common::isolate("panel_renders_title_results_and_status") {
+        return;
+    }
     let root = project("render");
     let mut app = App::new(
         root.clone(),
@@ -315,6 +338,9 @@ fn panel_renders_title_results_and_status() {
 
 #[test]
 fn panel_fits_the_compact_phone_layout() {
+    if common::isolate("panel_fits_the_compact_phone_layout") {
+        return;
+    }
     let root = project("compact");
     let mut app = App::new(
         root.clone(),
@@ -335,6 +361,9 @@ fn panel_fits_the_compact_phone_layout() {
 
 #[test]
 fn root_and_directory_boxes_scope_the_search() {
+    if common::isolate("root_and_directory_boxes_scope_the_search") {
+        return;
+    }
     let root = project("scope");
     let mut app = App::new(
         root.clone(),
@@ -386,6 +415,9 @@ fn root_and_directory_boxes_scope_the_search() {
 
 #[test]
 fn panel_renders_the_root_and_filter_rows() {
+    if common::isolate("panel_renders_the_root_and_filter_rows") {
+        return;
+    }
     let root = project("rows");
     let mut app = App::new(
         root.clone(),
@@ -409,6 +441,9 @@ fn panel_renders_the_root_and_filter_rows() {
 
 #[test]
 fn directory_scopes_reach_nested_and_wildcard_paths() {
+    if common::isolate("directory_scopes_reach_nested_and_wildcard_paths") {
+        return;
+    }
     let root = project("nested-glob");
     let nested = root.join("packages/app/src/deep");
     std::fs::create_dir_all(&nested).unwrap();
@@ -441,6 +476,10 @@ fn directory_scopes_reach_nested_and_wildcard_paths() {
 
 #[test]
 fn open_buffers_include_ignored_and_not_yet_created_files_without_duplicates() {
+    if common::isolate("open_buffers_include_ignored_and_not_yet_created_files_without_duplicates")
+    {
+        return;
+    }
     let root = project("new-ignored-buffers");
     std::fs::write(root.join(".gitignore"), "ignored.cs\n").unwrap();
     std::fs::write(root.join("ignored.cs"), "old disk content\n").unwrap();
@@ -490,6 +529,9 @@ fn open_buffers_include_ignored_and_not_yet_created_files_without_duplicates() {
 
 #[test]
 fn pasted_query_replaces_the_prefilled_selection() {
+    if common::isolate("pasted_query_replaces_the_prefilled_selection") {
+        return;
+    }
     let root = project("paste-selected");
     let mut app = App::new(
         root.clone(),
@@ -507,6 +549,9 @@ fn pasted_query_replaces_the_prefilled_selection() {
 
 #[test]
 fn search_from_the_phone_agent_sheet_is_visible() {
+    if common::isolate("search_from_the_phone_agent_sheet_is_visible") {
+        return;
+    }
     let root = project("phone-agent");
     let mut app = App::new(
         root.clone(),
@@ -526,6 +571,9 @@ fn search_from_the_phone_agent_sheet_is_visible() {
 
 #[test]
 fn unreadable_roots_report_an_error_instead_of_a_clean_empty_result() {
+    if common::isolate("unreadable_roots_report_an_error_instead_of_a_clean_empty_result") {
+        return;
+    }
     let root = project("missing-root").join("not-there");
     let result = search(
         &root,

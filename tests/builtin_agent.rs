@@ -1,6 +1,8 @@
 //! The built-in agent end to end, against a local mock of the free gateway:
 //! streaming, a tool call that edits a file, and failover after HTTP 429.
 
+mod common;
+
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -13,6 +15,9 @@ use termed::commands::Command as Cmd;
 
 #[test]
 fn builtin_agent_edits_files_and_fails_over_on_rate_limit() {
+    if common::isolate("builtin_agent_edits_files_and_fails_over_on_rate_limit") {
+        return;
+    }
     let fixture =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mock_free_gateway.py");
     let Ok(mut server) = Command::new("python3")
@@ -46,6 +51,12 @@ fn builtin_agent_edits_files_and_fails_over_on_rate_limit() {
         "Visual Studio Dark",
         false,
     );
+    // This fixture exercises the optional legacy free gateway, not the new
+    // default authenticated router.
+    let mut options = app.preferences.agent.clone();
+    options.provider = "kilo".into();
+    app.preferences.agent = options.clone();
+    app.agent.configure(options, String::new()).unwrap();
     assert_eq!(app.agent.name(), "termed AI");
     app.run(Cmd::AgentToggle);
     for c in "fix add".chars() {
