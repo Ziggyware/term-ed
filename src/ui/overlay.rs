@@ -84,8 +84,23 @@ pub fn render_palette(buf: &mut Buffer, screen: Rect, app: &mut App) -> Option<P
         .unwrap_or((0, 0));
     let compact = app.compact;
     // Rows taken at the bottom by the toolbar and status bar.
-    let reserved = 1 + u16::from(app.toolbar_visible());
+    let reserved = 1 + if app.toolbar_visible() { 2 } else { 0 };
+    let edit = app.management.edit.clone();
     let p = app.palette.as_mut()?;
+    let managed = matches!(
+        p.mode,
+        PaletteMode::Settings
+            | PaletteMode::AgentSettings
+            | PaletteMode::SubAgents
+            | PaletteMode::SubAgentSettings
+            | PaletteMode::Skills
+            | PaletteMode::SkillActions
+            | PaletteMode::PluginActions
+            | PaletteMode::PluginCommands
+            | PaletteMode::ConfirmRemoveSkill
+            | PaletteMode::ConfirmRemoveSubAgent
+    );
+    let footer_h = if managed { 3 } else { 0 };
     // Phones: edge-to-edge sheet just under the title bar.
     let (w, x, top) = if compact {
         let w = screen.width.saturating_sub(2).max(10);
@@ -98,11 +113,20 @@ pub fn render_palette(buf: &mut Buffer, screen: Rect, app: &mut App) -> Option<P
     };
     let list_rows = match p.mode {
         PaletteMode::GotoLine | PaletteMode::SaveAs => 1,
-        _ => (p.filtered.len() as u16)
-            .clamp(1, 14)
-            .min(screen.height.saturating_sub(top + 4 + reserved).max(1)),
+        PaletteMode::Input => 4.min(
+            screen
+                .height
+                .saturating_sub(top + 4 + reserved + footer_h)
+                .max(1),
+        ),
+        _ => (p.filtered.len() as u16).clamp(1, 14).min(
+            screen
+                .height
+                .saturating_sub(top + 4 + reserved + footer_h)
+                .max(1),
+        ),
     };
-    let h = list_rows + 4;
+    let h = list_rows + 4 + footer_h;
     let r = Rect::new(x, top, w, h);
     let title = match p.mode {
         PaletteMode::Commands => "Command Palette",
@@ -113,6 +137,21 @@ pub fn render_palette(buf: &mut Buffer, screen: Rect, app: &mut App) -> Option<P
         PaletteMode::AgentModels => "Agent Model",
         PaletteMode::AgentPicker => "AI Agent",
         PaletteMode::SaveAs => "Save As",
+        PaletteMode::Plugins | PaletteMode::PluginActions | PaletteMode::PluginCommands => {
+            "Plugins"
+        }
+        PaletteMode::Settings => "Settings · Workspace",
+        PaletteMode::AgentSettings => "AI Agent Configuration",
+        PaletteMode::SubAgents | PaletteMode::SubAgentSettings => {
+            "Sub-agents · Built-in Specialists"
+        }
+        PaletteMode::Skills | PaletteMode::SkillActions => "Skills",
+        PaletteMode::Input => edit
+            .as_ref()
+            .map(|e| e.title.as_str())
+            .unwrap_or("Edit Setting"),
+        PaletteMode::ConfirmRemoveSkill => "Delete Skill?",
+        PaletteMode::ConfirmRemoveSubAgent => "Delete Sub-agent?",
     };
     panel(buf, r, pal.accent, pal.popup_bg, Some(title));
 
@@ -126,6 +165,8 @@ pub fn render_palette(buf: &mut Buffer, screen: Rect, app: &mut App) -> Option<P
         PaletteMode::AgentModels => ("✦", "Choose a model (free ones first)"),
         PaletteMode::AgentPicker => ("✦", "Choose an AI agent"),
         PaletteMode::SaveAs => ("⤓", "path/relative/to/project"),
+        PaletteMode::Input => ("›", "Enter a value; empty restores the default"),
+        _ => ("⚙", "Filter options · ↑↓ · Enter to select · Esc to close"),
     };
     let iy = r.y + 1;
     let field = Rect::new(r.x + 2, iy, r.width.saturating_sub(4), 1);
@@ -139,16 +180,39 @@ pub fn render_palette(buf: &mut Buffer, screen: Rect, app: &mut App) -> Option<P
         field.right(),
     );
     let px = field.x + width(prompt) + 2;
+    let secret = p.mode == PaletteMode::Input && edit.as_ref().is_some_and(|e| e.secret);
+    let masked = if secret {
+        "•".repeat(p.input.chars().count())
+    } else {
+        String::new()
+    };
+    let display = if secret {
+        masked.as_str()
+    } else {
+        p.input.as_str()
+    };
+    let cursor = if secret {
+        p.input[..p.cursor].chars().count() * "•".len()
+    } else {
+        p.cursor
+    };
     let caret = input(
         buf,
         Rect::new(px, iy, field.right().saturating_sub(px + 1), 1),
-        &p.input,
-        p.cursor,
+        display,
+        cursor,
         placeholder,
         pal.popup_fg,
         pal.popup_dim,
         pal.input_bg,
     );
+    if p.input_selected {
+        for x in px..field.right().saturating_sub(1) {
+            if let Some(cell) = buf.cell_mut((x, iy)) {
+                cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
+            }
+        }
+    }
     // Separator.
     let sep = "─".repeat(r.width.saturating_sub(2) as usize);
     put(
@@ -163,6 +227,25 @@ pub fn render_palette(buf: &mut Buffer, screen: Rect, app: &mut App) -> Option<P
     let list = Rect::new(r.x + 1, iy + 2, r.width.saturating_sub(2), list_rows);
     app.layout.palette_list = list;
     match p.mode {
+        PaletteMode::Input => {
+            let hint = edit.as_ref().map(|e| e.hint.as_str()).unwrap_or("");
+            let text = format!("Enter: save · Esc: cancel · Ctrl+A: select all\n{hint}");
+            for (row, line) in wrap_text(&text, list.width.saturating_sub(4) as usize)
+                .into_iter()
+                .take(list_rows as usize)
+                .enumerate()
+            {
+                put(
+                    buf,
+                    list.x + 2,
+                    list.y + row as u16,
+                    &line,
+                    fgbg(pal.popup_dim, pal.popup_bg),
+                    list.right(),
+                );
+            }
+            return Some(caret);
+        }
         PaletteMode::GotoLine => {
             let msg = format!(
                 "Current line: {cur_line} of {total_lines}. Type a line number between 1 and {total_lines}."
@@ -232,11 +315,14 @@ pub fn render_palette(buf: &mut Buffer, screen: Rect, app: &mut App) -> Option<P
             label.clone()
         };
         // Keyboard hints are noise on a phone and steal width from the label.
-        let hint = if compact && matches!(p.mode, PaletteMode::Commands | PaletteMode::Files) {
+        let hint = if managed
+            || (compact && matches!(p.mode, PaletteMode::Commands | PaletteMode::Files))
+        {
             String::new()
         } else {
             hint
         };
+        let hint = ellipsize(&hint, (list.width / 3) as usize);
         let hint_w = if hint.is_empty() { 0 } else { width(&hint) + 3 };
         let max_x = list.right().saturating_sub(hint_w + 1);
         for (ci, ch) in display.chars().enumerate() {
@@ -259,6 +345,37 @@ pub fn render_palette(buf: &mut Buffer, screen: Rect, app: &mut App) -> Option<P
                 fgbg(pal.popup_dim, bg)
             };
             put(buf, hx, y, &format!(" {hint} "), st, list.right());
+        }
+    }
+    if managed {
+        let y = list.bottom();
+        put(
+            buf,
+            list.x + 1,
+            y,
+            &"─".repeat(list.width.saturating_sub(2) as usize),
+            fgbg(pal.border, pal.popup_bg),
+            list.right(),
+        );
+        let hint = p
+            .filtered
+            .get(p.selected)
+            .and_then(|item| p.hints.get(item.index))
+            .map(String::as_str)
+            .unwrap_or("");
+        for (row, line) in wrap_text(hint, list.width.saturating_sub(4) as usize)
+            .into_iter()
+            .take(2)
+            .enumerate()
+        {
+            put(
+                buf,
+                list.x + 2,
+                y + 1 + row as u16,
+                &line,
+                fgbg(pal.popup_dim, pal.popup_bg),
+                list.right(),
+            );
         }
     }
     // Count badge.
@@ -728,8 +845,13 @@ pub fn render_search(buf: &mut Buffer, editor: Rect, app: &mut App) -> Option<Po
             )
         } else if app.search.query.is_empty() {
             "Type a query to search every file in the project".to_string()
+        } else if let Some(error) = results.warnings.first() {
+            format!("Search incomplete: {error}")
         } else if results.matches == 0 {
-            "No results".to_string()
+            format!(
+                "No results · {} files scanned (check root and filters)",
+                results.scanned
+            )
         } else {
             let mut s = format!(
                 "{} match{} in {} file{}",
@@ -755,6 +877,8 @@ pub fn render_search(buf: &mut Buffer, editor: Rect, app: &mut App) -> Option<Po
     };
     let sc = if app.search.error || app.search.missing_root {
         pal.error
+    } else if !app.search.results.warnings.is_empty() {
+        pal.warning
     } else {
         pal.popup_dim
     };

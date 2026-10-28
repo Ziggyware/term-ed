@@ -406,3 +406,133 @@ fn panel_renders_the_root_and_filter_rows() {
     let ids: Vec<u8> = app.layout.search_fields.iter().map(|(_, id)| *id).collect();
     assert_eq!(ids, vec![0, 2, 3, 4]);
 }
+
+#[test]
+fn directory_scopes_reach_nested_and_wildcard_paths() {
+    let root = project("nested-glob");
+    let nested = root.join("packages/app/src/deep");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(nested.join("Nested.cs"), "class Nested {}\n").unwrap();
+    for dirs in ["src", "**/src", "packages/*/src", "packages/**/src"] {
+        let results = search(
+            &root,
+            &Query::new("class"),
+            &FilterSet::parse_parts(dirs, "*.cs"),
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert!(
+            results
+                .files
+                .iter()
+                .any(|f| f.rel == "packages/app/src/deep/Nested.cs"),
+            "scope {dirs}: {results:?}"
+        );
+    }
+    let results = search(
+        &root,
+        &Query::new("class"),
+        &FilterSet::parse_parts("src;!deep", "*.cs"),
+        &HashMap::new(),
+    )
+    .unwrap();
+    assert!(!results.files.iter().any(|f| f.rel.ends_with("Nested.cs")));
+}
+
+#[test]
+fn open_buffers_include_ignored_and_not_yet_created_files_without_duplicates() {
+    let root = project("new-ignored-buffers");
+    std::fs::write(root.join(".gitignore"), "ignored.cs\n").unwrap();
+    std::fs::write(root.join("ignored.cs"), "old disk content\n").unwrap();
+    let buffers = HashMap::from([
+        (
+            root.join("ignored.cs"),
+            "needle from ignored buffer\n".into(),
+        ),
+        (root.join("new.cs"), "needle from new buffer\n".into()),
+        (
+            root.join("src/../src/Widget.cs"),
+            "needle from normalized buffer\n".into(),
+        ),
+        (
+            root.parent().unwrap().join("outside.cs"),
+            "needle outside project\n".into(),
+        ),
+    ]);
+    let result = search(
+        &root.join("src/.."),
+        &Query::new("needle"),
+        &FilterSet::parse("*.cs"),
+        &buffers,
+    )
+    .unwrap();
+    assert_eq!(result.matches, 3);
+    assert_eq!(
+        result
+            .files
+            .iter()
+            .map(|f| f.rel.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ignored.cs", "new.cs", "src/Widget.cs"]
+    );
+    let result = search(
+        &root,
+        &Query::new("needle"),
+        &FilterSet::parse("*.cs;!ignored.cs"),
+        &buffers,
+    )
+    .unwrap();
+    assert_eq!(
+        result.matches, 2,
+        "open buffers must still honor explicit filters"
+    );
+}
+
+#[test]
+fn pasted_query_replaces_the_prefilled_selection() {
+    let root = project("paste-selected");
+    let mut app = App::new(
+        root.clone(),
+        vec![root.join("src/Program.cs")],
+        "Visual Studio Dark",
+        false,
+    );
+    app.editor_mut().unwrap().sel = termed::document::Selection { anchor: 0, head: 5 };
+    app.run(Command::FindInFiles);
+    assert!(app.search.query_selected);
+    app.handle_event(Event::Paste("Console".into()));
+    assert_eq!(app.search.query, "Console");
+    assert_eq!(app.search.results.matches, 2);
+}
+
+#[test]
+fn search_from_the_phone_agent_sheet_is_visible() {
+    let root = project("phone-agent");
+    let mut app = App::new(
+        root.clone(),
+        vec![root.join("src/Program.cs")],
+        "Visual Studio Dark",
+        false,
+    );
+    app.set_compact(true);
+    app.run(Command::AgentToggle);
+    app.run(Command::FindInFiles);
+    assert!(!app.show_agent);
+    type_text(&mut app, "Console");
+    let mut term = Terminal::new(TestBackend::new(46, 30)).unwrap();
+    term.draw(|f| termed::ui::draw(f, &mut app, true)).unwrap();
+    assert!(screen(&term).contains("Find in Files"));
+}
+
+#[test]
+fn unreadable_roots_report_an_error_instead_of_a_clean_empty_result() {
+    let root = project("missing-root").join("not-there");
+    let result = search(
+        &root,
+        &Query::new("class"),
+        &FilterSet::default(),
+        &HashMap::new(),
+    )
+    .unwrap();
+    assert!(!result.warnings.is_empty());
+}

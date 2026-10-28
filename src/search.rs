@@ -195,12 +195,10 @@ impl FilterSet {
         if self.dir_excludes.iter().any(|g| hits_path(rel, g)) {
             return false;
         }
-        if self.dir_includes.is_empty() {
-            return true;
-        }
-        // Descend when the folder is inside a scope, or on the way to one
-        // (`src` scopes the walk, so `src/app` must stay reachable).
-        self.dir_includes.iter().any(|g| dir_reaches(rel, g))
+        // Includes match *any path tail*. A directory that does not match
+        // yet can still contain a match (nested/src, src/**/tests, etc.).
+        // Only exclusions are safe to prune; matches_file applies scopes.
+        true
     }
 }
 
@@ -232,21 +230,6 @@ fn parse_entries(spec: &str) -> Vec<(bool, Glob)> {
         out.push((exclude, Glob { text, dir }));
     }
     out
-}
-
-/// Is the directory `rel` the include pattern itself, inside it, or on the
-/// way to it? (`src` scopes the walk, so the walker may enter `src/app`.)
-fn dir_reaches(rel: &str, g: &Glob) -> bool {
-    if g.matches(rel) || in_dir(rel, g) {
-        return true;
-    }
-    // A plain (wildcard-free) pattern can be reached by walking into its
-    // leading folders. Globs are matched against folders as we go instead.
-    if g.text.contains(['*', '?', '[']) {
-        return false;
-    }
-    let prefix = format!("{rel}/");
-    g.text.starts_with(&prefix) || rel.is_empty()
 }
 
 /// `a/b/c.txt` -> `["a", "a/b"]`.
@@ -384,24 +367,33 @@ pub struct TextFile {
 
 impl TextFile {
     pub fn read(path: &Path) -> Option<Self> {
-        let meta = std::fs::metadata(path).ok()?;
+        Self::read_checked(path).ok().flatten()
+    }
+
+    pub fn read_checked(path: &Path) -> std::io::Result<Option<Self>> {
+        if crate::credentials::is_private_path(path) {
+            return Ok(None);
+        }
+        let meta = std::fs::metadata(path)?;
         if meta.len() > MAX_FILE_BYTES {
-            return None;
+            return Ok(None);
         }
-        let bytes = std::fs::read(path).ok()?;
+        let bytes = std::fs::read(path)?;
         if looks_binary(&bytes) {
-            return None;
+            return Ok(None);
         }
-        let mut text = String::from_utf8(bytes).ok()?;
+        let Ok(mut text) = String::from_utf8(bytes) else {
+            return Ok(None);
+        };
         let crlf = text.contains("\r\n");
         if crlf {
             text = text.replace("\r\n", "\n");
         }
-        Some(Self {
+        Ok(Some(Self {
             path: path.to_path_buf(),
             text,
             crlf,
-        })
+        }))
     }
 
     pub fn write(&self, text: &str) -> std::io::Result<()> {
@@ -435,7 +427,7 @@ pub fn relative(root: &Path, path: &Path) -> String {
 pub fn resolve_root(project: &Path, input: &str) -> PathBuf {
     let t = input.trim();
     if t.is_empty() || t == "." {
-        return project.to_path_buf();
+        return absolute_path(project);
     }
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
@@ -453,10 +445,18 @@ pub fn resolve_root(project: &Path, input: &str) -> PathBuf {
     } else {
         project.join(expanded)
     };
-    normalize(&joined)
+    absolute_path(&joined)
 }
 
-/// Fold `.` and `..` without touching the filesystem (the path may not exist).
+/// Stable absolute identity for roots and open buffers. Canonicalize existing
+/// paths (including symlinked project roots), but keep new unsaved paths usable.
+pub fn absolute_path(p: &Path) -> PathBuf {
+    let p = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+    let p = normalize(&p);
+    p.canonicalize().unwrap_or(p)
+}
+
+/// Fold `.` and `..` without walking above an absolute filesystem root.
 fn normalize(p: &Path) -> PathBuf {
     use std::path::Component;
     let mut out = PathBuf::new();
@@ -464,7 +464,9 @@ fn normalize(p: &Path) -> PathBuf {
         match c {
             Component::CurDir => {}
             Component::ParentDir => {
-                if !out.pop() {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else if !out.has_root() {
                     out.push("..");
                 }
             }
@@ -521,6 +523,8 @@ pub struct Results {
     pub scanned: usize,
     /// A cap was hit; there may be more matches.
     pub truncated: bool,
+    /// Up to three filesystem errors, rather than silently reporting no hits.
+    pub warnings: Vec<String>,
 }
 
 impl Results {
@@ -543,93 +547,129 @@ pub fn search(
     }
     let re = query.compile()?;
 
-    let walk_root = root.to_path_buf();
+    let root = absolute_path(root);
+    let overrides: HashMap<PathBuf, &String> = overrides
+        .iter()
+        .map(|(p, text)| (absolute_path(p), text))
+        .collect();
+    let walk_root = root.clone();
     let walk_filter = filter.clone();
-    let mut builder = WalkBuilder::new(root);
+    let mut builder = WalkBuilder::new(&root);
     builder
         .hidden(false)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
         .require_git(false)
+        .sort_by_file_path(|a, b| a.cmp(b))
         .filter_entry(move |e| {
-            if e.file_name() == ".git" {
+            if e.file_name() == ".git" || crate::credentials::is_private_path(e.path()) {
                 return false;
             }
             if e.depth() > 0 && e.file_type().is_some_and(|t| t.is_dir()) {
-                let rel = relative(&walk_root, e.path());
-                return walk_filter.allows_dir(&rel);
+                return walk_filter.allows_dir(&relative(&walk_root, e.path()));
             }
             true
         });
 
-    for entry in builder.build().flatten() {
-        if !entry.file_type().is_some_and(|t| t.is_file()) {
+    // Search open buffers first, even if they are new, ignored or no longer
+    // on disk. They must not be lost behind the disk-walk file limit.
+    let mut open: Vec<_> = overrides.keys().collect();
+    open.sort();
+    for path in open {
+        if !path.starts_with(&root) || crate::credentials::is_private_path(path) {
             continue;
         }
-        let path = entry.path();
-        let rel = relative(root, path);
-        if !filter.matches_file(&rel) {
+        let rel = relative(&root, path);
+        if rel.split('/').any(|part| part == ".git") || !filter.matches_file(&rel) {
             continue;
         }
-        if entry.metadata().is_ok_and(|m| m.len() > MAX_FILE_BYTES) {
+        let text = overrides[path];
+        if text.len() as u64 > MAX_FILE_BYTES {
             continue;
         }
-        let text = match overrides.get(path) {
-            Some(t) => t.clone(),
-            None => match TextFile::read(path) {
-                Some(f) => f.text,
-                None => continue,
-            },
-        };
-        out.scanned += 1;
-        if out.scanned > MAX_FILES {
-            out.truncated = true;
+        collect_hits(&mut out, path, rel, text, &re);
+        if out.matches >= MAX_MATCHES {
             break;
         }
-        let mut hits = Vec::new();
-        for (line_no, raw) in text.split('\n').enumerate() {
-            let line = raw.strip_suffix('\r').unwrap_or(raw);
-            if hits.len() >= MAX_MATCHES_PER_FILE {
+    }
+    if out.matches < MAX_MATCHES {
+        for entry in builder.build() {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    if out.warnings.len() < 3 {
+                        out.warnings.push(e.to_string());
+                    }
+                    continue;
+                }
+            };
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
+                continue;
+            }
+            let path = entry.path();
+            if overrides.contains_key(&absolute_path(path)) {
+                continue;
+            }
+            let rel = relative(&root, path);
+            if !filter.matches_file(&rel) {
+                continue;
+            }
+            if out.scanned >= MAX_FILES {
                 out.truncated = true;
                 break;
             }
-            for m in re.find_iter(line) {
-                if m.start() == m.end() {
-                    continue; // empty match: nothing to show or replace
+            let file = match TextFile::read_checked(path) {
+                Ok(Some(file)) => file,
+                Ok(None) => continue,
+                Err(e) => {
+                    if out.warnings.len() < 3 {
+                        out.warnings.push(format!("{}: {e}", path.display()));
+                    }
+                    continue;
                 }
-                let start = line[..m.start()].chars().count();
-                let end = start + line[m.start()..m.end()].chars().count();
-                hits.push(Hit {
-                    line: line_no,
-                    start,
-                    end,
-                    text: line.to_string(),
-                });
-                out.matches += 1;
-                if out.matches >= MAX_MATCHES || hits.len() >= MAX_MATCHES_PER_FILE {
-                    out.truncated = true;
-                    break;
-                }
-            }
-            if out.truncated && (out.matches >= MAX_MATCHES || hits.len() >= MAX_MATCHES_PER_FILE) {
+            };
+            collect_hits(&mut out, path, rel, &file.text, &re);
+            if out.matches >= MAX_MATCHES {
                 break;
             }
-        }
-        if !hits.is_empty() {
-            out.files.push(FileHits {
-                path: path.to_path_buf(),
-                rel,
-                matches: hits,
-            });
-        }
-        if out.matches >= MAX_MATCHES {
-            out.truncated = true;
-            break;
         }
     }
     out.files.sort_by(|a, b| a.rel.cmp(&b.rel));
     Ok(out)
+}
+
+fn collect_hits(out: &mut Results, path: &Path, rel: String, text: &str, re: &Regex) {
+    out.scanned += 1;
+    let mut hits = Vec::new();
+    'lines: for (line_no, raw) in text.split('\n').enumerate() {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        for m in re.find_iter(line).filter(|m| m.start() != m.end()) {
+            if out.matches >= MAX_MATCHES || hits.len() >= MAX_MATCHES_PER_FILE {
+                out.truncated = true;
+                break 'lines;
+            }
+            let start = line[..m.start()].chars().count();
+            let end = start + line[m.start()..m.end()].chars().count();
+            hits.push(Hit {
+                line: line_no,
+                start,
+                end,
+                text: line.to_string(),
+            });
+            out.matches += 1;
+        }
+    }
+    if !hits.is_empty() {
+        out.files.push(FileHits {
+            path: path.to_path_buf(),
+            rel,
+            matches: hits,
+        });
+    }
+    if out.matches >= MAX_MATCHES {
+        out.truncated = true;
+    }
 }
 
 // ================================================================ replace
@@ -820,11 +860,12 @@ mod tests {
         assert!(!f.matches_file("tests/main.rs"));
         assert!(f.allows_dir("src"));
         assert!(f.allows_dir("src/a"));
-        assert!(!f.allows_dir("tests"));
+        // A nonmatching folder can contain a nested src/ scope.
+        assert!(f.allows_dir("tests"));
         // On the way to a scope, the walker may descend.
         let f = FilterSet::parse_parts("src/app", "*");
         assert!(f.allows_dir("src"));
-        assert!(!f.allows_dir("tests"));
+        assert!(f.allows_dir("tests"));
 
         // `!` in the directory box excludes; globs work there too.
         let f = FilterSet::parse_parts("!**/generated", "*.rs");

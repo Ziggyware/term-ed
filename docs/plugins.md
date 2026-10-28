@@ -167,3 +167,22 @@ Notes:
   ignores stderr unless the plugin exits with an error.
 - The plugin process is started on first use and kept for the session.
   Disabling a plugin or quitting termed stops it.
+
+## AI access
+
+The Plugins title-bar menu / **Ctrl+Alt+P** now opens each plugin's command and
+AI-access menu. Enabled, runnable plugins can be discovered with `list_plugins`
+and executed with `run_plugin` by the built-in agent or through the editor's
+authenticated MCP relay for external ACP agents. Every AI invocation requires
+Allow Once; disabled, denied, missing or incompatible commands are rejected.
+
+`run_plugin` accepts optional object `arguments` (passed as `params.arguments`)
+and an optional workspace `file`. The host pins the target buffer while handling
+editor callbacks, waits for the command's JSON-RPC result, and returns messages
+and the resulting unsaved buffer. AI callers can use `read_editor` for fresh
+in-memory state. Plugin errors, error toasts, exits and timeouts propagate as
+tool failures. Plugin edits remain ordinary undoable editor changes.
+
+Plugins execute with the user's local account privileges; this protocol and
+approval flow are not a sandbox. See [agent configuration](agent-configuration.md)
+for allowlists, inherited worker restrictions, lifecycle and transport details.

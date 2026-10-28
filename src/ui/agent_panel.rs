@@ -665,7 +665,7 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
             .agent_targets
             .push((Rect::new(nx, inner.y, x - nx, 1), AgentTarget::PickAgent));
     }
-    let right = " + New  ✕ ";
+    let right = " ⚙  + New  ✕ ";
     let rx = head.right().saturating_sub(width(right));
     if let Some(label) = app.agent.model_label() {
         // "OpenCode Zen/Big Pickle" -> "Big Pickle".
@@ -692,6 +692,11 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
             .agent_targets
             .push((Rect::new(mx, inner.y, x - mx, 1), AgentTarget::Model));
     }
+    put(buf, rx, inner.y, " ⚙ ", fgbg(pal.fg, head_bg), head.right());
+    app.layout
+        .agent_targets
+        .push((Rect::new(rx, inner.y, 3, 1), AgentTarget::Settings));
+    let rx = rx + 3;
     put(
         buf,
         rx,
@@ -728,11 +733,60 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
     let ctx_h = u16::from(ctx.is_some());
     let box_top = inner.bottom().saturating_sub(input_h + 1);
     let ctx_y = box_top.saturating_sub(ctx_h);
+    let records: Vec<_> = app
+        .automation
+        .overwatch
+        .records
+        .iter()
+        .filter(|r| r.turn == app.automation.overwatch.turn)
+        .collect();
+    let overwatch_h = u16::from(app.automation.overwatch.owned_turn || !records.is_empty());
+    if overwatch_h > 0 {
+        let live = records.iter().filter(|r| !r.status.terminal()).count();
+        let waiting = records
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.status,
+                    crate::supervision::Status::WaitingChild
+                        | crate::supervision::Status::WaitingPermission
+                )
+            })
+            .count();
+        let done = records
+            .iter()
+            .filter(|r| r.status == crate::supervision::Status::Completed)
+            .count();
+        let failed = records.len().saturating_sub(live + done);
+        let remaining = app
+            .automation
+            .overwatch
+            .root_deadline
+            .map(|d| {
+                format!(
+                    " · {}s",
+                    d.saturating_duration_since(std::time::Instant::now())
+                        .as_secs()
+                )
+            })
+            .unwrap_or_default();
+        let label = format!(
+            "Overwatch{remaining} · {live} workers · {waiting} wait · {done} done · {failed} stopped"
+        );
+        put(
+            buf,
+            inner.x + 1,
+            inner.y + 1,
+            &ellipsize(&label, inner.width.saturating_sub(2) as usize),
+            fgbg(pal.accent, panel_bg),
+            inner.right(),
+        );
+    }
     let body = Rect::new(
         inner.x,
-        inner.y + 1,
+        inner.y + 1 + overwatch_h,
         inner.width,
-        ctx_y.saturating_sub(inner.y + 1),
+        ctx_y.saturating_sub(inner.y + 1 + overwatch_h),
     );
 
     // Transcript.

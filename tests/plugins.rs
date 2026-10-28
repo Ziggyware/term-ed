@@ -362,6 +362,25 @@ fn disabled_plugins_are_remembered() {
 }
 
 #[test]
+fn failed_plugin_preference_writes_leave_the_live_plugin_enabled() {
+    let _guard = lock();
+    let root = project("toggle-write-error");
+    write_upper_plugin(&root);
+    let config = root.join("not-a-config-directory");
+    std::fs::write(&config, "a file blocks the configuration directory").unwrap();
+    let mut host = with_config_home(&config, || Host::new(root.clone()));
+    let pi = host.plugins.iter().position(|p| p.name == "upper").unwrap();
+    assert!(host.try_set_enabled(pi, false).is_err());
+    assert!(host.plugins[pi].enabled);
+    assert!(
+        host.commands()
+            .iter()
+            .any(|(_, _, title)| title.contains("upper"))
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn the_host_api_answers_the_documented_methods() {
     let _guard = lock();
     let root = project("api");

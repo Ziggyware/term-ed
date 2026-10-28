@@ -13,16 +13,20 @@ use ratatui::layout::{Position, Rect};
 use regex::{Regex, RegexBuilder};
 use serde_json::{Value, json};
 
-use crate::agent::{self, Agent, AgentEvent, State as AgentState};
+use crate::agent::{self, Agent, State as AgentState};
+use crate::automation::{Automation, Source};
 use crate::clipboard::Clipboard;
 use crate::commands::{COMMANDS, Command};
+use crate::config::Preferences;
 use crate::document::{Document, Indent, LineEnding, Selection};
 use crate::editor::Editor;
 use crate::explorer::{self, Explorer};
 use crate::fuzzy;
 use crate::highlight;
+use crate::management::Management;
 use crate::plugin::{self, Host as PluginHost};
 use crate::search;
+use crate::skills::Skill;
 use crate::theme::{self, ThemeEntry};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,12 +52,24 @@ pub enum PaletteMode {
     AgentPicker,
     /// Manage plugins: reload, reinstall the bundled ones, enable/disable.
     Plugins,
+    Settings,
+    AgentSettings,
+    SubAgents,
+    SubAgentSettings,
+    Skills,
+    SkillActions,
+    PluginActions,
+    PluginCommands,
+    Input,
+    ConfirmRemoveSkill,
+    ConfirmRemoveSubAgent,
 }
 
 pub struct Palette {
     pub mode: PaletteMode,
     pub input: String,
     pub cursor: usize,
+    pub input_selected: bool,
     pub items: Vec<String>,
     pub hints: Vec<String>,
     pub filtered: Vec<fuzzy::Scored>,
@@ -390,6 +406,7 @@ pub enum AgentTarget {
     Close,
     Model,
     PickAgent,
+    Settings,
     Stop,
     Send,
     /// A one-tap starter prompt.
@@ -433,6 +450,10 @@ pub struct App {
     pub search: SearchState,
     pub toasts: Vec<Toast>,
     pub settings: Settings,
+    pub preferences: Preferences,
+    pub skills: Vec<Skill>,
+    pub management: Management,
+    pub automation: Automation,
     pub git_branch: Option<String>,
     pub layout: Layout,
     pub quit: bool,
@@ -455,6 +476,17 @@ pub struct App {
 
 impl App {
     pub fn new(root: PathBuf, files: Vec<PathBuf>, theme_name: &str, nerd_font: bool) -> Self {
+        let root = search::absolute_path(&root);
+        let (preferences, config_error) = match Preferences::load(&root) {
+            Ok(p) => (p, None),
+            Err(e) => (Preferences::default(), Some(format!("{e:#}"))),
+        };
+        let saved = &preferences.editor;
+        let theme_name = if theme_name == "Visual Studio Dark" && !saved.theme.is_empty() {
+            &saved.theme
+        } else {
+            theme_name
+        };
         let theme =
             theme::load(theme_name).unwrap_or_else(|| theme::load("Visual Studio Dark").unwrap());
         let mut app = Self {
@@ -474,15 +506,19 @@ impl App {
             search: SearchState::default(),
             toasts: Vec::new(),
             settings: Settings {
-                minimap: true,
-                whitespace: false,
-                indent_guides: true,
-                line_numbers: true,
+                minimap: saved.minimap,
+                whitespace: saved.whitespace,
+                indent_guides: saved.indent_guides,
+                line_numbers: saved.line_numbers,
                 nerd_font,
-                word_wrap: None,
-                toolbar: None,
+                word_wrap: saved.word_wrap,
+                toolbar: saved.toolbar,
                 force_compact: false,
             },
+            skills: crate::skills::discover(&root, &preferences.disabled_skills),
+            preferences,
+            management: Management::default(),
+            automation: Automation::default(),
             compact: false,
             mods: StickyMods::default(),
             agent: Agent::new(root.clone()),
@@ -499,6 +535,17 @@ impl App {
             last_click: None,
             project_files: None,
         };
+        if let Err(e) = app.agent.configure(
+            app.preferences.agent.clone(),
+            crate::skills::context(&app.skills, &app.preferences.agent.skills),
+        ) {
+            app.agent.state = AgentState::Failed(e.clone());
+            app.toast(e, ToastKind::Error);
+        }
+        if let Some(error) = config_error {
+            app.management.load_error = Some(error.clone());
+            app.toast(format!("Settings not loaded: {error}"), ToastKind::Error);
+        }
         for f in files {
             app.open_file(&f);
         }
@@ -529,6 +576,10 @@ impl App {
         }
     }
 
+    pub(crate) fn invalidate_project_files(&mut self) {
+        self.project_files = None;
+    }
+
     pub fn word_wrap(&self) -> bool {
         self.settings.word_wrap.unwrap_or(self.compact)
     }
@@ -555,19 +606,42 @@ impl App {
 
     /// Expire old notifications; returns true if anything changed.
     pub fn tick(&mut self) -> bool {
+        let old_search = self.search.key.clone();
+        self.update_search();
         let before = self.toasts.len();
         self.toasts
             .retain(|t| t.at.elapsed() < Duration::from_millis(3500));
-        before != self.toasts.len()
+        before != self.toasts.len() || old_search != self.search.key
     }
 
     pub fn open_file(&mut self, path: &Path) {
-        let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        let path = search::absolute_path(path);
+        if crate::credentials::is_private_path(&path) {
+            self.toast(
+                "Credential files are private; manage the router key through masked AI settings",
+                ToastKind::Error,
+            );
+            return;
+        }
         if let Some(i) = self
             .editors
             .iter()
             .position(|e| e.doc.path.as_deref() == Some(&path))
         {
+            // An explicit reopen refreshes a cached binary preview. Ordinary
+            // text buffers retain their unsaved changes and undo history.
+            if self.editors[i].doc.is_read_only() {
+                match Editor::open(path.clone()) {
+                    Ok(editor) => self.editors[i] = editor,
+                    Err(error) => {
+                        self.toast(
+                            format!("Cannot refresh preview: {error:#}"),
+                            ToastKind::Error,
+                        );
+                        return;
+                    }
+                }
+            }
             self.active = i;
         } else if path.is_dir() {
             return;
@@ -579,7 +653,7 @@ impl App {
                 }
                 Err(err) => {
                     self.toast(
-                        format!("Cannot open {}: {err}", path.display()),
+                        format!("Cannot open {}: {err:#}", path.display()),
                         ToastKind::Error,
                     );
                     return;
@@ -621,15 +695,29 @@ impl App {
         }
         if let Some(p) = &mut self.palette {
             let t = text.replace(['\n', '\r'], "");
+            if std::mem::take(&mut p.input_selected) {
+                p.input.clear();
+                p.cursor = 0;
+            }
             p.input.insert_str(byte_at(&p.input, p.cursor), &t);
             p.cursor += t.chars().count();
             self.refilter();
         } else if self.focus == Focus::Find {
+            if self.find.query_selected && !self.find.on_replace {
+                self.find.query.clear();
+                self.find.query_cursor = 0;
+                self.find.query_selected = false;
+            }
             let t = text.replace(['\n', '\r'], "");
             let (field, cur) = self.find_field();
             field.insert_str(byte_at(field, *cur), &t);
             *cur += t.chars().count();
         } else if self.focus == Focus::Search {
+            if self.search.query_selected && self.search.field == SearchField::Query {
+                self.search.query.clear();
+                self.search.query_cursor = 0;
+                self.search.query_selected = false;
+            }
             let t = text.replace(['\n', '\r'], "");
             let (field, cur) = self.search_field_mut();
             field.insert_str(byte_at(field, *cur), &t);
@@ -769,6 +857,7 @@ impl App {
             (KeyCode::Char('p'), true, false, _) | (KeyCode::Char('o'), true, ..) => {
                 Some(Command::QuickOpen)
             }
+            (KeyCode::Char(','), true, ..) => Some(Command::Settings),
             (KeyCode::Char('q'), true, ..) => Some(Command::Quit),
             (KeyCode::Char('n'), true, ..) => Some(Command::NewFile),
             (KeyCode::Char('s'), true, _, true) => Some(Command::SaveAs),
@@ -825,12 +914,26 @@ impl App {
             Focus::Find => self.find_key(code, ctrl, shift, alt),
             Focus::Search => self.search_key(code, ctrl, shift, alt),
             Focus::Agent => self.agent_key(code, ctrl, shift, alt),
-            Focus::Explorer => self.explorer_key(code),
+            Focus::Explorer => {
+                if shift && code == KeyCode::Enter {
+                    self.run(Command::OpenArchiveFile);
+                } else {
+                    self.explorer_key(code);
+                }
+            }
             Focus::Editor => self.editor_key(code, ctrl, shift, alt),
         }
     }
 
     fn editor_key(&mut self, code: KeyCode, ctrl: bool, shift: bool, alt: bool) {
+        if !ctrl
+            && !alt
+            && let Some(crate::document::Preview::Image(image)) =
+                self.editor_mut().and_then(|e| e.doc.preview.as_mut())
+        {
+            image.key(code);
+            return;
+        }
         let cmd = match (code, ctrl, shift, alt) {
             (KeyCode::Char('z'), true, true, _) => Some(Command::Redo),
             (KeyCode::Char('z'), true, ..) => Some(Command::Undo),
@@ -978,12 +1081,20 @@ impl App {
             }
             _ => {}
         }
+        let errors = std::mem::take(&mut self.explorer.errors);
+        for error in errors {
+            self.toast(error, ToastKind::Error);
+        }
     }
 
     fn activate_explorer_entry(&mut self) {
         if let Some(e) = self.explorer.selected_entry().cloned() {
             if e.is_dir {
                 self.explorer.toggle(self.explorer.selected);
+                let errors = std::mem::take(&mut self.explorer.errors);
+                for error in errors {
+                    self.toast(error, ToastKind::Error);
+                }
             } else {
                 self.open_file(&e.path);
                 if self.compact {
@@ -999,6 +1110,31 @@ impl App {
     pub fn run(&mut self, cmd: Command) {
         use Command::*;
         match cmd {
+            ImageZoomIn | ImageZoomOut | ImageFit => {
+                if let Some(crate::document::Preview::Image(image)) =
+                    self.editor_mut().and_then(|e| e.doc.preview.as_mut())
+                {
+                    match cmd {
+                        ImageZoomIn => image.zoom_by(1),
+                        ImageZoomOut => image.zoom_by(-1),
+                        _ => image.fit(),
+                    }
+                } else {
+                    self.toast("Open an image to use preview controls", ToastKind::Info);
+                }
+            }
+            OpenArchiveFile => {
+                if let Some(e) = self.explorer.selected_entry().cloned()
+                    && e.is_archive
+                {
+                    self.open_file(&e.path);
+                    if self.compact {
+                        self.show_sidebar = false;
+                    }
+                } else {
+                    self.toast("Select a ZIP in Explorer first", ToastKind::Info);
+                }
+            }
             QuickOpen => self.open_palette(PaletteMode::Files),
             CommandPalette | ShowKeybindings => self.open_palette(PaletteMode::Commands),
             GotoLine => {
@@ -1095,11 +1231,18 @@ impl App {
                 }
             }
             AgentNewChat => {
+                self.cancel_automation();
+                self.agent.cancel();
                 self.agent.new_chat();
                 self.show_agent = true;
                 self.focus = Focus::Agent;
             }
-            AgentStop => self.agent.cancel(),
+            AgentStop => {
+                self.agent.cancel();
+                self.cancel_automation();
+                self.agent.stop();
+                self.agent.entries.push(agent::Entry::Notice{text:"Stopped this task tree. Partial edits were kept for review; no side effects were automatically retried. Provider session reset: restate essential context before continuing.".into(),error:false});
+            }
             AgentModel => {
                 if self.agent.models.is_empty() {
                     self.toast(
@@ -1150,6 +1293,10 @@ impl App {
             FindInFiles => self.open_search(false),
             ReplaceInFiles => self.open_search(true),
             Plugins => self.open_palette(PaletteMode::Plugins),
+            Settings => self.open_palette(PaletteMode::Settings),
+            AgentSettings => self.open_palette(PaletteMode::AgentSettings),
+            SubAgents => self.open_palette(PaletteMode::SubAgents),
+            Skills => self.open_palette(PaletteMode::Skills),
             Find | Replace => {
                 self.search.visible = false;
                 self.find.visible = true;
@@ -1208,6 +1355,18 @@ impl App {
             | DuplicateLineUp | DeleteLine | InsertLineBelow | InsertLineAbove => {
                 self.edit_command(cmd)
             }
+        }
+        if matches!(
+            cmd,
+            ToggleMinimap
+                | ToggleWhitespace
+                | ToggleIndentGuides
+                | ToggleLineNumbers
+                | ToggleWordWrap
+                | ToggleToolbar
+                | NextTheme
+        ) {
+            self.persist_editor_preferences();
         }
     }
 
@@ -1379,7 +1538,11 @@ impl App {
 
     fn do_close(&mut self, what: PendingClose) {
         match what {
-            PendingClose::Quit => self.quit = true,
+            PendingClose::Quit => {
+                self.cancel_automation();
+                self.agent.stop();
+                self.quit = true;
+            }
             PendingClose::Tab(i) => {
                 if i < self.editors.len() {
                     self.editors.remove(i);
@@ -1555,9 +1718,28 @@ impl App {
                     (a.name.clone(), hint.to_string())
                 })
                 .unzip(),
+            PaletteMode::Settings
+            | PaletteMode::AgentSettings
+            | PaletteMode::SubAgents
+            | PaletteMode::SubAgentSettings
+            | PaletteMode::Skills
+            | PaletteMode::SkillActions
+            | PaletteMode::PluginActions
+            | PaletteMode::PluginCommands
+            | PaletteMode::Input
+            | PaletteMode::ConfirmRemoveSkill
+            | PaletteMode::ConfirmRemoveSubAgent => self.management_items(mode),
             PaletteMode::GotoLine | PaletteMode::SaveAs => (Vec::new(), Vec::new()),
         };
-        let mut input = String::new();
+        let mut input = if mode == PaletteMode::Input {
+            self.management
+                .edit
+                .as_ref()
+                .map(|e| e.value.clone())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         if mode == PaletteMode::SaveAs
             && let Some(e) = self.editor()
         {
@@ -1574,6 +1756,7 @@ impl App {
         let cursor = input.chars().count();
         self.palette = Some(Palette {
             mode,
+            input_selected: mode == PaletteMode::Input && !input.is_empty(),
             input,
             cursor,
             items,
@@ -1634,8 +1817,35 @@ impl App {
         let Some(p) = &mut self.palette else { return };
         let n = p.filtered.len();
         let mut moved = false;
+        if code == KeyCode::Char('a') && ctrl {
+            p.input_selected = true;
+            return;
+        }
+        if p.input_selected && matches!(code, KeyCode::Backspace | KeyCode::Delete) {
+            p.input.clear();
+            p.cursor = 0;
+            p.input_selected = false;
+            self.refilter();
+            return;
+        }
+        if p.input_selected && matches!(code, KeyCode::Char(_)) && !ctrl {
+            p.input.clear();
+            p.cursor = 0;
+            p.input_selected = false;
+        }
+        if matches!(
+            code,
+            KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End
+        ) {
+            p.input_selected = false;
+        }
         match code {
             KeyCode::Esc => {
+                if p.mode == PaletteMode::Input {
+                    self.palette = None;
+                    self.cancel_setting_edit();
+                    return;
+                }
                 if let Some(t) = p.restore_theme.take() {
                     self.set_theme(&t);
                 }
@@ -1682,6 +1892,13 @@ impl App {
                 self.refilter();
                 return;
             }
+            KeyCode::Delete => {
+                if p.cursor < p.input.chars().count() {
+                    p.input.remove(byte_at(&p.input, p.cursor));
+                }
+                self.refilter();
+                return;
+            }
             KeyCode::Char(c) if !ctrl => {
                 let b = byte_at(&p.input, p.cursor);
                 p.input.insert(b, c);
@@ -1716,26 +1933,50 @@ impl App {
             PaletteMode::Plugins => {
                 if let Some(s) = p.filtered.get(p.selected) {
                     match s.index {
-                        0 => self.plugins.reload(),
+                        0 => {
+                            self.cancel_automation();
+                            self.plugins.reload();
+                        }
                         1 => {
-                            let _ = plugin::install_bundled();
+                            self.cancel_automation();
+                            if let Err(e) = plugin::install_bundled() {
+                                self.toast(
+                                    format!("Cannot install plugins: {e}"),
+                                    ToastKind::Error,
+                                );
+                            }
                             self.plugins.reload();
                         }
                         i if i >= 2 => {
                             let pi = i - 2;
-                            let enabled = self
-                                .plugins
-                                .plugins
-                                .get(pi)
-                                .map(|p| !p.enabled)
-                                .unwrap_or(false);
-                            self.plugins.set_enabled(pi, enabled);
+                            if self.plugins.plugins.get(pi).is_some() {
+                                self.management.plugin = Some(pi);
+                                self.open_palette(PaletteMode::PluginActions);
+                                return;
+                            }
                         }
                         _ => {}
                     }
                     // Stay in the manager so the new state is visible.
                     self.open_palette(PaletteMode::Plugins);
                 }
+            }
+            PaletteMode::Settings
+            | PaletteMode::AgentSettings
+            | PaletteMode::SubAgents
+            | PaletteMode::SubAgentSettings
+            | PaletteMode::Skills
+            | PaletteMode::SkillActions
+            | PaletteMode::PluginActions
+            | PaletteMode::PluginCommands
+            | PaletteMode::Input
+            | PaletteMode::ConfirmRemoveSkill
+            | PaletteMode::ConfirmRemoveSubAgent => {
+                self.management_accept(
+                    p.mode,
+                    p.filtered.get(p.selected).map(|s| s.index),
+                    p.input,
+                );
             }
             PaletteMode::Files => {
                 if let Some(f) = chosen {
@@ -1746,17 +1987,48 @@ impl App {
             PaletteMode::Themes => {
                 if let Some(t) = chosen {
                     self.set_theme(&t);
+                    self.persist_editor_preferences();
                 }
             }
             PaletteMode::AgentModels => {
                 if let Some(v) = chosen {
-                    self.agent.set_model(&v);
+                    let mut prefs = self.preferences.clone();
+                    prefs.agent.model = v.clone();
+                    let saved = self.ensure_preferences_writable().and_then(|_| {
+                        if self.agent.is_working() || self.automation.busy() {
+                            anyhow::bail!("Stop the AI turn before changing its model");
+                        }
+                        prefs.save(&self.explorer.root)
+                    });
+                    if let Err(e) = saved {
+                        self.toast(format!("Model not saved: {e:#}"), ToastKind::Error);
+                    } else {
+                        self.preferences = prefs;
+                        self.agent.options.model = v.clone();
+                        self.agent.set_model(&v);
+                    }
                 }
                 self.focus = Focus::Agent;
             }
             PaletteMode::AgentPicker => {
-                if let Some(s) = p.filtered.get(p.selected) {
-                    self.agent.use_agent(s.index);
+                if let Some(spec) = p
+                    .filtered
+                    .get(p.selected)
+                    .and_then(|s| self.agent.available.get(s.index))
+                    .cloned()
+                {
+                    let mut prefs = self.preferences.clone();
+                    prefs.agent.backend = if spec.builtin {
+                        "builtin".into()
+                    } else {
+                        spec.name
+                    };
+                    if let Err(e) = self.save_preferences(prefs) {
+                        self.toast(format!("Agent settings: {e:#}"), ToastKind::Error);
+                        return;
+                    }
+                    self.setup_bridge();
+                    self.agent.start();
                 }
                 self.show_agent = true;
                 self.focus = Focus::Agent;
@@ -1794,12 +2066,33 @@ impl App {
                         self.explorer.root.join(raw)
                     }
                 };
-                if let Some(e) = self.editors.get_mut(self.active) {
-                    e.doc.path = Some(path.clone());
-                    let first = e.doc.line_str(0);
-                    e.hl.set_syntax(highlight::detect_syntax(Some(&path), &first));
+                let result = if let Some(e) = self.editors.get_mut(self.active) {
+                    let export = e.doc.is_read_only();
+                    e.doc.save_as(&path).map(|()| {
+                        if !export {
+                            let first = e.doc.line_str(0);
+                            e.hl.set_syntax(highlight::detect_syntax(Some(&path), &first));
+                        }
+                        export
+                    })
+                } else {
+                    return;
+                };
+                match result {
+                    Ok(export) => self.toast(
+                        format!(
+                            "{} {}",
+                            if export { "Exported" } else { "Saved" },
+                            path.display()
+                        ),
+                        ToastKind::Success,
+                    ),
+                    Err(e) => {
+                        self.toast(format!("Save As failed: {e:#}"), ToastKind::Error);
+                        return;
+                    }
                 }
-                self.save_active();
+                self.project_files = None;
                 self.explorer.refresh();
                 self.explorer.reveal(&path);
             }
@@ -2001,6 +2294,13 @@ impl App {
     }
 
     fn replace_one(&mut self) {
+        if self.editor().is_some_and(|e| e.doc.is_read_only()) {
+            self.toast(
+                "Preview is read-only; open a text member to edit",
+                ToastKind::Info,
+            );
+            return;
+        }
         let Some(i) = self.find.current else { return };
         let Some(&(s, en)) = self.find.matches.get(i) else {
             return;
@@ -2029,6 +2329,13 @@ impl App {
     }
 
     fn replace_all(&mut self) {
+        if self.editor().is_some_and(|e| e.doc.is_read_only()) {
+            self.toast(
+                "Preview is read-only; open a text member to edit",
+                ToastKind::Info,
+            );
+            return;
+        }
         self.update_find();
         let ranges = self.find.matches.clone();
         let n = ranges.len();
@@ -2083,6 +2390,11 @@ impl App {
             self.search.field = SearchField::Replace;
         }
         self.focus = Focus::Search;
+        // A full-screen agent sheet must not obscure a newly opened search.
+        if self.compact {
+            self.show_agent = false;
+            self.show_sidebar = false;
+        }
         self.search.key = None;
         self.update_search();
     }
@@ -2167,7 +2479,9 @@ impl App {
         self.search.key = Some(key);
         let mut overrides = HashMap::new();
         for e in &self.editors {
-            if let Some(p) = &e.doc.path {
+            if !e.doc.is_read_only()
+                && let Some(p) = &e.doc.path
+            {
                 overrides.insert(p.clone(), e.doc.rope.to_string());
             }
         }
@@ -2180,6 +2494,8 @@ impl App {
         self.search.error = false;
         self.search.selected = None;
         self.search.scroll = 0;
+        self.search.root_path = search::resolve_root(&self.explorer.root, &self.search.root);
+        self.search.missing_root = !self.search.root_path.is_dir();
         if q.is_empty() {
             self.search.results = search::Results::default();
             return;
@@ -2344,6 +2660,9 @@ impl App {
             .iter()
             .position(|e| e.doc.path.as_deref() == Some(path))
         {
+            if self.editors[i].doc.is_read_only() {
+                return Err(());
+            }
             let text = self.editors[i].doc.rope.to_string();
             let (new, n) = search::replace_in_text(&text, re, replacement, literal);
             if n > 0 {
@@ -2626,8 +2945,8 @@ impl App {
             }
             _ => {
                 // Field editing.
-                let selected = std::mem::take(&mut self.search.query_selected)
-                    && self.search.field == SearchField::Query;
+                let selected = self.search.field == SearchField::Query
+                    && std::mem::take(&mut self.search.query_selected);
                 if selected
                     && matches!(
                         code,
@@ -2680,8 +2999,18 @@ impl App {
 
     /// Start a plugin command (palette entry or keybinding).
     pub fn run_plugin(&mut self, pi: usize, ci: usize) {
+        if self.editor().is_some_and(|e| e.doc.is_read_only()) {
+            self.toast(
+                "Binary previews are read-only; open a text member to run editor plugins",
+                ToastKind::Error,
+            );
+            return;
+        }
         let file = self.editor().and_then(|e| e.doc.path.clone());
-        self.plugins.run(pi, ci, file.as_deref());
+        if let Err(e) = self.plugins.run_request(pi, ci, file.as_deref(), json!({})) {
+            self.toast(e, ToastKind::Error);
+            return;
+        }
         let name = self
             .plugins
             .plugins
@@ -2730,7 +3059,12 @@ impl App {
             }
             "editor.open" => {
                 if let Some(path) = params.get("path").and_then(Value::as_str) {
-                    self.open_file(Path::new(path));
+                    let p = Path::new(path);
+                    self.open_file(&if p.is_absolute() {
+                        p.to_path_buf()
+                    } else {
+                        self.explorer.root.join(p)
+                    });
                     if let Some(line) = params.get("line").and_then(Value::as_u64)
                         && let Some(e) = self.editor_mut()
                     {
@@ -2787,12 +3121,54 @@ impl App {
                     method,
                     params,
                 } => {
+                    let context = self.plugin_context(plugin);
+                    let ai_call = self.automation.plugins.values().find(|c| c.pi == plugin);
+                    let expects_buffer =
+                        ai_call.is_some_and(|c| c.file.is_some() || c.untitled.is_some());
+                    if method.starts_with("editor.") && ai_call.is_some() && context.is_none() {
+                        if expects_buffer {
+                            self.plugins.stop(plugin);
+                            self.plugin_exited(plugin);
+                        } else if let Some(id) = id {
+                            self.plugins.reply(plugin, id, Value::Null);
+                        }
+                        continue;
+                    }
+                    let (active, focus) = (self.active, self.focus);
+                    if let Some(index) = context {
+                        self.active = index;
+                    }
+                    if method == "ui.toast" {
+                        if let Some(text) = params.get("message").and_then(Value::as_str) {
+                            for call in self
+                                .automation
+                                .plugins
+                                .values_mut()
+                                .filter(|c| c.pi == plugin)
+                            {
+                                if call.messages.len() < 20 {
+                                    call.messages.push(text.chars().take(2000).collect());
+                                }
+                                if params.get("kind").and_then(Value::as_str) == Some("error") {
+                                    call.error = Some(text.chars().take(2000).collect());
+                                }
+                            }
+                        }
+                    }
                     let result = self.plugin_call(&method, &params);
+                    if context.is_some() {
+                        self.active = active.min(self.editors.len().saturating_sub(1));
+                        self.focus = focus;
+                    }
                     if let Some(id) = id {
                         self.plugins.reply(plugin, id, result);
                     }
                 }
+                plugin::Msg::Response { plugin, id, result } => {
+                    self.plugin_finished(plugin, id, result)
+                }
                 plugin::Msg::Exited { plugin, code } => {
+                    self.plugin_exited(plugin);
                     if let Some(0) | None = code {
                         continue;
                     }
@@ -2849,6 +3225,10 @@ impl App {
                     self.explorer.scroll =
                         (self.explorer.scroll as isize + d).clamp(0, max as isize) as usize;
                 } else if let Some(e) = self.editor_mut() {
+                    if let Some(crate::document::Preview::Image(image)) = e.doc.preview.as_mut() {
+                        image.zoom_by(if d > 0 { -1 } else { 1 });
+                        return;
+                    }
                     if m.modifiers.contains(KeyModifiers::SHIFT) {
                         e.scroll_col = (e.scroll_col as isize + d * 2).max(0) as usize;
                     } else {
@@ -3085,6 +3465,12 @@ impl App {
         }
         if l.text.contains(pos) || l.gutter.contains(pos) {
             self.focus = Focus::Editor;
+            if self
+                .editor()
+                .is_some_and(|e| matches!(e.doc.preview, Some(crate::document::Preview::Image(_))))
+            {
+                return;
+            }
             let count = self.click_count(pos);
             let in_gutter = l.gutter.contains(pos);
             let Some(idx) = self.idx_at(pos) else { return };
@@ -3235,63 +3621,27 @@ impl App {
 
     /// Drain agent messages and act on them. Returns true if anything changed.
     pub fn pump_agent(&mut self) -> bool {
-        let (events, changed) = self.agent.poll();
-        for ev in events {
-            match ev {
-                AgentEvent::FileChanged { path, diffs } => self.agent_file_changed(&path, &diffs),
-                AgentEvent::ReadFile {
-                    rpc_id,
-                    path,
-                    line,
-                    limit,
-                } => {
-                    let text = match self
-                        .editors
-                        .iter()
-                        .find(|e| e.doc.path.as_deref() == Some(path.as_path()))
-                    {
-                        Some(e) => Some(e.doc.rope.to_string()),
-                        None => std::fs::read_to_string(&path).ok(),
-                    };
-                    match text {
-                        Some(t) => self.agent.respond_read(rpc_id, &t, line, limit),
-                        None => self
-                            .agent
-                            .respond_error(rpc_id, &format!("cannot read {}", path.display())),
-                    }
-                }
-                AgentEvent::WriteFile {
-                    rpc_id,
-                    path,
-                    content,
-                } => {
-                    let old = std::fs::read_to_string(&path).ok();
-                    match std::fs::write(&path, &content) {
-                        Ok(()) => {
-                            self.agent.respond(rpc_id, serde_json::Value::Null);
-                            let diffs = vec![(old, content)];
-                            self.agent_file_changed(&path, &diffs);
-                        }
-                        Err(e) => self.agent.respond_error(rpc_id, &e.to_string()),
-                    }
-                }
-                AgentEvent::TurnEnded => {
-                    self.explorer.refresh();
-                    self.project_files = None;
-                }
-            }
+        if self.automation.busy() {
+            // External ACP agents can wait on MCP children/plugins without
+            // sending transcript updates. Do not replay their prompt while
+            // the live host task is still running; overwatch owns its deadline.
+            self.agent.host_progress();
         }
-        changed
+        let (events, changed) = self.agent.poll();
+        for event in events {
+            self.process_agent_event(Source::Main, event);
+        }
+        self.pump_automation() || changed
     }
 
     /// Keep animating while the agent works (spinners, elapsed time).
     pub fn agent_animating(&self) -> bool {
-        self.agent.is_working()
+        self.agent.is_working() || self.automation.busy()
     }
 
     /// An agent changed `path` on disk: show it in the editor as an undoable
     /// change with change bars, so you can review it (and Ctrl+Z it).
-    fn agent_file_changed(&mut self, path: &Path, diffs: &[(Option<String>, String)]) {
+    pub(crate) fn agent_file_changed(&mut self, path: &Path, diffs: &[(Option<String>, String)]) {
         let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
         let Ok(new) = std::fs::read_to_string(&path) else {
             return; // deleted or moved: the explorer refresh at the end of the turn shows it
@@ -3340,11 +3690,36 @@ impl App {
 
     /// Send what is in the agent input box.
     pub fn agent_send(&mut self) {
+        if self.agent.is_working() || self.automation.busy() {
+            self.toast(
+                "Wait for the current turn or stop it first",
+                ToastKind::Info,
+            );
+            return;
+        }
         let text = std::mem::take(&mut self.agent.input);
         self.agent.cursor = 0;
         if text.trim().is_empty() {
             return;
         }
+        if text.len() > 32 * 1024 {
+            self.agent.cursor = text.len();
+            self.agent.input = text;
+            self.toast("Task text exceeds 32 KiB; split the goal or reference files so descendants receive the full goal",ToastKind::Error);
+            return;
+        }
+        self.reload_skills();
+        self.agent.skill_context =
+            match crate::skills::required_context(&self.skills, &self.agent.options.skills) {
+                Ok(context) => context,
+                Err(e) => {
+                    self.agent.cursor = text.len();
+                    self.agent.input = text;
+                    self.toast(format!("Cannot start agent: {e:#}"), ToastKind::Error);
+                    return;
+                }
+            };
+        self.setup_bridge();
         // The agent reads files from disk: save your work first.
         let mut saved = 0;
         for e in &mut self.editors {
@@ -3358,7 +3733,12 @@ impl App {
                 ToastKind::Info,
             );
         }
-        let context = self.agent_context();
+        let context = if self.agent.options.auto_context {
+            self.agent_context()
+        } else {
+            Vec::new()
+        };
+        self.begin_automation_turn(&text, serde_json::json!({"editor_context":context}));
         self.agent.prompt(&text, context);
     }
 
@@ -3370,6 +3750,9 @@ impl App {
         let Some(path) = e.doc.path.as_ref() else {
             return Vec::new();
         };
+        if crate::credentials::is_private_path(path) {
+            return Vec::new();
+        }
         let uri = agent::file_uri(path);
         let mut blocks = vec![serde_json::json!({
             "type": "resource_link", "uri": uri, "name": e.doc.name()
@@ -3395,8 +3778,14 @@ impl App {
 
     /// Short description of the context that will be attached (for the chip).
     pub fn agent_context_label(&self) -> Option<String> {
+        if !self.agent.options.auto_context {
+            return None;
+        }
         let e = self.editor()?;
-        e.doc.path.as_ref()?;
+        let path = e.doc.path.as_ref()?;
+        if crate::credentials::is_private_path(path) {
+            return None;
+        }
         let name = e.doc.name();
         if e.sel.is_empty() {
             Some(name)
@@ -3425,7 +3814,9 @@ impl App {
                 if self.agent.spec.is_none() {
                     self.agent.spec = self.agent.available.first().cloned();
                 }
+                self.cancel_automation();
                 self.agent.stop();
+                self.setup_bridge();
                 self.agent.start();
             }
             AgentTarget::NewChat => self.run(Command::AgentNewChat),
@@ -3439,7 +3830,8 @@ impl App {
             }
             AgentTarget::Model => self.run(Command::AgentModel),
             AgentTarget::PickAgent => self.run(Command::AgentPick),
-            AgentTarget::Stop => self.agent.cancel(),
+            AgentTarget::Settings => self.run(Command::AgentSettings),
+            AgentTarget::Stop => self.run(Command::AgentStop),
             AgentTarget::Send => {
                 self.focus = Focus::Agent;
                 self.agent_send();
@@ -3453,6 +3845,10 @@ impl App {
     }
 
     fn agent_key(&mut self, code: KeyCode, ctrl: bool, shift: bool, alt: bool) {
+        if code == KeyCode::Esc && (self.agent.is_working() || self.automation.busy()) {
+            self.run(Command::AgentStop);
+            return;
+        }
         // Number keys answer a pending permission request.
         if self.agent.input.is_empty()
             && let KeyCode::Char(c @ '1'..='9') = code
