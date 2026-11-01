@@ -1,7 +1,7 @@
 //! Application state and input handling.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -300,11 +300,18 @@ pub enum SearchField {
     Dirs,
     /// File filter: `*.cs;!*.csproj`.
     Filter,
+    Limit,
 }
 
 /// Find/Replace in Files: the query, the file filter and the results.
 #[derive(Default)]
 pub struct SearchState {
+    pub options: search::SearchOptions,
+    pub limit_input: String,
+    pub limit_error: bool,
+    pub job: Option<search::SearchJob>,
+    pub pending_since: Option<Instant>,
+    pub error_message: Option<String>,
     pub visible: bool,
     /// The replace inputs and buttons are shown.
     pub replace: bool,
@@ -323,6 +330,7 @@ pub struct SearchState {
     /// File filter: `*.cs;!*.csproj`. A trailing `/` still means a folder.
     pub filter: String,
     pub filter_cursor: usize,
+    pub limit_cursor: usize,
     /// `root` resolved against the project root, for display and searching.
     pub root_path: PathBuf,
     /// The root box names a folder that does not exist.
@@ -343,20 +351,17 @@ pub struct SearchState {
     key: Option<SearchKey>,
 }
 
-/// Everything a search depends on, so typing in the replace box does not
-/// rebuild the results: query, file filter, directory filter, root, options,
-/// the open editors' versions and the project root.
-type SearchKey = (
-    String,
-    String,
-    String,
-    String,
-    bool,
-    bool,
-    bool,
-    u64,
-    PathBuf,
-);
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SearchKey {
+    query: search::Query,
+    filters: String,
+    dirs: String,
+    root: String,
+    options: search::SearchOptions,
+    versions: u64,
+    project: PathBuf,
+}
+
 
 /// Screen regions from the last frame, for mouse hit testing.
 #[derive(Default, Clone)]
@@ -375,6 +380,7 @@ pub struct Layout {
     pub find_buttons: Vec<(Rect, u8)>,
     pub search_box: Rect,
     pub search_list: Rect,
+    pub search_scrollbar: Rect,
     /// 0 = query, 1 = replace, 2 = root, 3 = directories, 4 = files.
     pub search_fields: Vec<(Rect, u8)>,
     /// 0..=2 options, 3 replace all, 4 replace file, 5 close.
@@ -419,6 +425,7 @@ enum Drag {
     Scrollbar,
     Minimap,
     SidebarResize,
+    SearchScrollbar,
 }
 
 pub struct Settings {
@@ -436,6 +443,8 @@ pub struct Settings {
 }
 
 pub struct App {
+    pub image_cell_pixels: (u16, u16),
+    pub graphics: crate::graphics::GraphicsState,
     pub editors: Vec<Editor>,
     pub active: usize,
     pub explorer: Explorer,
@@ -489,6 +498,8 @@ impl App {
         let theme =
             theme::load(theme_name).unwrap_or_else(|| theme::load("Visual Studio Dark").unwrap());
         let mut app = Self {
+            image_cell_pixels: (8, 16),
+            graphics: crate::graphics::GraphicsState::default(),
             editors: Vec::new(),
             active: 0,
             explorer: Explorer::new(root.clone()),
@@ -502,7 +513,15 @@ impl App {
                 case_sensitive: false,
                 ..Default::default()
             },
-            search: SearchState::default(),
+            search: SearchState {
+                options: search::SearchOptions {
+                    max_results: preferences.search.max_results,
+                    ignore_binary: preferences.search.ignore_binary,
+                    ..Default::default()
+                },
+                limit_input: preferences.search.max_results.to_string(),
+                ..Default::default()
+            },
             toasts: Vec::new(),
             settings: Settings {
                 minimap: saved.minimap,
@@ -610,16 +629,17 @@ impl App {
     /// Background work (highlighting) wants another frame.
     pub fn busy(&self) -> bool {
         self.editor().is_some_and(|e| e.hl_pending)
+        || self.search.job.as_ref().is_some_and(|j| j.running)
     }
 
     /// Expire old notifications; returns true if anything changed.
     pub fn tick(&mut self) -> bool {
-        let old_search = self.search.key.clone();
         self.update_search();
+        let search_changed = self.pump_search();
         let before = self.toasts.len();
         self.toasts
             .retain(|t| t.at.elapsed() < Duration::from_millis(3500));
-        before != self.toasts.len() || old_search != self.search.key
+        before != self.toasts.len() || search_changed
     }
 
     pub fn open_file(&mut self, path: &Path) {
@@ -936,10 +956,19 @@ impl App {
     fn editor_key(&mut self, code: KeyCode, ctrl: bool, shift: bool, alt: bool) {
         if !ctrl
             && !alt
-            && let Some(crate::document::Preview::Image(image)) =
-                self.editor_mut().and_then(|e| e.doc.preview.as_mut())
+            && self.editor().is_some_and(|e| matches!(e.doc.preview, Some(crate::document::Preview::Image(_))))
         {
-            image.key(code);
+            match code {
+                KeyCode::Char('+') | KeyCode::Char('=') => self.run(Command::ImageZoomIn),
+                KeyCode::Char('-') => self.run(Command::ImageZoomOut),
+                KeyCode::Char('0') | KeyCode::Home => self.run(Command::ImageFit),
+                KeyCode::Char('1') => self.run(Command::ImageActualSize),
+                _ => {
+                    if let Some(crate::document::Preview::Image(image)) =
+                        self.editor_mut().and_then(|e| e.doc.preview.as_mut())
+                    { image.key(code); }
+                }
+            }
             return;
         }
         let cmd = match (code, ctrl, shift, alt) {
@@ -1118,13 +1147,17 @@ impl App {
     pub fn run(&mut self, cmd: Command) {
         use Command::*;
         match cmd {
-            ImageZoomIn | ImageZoomOut | ImageFit => {
+            ImageZoomIn | ImageZoomOut | ImageFit | ImageActualSize => {
+                let (cw, ch) = self.image_cell_pixels;
+                let area = self.layout.text;
+                let (vw, vh) = (u32::from(cw) * u32::from(area.width), u32::from(ch) * u32::from(area.height));
                 if let Some(crate::document::Preview::Image(image)) =
                     self.editor_mut().and_then(|e| e.doc.preview.as_mut())
                 {
                     match cmd {
-                        ImageZoomIn => image.zoom_by(1),
-                        ImageZoomOut => image.zoom_by(-1),
+                        ImageZoomIn => image.zoom_at_size(1, vw, vh),
+                        ImageZoomOut => image.zoom_at_size(-1, vw, vh),
+                        ImageActualSize => image.actual_size(),
                         _ => image.fit(),
                     }
                 } else {
@@ -2392,6 +2425,7 @@ impl App {
         self.find.visible = false;
         self.search.visible = true;
         self.search.replace = replace;
+        if replace { self.search.options.content = true; }
         if self.focus != Focus::Search {
             if let Some(e) = self.editor() {
                 let text = e.selected_text();
@@ -2421,6 +2455,9 @@ impl App {
     }
 
     fn close_search(&mut self) {
+        self.cancel_search();
+        self.search.job = None;
+        self.persist_search_preferences();
         self.search.visible = false;
         self.focus = if self.editors.is_empty() {
             Focus::Explorer
@@ -2438,6 +2475,7 @@ impl App {
             SearchField::Root => (&mut self.search.root, &mut self.search.root_cursor),
             SearchField::Dirs => (&mut self.search.dirs, &mut self.search.dirs_cursor),
             SearchField::Filter => (&mut self.search.filter, &mut self.search.filter_cursor),
+            SearchField::Limit => (&mut self.search.limit_input, &mut self.search.limit_cursor),
             _ => (&mut self.search.query, &mut self.search.query_cursor),
         }
     }
@@ -2465,98 +2503,178 @@ impl App {
         }
     }
 
-    /// Recompute the results when the query, options, filter or an open
-    /// editor changed. Cheap to call: nothing happens if the key is the same.
+    /// Schedule a debounced search. No filesystem work or worker join occurs
+    /// on the UI thread. Every new keystroke cancels the previous generation.
     pub fn update_search(&mut self) {
-        if !self.search.visible {
-            return;
-        }
+        if !self.search.visible { return; }
         let q = self.search_query();
-        // Open editors can hold unsaved text; their edits are part of the key
-        // so nothing is copied until the results are actually stale.
         let mut versions = self.editors.len() as u64;
         for e in &self.editors {
             if let Some(p) = &e.doc.path {
                 let mut h = DefaultHasher::new();
-                p.hash(&mut h);
-                e.doc.version.hash(&mut h);
+                p.hash(&mut h); e.doc.version.hash(&mut h);
                 versions = versions.rotate_left(9) ^ h.finish();
             }
         }
-        let key = (
-            q.text.clone(),
-            self.search.filter.clone(),
-            self.search.dirs.clone(),
-            self.search.root.clone(),
-            q.case_sensitive,
-            q.whole_word,
-            q.regex,
-            versions,
-            self.explorer.root.clone(),
-        );
-        if self.search.key.as_ref() == Some(&key) {
-            return;
-        }
-        self.search.key = Some(key);
-        let mut overrides = HashMap::new();
-        for e in &self.editors {
-            if !e.doc.is_read_only()
-                && let Some(p) = &e.doc.path
-            {
-                overrides.insert(p.clone(), e.doc.rope.to_string());
+        if self.search.field == SearchField::Limit {
+            match self.search.limit_input.parse::<usize>() {
+                Ok(n) if (1..=search::MAX_RESULT_LIMIT).contains(&n) => {
+                    self.search.options.max_results = n;
+                    self.search.limit_error = false;
+                }
+                _ => self.search.limit_error = true,
             }
         }
-        // Keep the selection on the same occurrence if it is still there.
-        let prev = self.search.selected.and_then(|(fi, mi)| {
-            let f = self.search.results.files.get(fi)?;
-            let m = f.matches.get(mi)?;
-            Some((f.path.clone(), m.line, m.start))
-        });
+        let key = SearchKey { query: q, filters: self.search.filter.clone(),
+            dirs: self.search.dirs.clone(), root: self.search.root.clone(),
+            options: self.search.options, versions, project: self.explorer.root.clone() };
+        if self.search.key.as_ref() == Some(&key) { return; }
+        self.search.job = None; // Drop cancels, never joins.
+        self.search.key = Some(key);
+        self.search.results = search::Results::default();
         self.search.error = false;
+        self.search.error_message = None;
         self.search.selected = None;
         self.search.scroll = 0;
+        self.search.collapsed.clear();
         self.search.root_path = search::resolve_root(&self.explorer.root, &self.search.root);
-        self.search.missing_root = !self.search.root_path.is_dir();
-        if q.is_empty() {
-            self.search.results = search::Results::default();
+        self.search.missing_root = false;
+        self.search.pending_since = Some(Instant::now());
+        if self.search.limit_error || self.search.query.is_empty() || !self.search.options.any_target() {
+            self.search.pending_since = None;
             return;
         }
-        let root = search::resolve_root(&self.explorer.root, &self.search.root);
-        self.search.root_path = root.clone();
-        let filter = search::FilterSet::parse_parts(&self.search.dirs, &self.search.filter);
-        self.search.missing_root = !root.is_dir();
-        if self.search.missing_root {
-            self.search.results = search::Results::default();
+        if let Err(e) = self.search.key.as_ref().unwrap().query.compile() {
+            self.search.error = true;
+            self.search.error_message = Some(e.to_string());
+            self.search.pending_since = None;
             return;
         }
-        match search::search(&root, &q, &filter, &overrides) {
-            Ok(results) => {
-                self.search.results = results;
-                self.search.selected = prev.and_then(|(path, line, start)| {
-                    self.search
-                        .results
-                        .files
-                        .iter()
-                        .enumerate()
-                        .find_map(|(fi, f)| {
-                            if f.path != path {
-                                return None;
-                            }
-                            f.matches
-                                .iter()
-                                .position(|m| m.line == line && m.start == start)
-                                .map(|mi| (fi, mi))
-                        })
-                });
-                if self.search.selected.is_none() {
-                    self.search.selected = self.first_search_hit();
-                }
-            }
-            Err(_) => {
-                self.search.results = search::Results::default();
-                self.search.error = true;
-            }
+        // The event loop starts this generation after 120 ms of quiet typing.
+        // No sleep or filesystem scan happens in the key handler.
+    }
+
+    fn start_search_if_due(&mut self) {
+        let Some(at) = self.search.pending_since else { return; };
+        if at.elapsed() < Duration::from_millis(120) { return; }
+        let Some(key) = &self.search.key else { return; };
+        let overrides = self.editors.iter().filter_map(|e| {
+            (!e.doc.is_read_only()).then_some(e.doc.path.as_ref()?)
+                .map(|p| (p.clone(), e.doc.rope.to_string()))
+        }).collect();
+        let filter = search::FilterSet::parse_parts(&key.dirs, &key.filters);
+        match search::search_async(&self.search.root_path, &key.query, &filter,
+            &overrides, key.options) {
+            Ok(job) => self.search.job = Some(job),
+            Err(e) => { self.search.error = true; self.search.error_message = Some(e.to_string()); }
         }
+        self.search.pending_since = None;
+    }
+
+    /// Nonblocking progress/result delivery, including a bounded merge budget.
+    pub fn pump_search(&mut self) -> bool {
+        self.start_search_if_due();
+        let Some(job) = &mut self.search.job else { return false; };
+        let changed = job.pump(&mut self.search.results);
+        if let Some(error) = &job.error {
+            self.search.error = true;
+            self.search.error_message = Some(error.clone());
+            self.search.missing_root = error.starts_with("Folder does not exist:");
+        }
+        if self.search.selected.is_none() { self.search.selected = self.first_search_hit(); }
+        changed
+    }
+
+    /// Blocking convenience for headless tests/tools, never called by the UI.
+    pub fn finish_search(&mut self) {
+        self.search.pending_since = Some(Instant::now() - Duration::from_millis(120));
+        self.pump_search();
+        while self.search.job.as_ref().is_some_and(|j| j.running) {
+            self.pump_search();
+            std::thread::yield_now();
+        }
+        self.pump_search();
+    }
+
+    pub fn search_running(&self) -> bool {
+        self.search.pending_since.is_some() || self.search.job.as_ref().is_some_and(|j| j.running)
+    }
+
+    pub fn search_progress_label(&self) -> String {
+        if self.search.limit_error { return "Result limit must be 1–100000".into(); }
+        if let Some(e) = &self.search.error_message { return format!("Search error: {e}"); }
+        if !self.search.options.any_target() { return "Choose content, file names, or directory names".into(); }
+        if self.search.query.is_empty() { return "Search content, file names, and directory names".into(); }
+        let p = self.search.job.as_ref().map(|j| &j.progress);
+        let scanned = p.map_or(self.search.results.scanned, |p| p.scanned);
+        let visited = p.map_or(self.search.results.visited, |p| p.visited);
+        if self.search_running() {
+            let spinner = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"];
+            let frame = self.search.job.as_ref().map_or(0, |j| (j.elapsed().as_millis() / 100) as usize % spinner.len());
+            let current = p.map(|p| p.current.as_str()).unwrap_or("");
+            return format!("{} Searching · {} results · {} files · {}", spinner[frame], self.search.results.matches, scanned, current);
+        }
+        if let Some(job) = &self.search.job
+            && job.is_cancelled() && !self.search.results.truncated {
+            return format!("Stopped · {} partial results · {} files scanned", self.search.results.matches, scanned);
+        }
+        let mut label = format!("{} match{} in {} file{} · {} scanned",
+            self.search.results.matches, if self.search.results.matches == 1 { "" } else { "es" },
+            self.search.results.files.len(), if self.search.results.files.len() == 1 { "" } else { "s" }, scanned);
+        if self.search.results.truncated { label.push_str(" · limit reached — raise limit or narrow filters"); }
+        if self.search.results.skipped_binary > 0 { label.push_str(&format!(" · {} binary skipped", self.search.results.skipped_binary)); }
+        if self.search.results.skipped_large > 0 { label.push_str(&format!(" · {} oversized skipped", self.search.results.skipped_large)); }
+        if !self.search.results.warnings.is_empty() { label.push_str(&format!(" · {}+ warnings", self.search.results.warnings.len())); }
+        if visited == 0 && self.search.results.matches == 0 { label = "No results · check the root and filters".into(); }
+        label
+    }
+
+    fn persist_search_preferences(&mut self) {
+        let mut prefs = self.preferences.clone();
+        prefs.search.max_results = self.search.options.max_results;
+        prefs.search.ignore_binary = self.search.options.ignore_binary;
+        if prefs.search != self.preferences.search
+            && let Err(e) = self.save_preferences(prefs) {
+            self.toast(format!("Search preference not saved: {e:#}"), ToastKind::Error);
+        }
+    }
+
+    fn search_replacement_ready(&mut self) -> bool {
+        self.update_search();
+        if self.search_running() || self.search.key.is_none() || self.search.error {
+            self.toast("Wait for a valid, completed content search before replacing", ToastKind::Info);
+            return false;
+        }
+        if !self.search.options.content {
+            self.toast("Enable Content to replace text; names are never renamed", ToastKind::Info);
+            return false;
+        }
+        if self.search.results.truncated {
+            self.toast("Raise the result limit or narrow filters before replacing; the list is capped", ToastKind::Info);
+            return false;
+        }
+        true
+    }
+
+    fn toggle_replace_search(&mut self) {
+        let replace = !self.search.replace;
+        self.search.replace = replace;
+        if replace { self.search.options.content = true; }
+        if !replace && self.search.field == SearchField::Replace { self.search.field = SearchField::Query; }
+        self.update_search();
+    }
+
+    fn refresh_search(&mut self) {
+        self.search.key = None;
+        self.update_search();
+        // F5/Refresh is explicit, so bypass typing debounce.
+        self.search.pending_since = Some(Instant::now() - Duration::from_millis(120));
+        self.start_search_if_due();
+    }
+
+    fn cancel_search(&mut self) {
+        if let Some(job) = &self.search.job { job.cancel(); }
+        self.search.pending_since = None;
     }
 
     fn first_search_hit(&self) -> Option<(usize, usize)> {
@@ -2570,47 +2688,54 @@ impl App {
 
     /// The flat rows of the results list: a header per file, then its
     /// matches (unless the file is collapsed).
-    pub fn search_rows(&self) -> Vec<(usize, Option<usize>)> {
-        let mut rows = Vec::new();
-        for (fi, f) in self.search.results.files.iter().enumerate() {
-            rows.push((fi, None));
-            if !self.search.collapsed.contains(&f.path) {
-                rows.extend((0..f.matches.len()).map(|mi| (fi, Some(mi))));
-            }
-        }
-        rows
+    fn rebuild_search_rows(&self) -> Vec<usize> {
+        let mut offset = 0;
+        self.search.results.files.iter().map(|f| {
+            let start = offset;
+            offset += 1 + if self.search.collapsed.contains(&f.path) { 0 } else { f.matches.len() };
+            start
+        }).collect()
     }
 
-    fn search_hits(&self) -> Vec<(usize, usize)> {
-        self.search
-            .results
-            .files
-            .iter()
-            .enumerate()
-            .flat_map(|(fi, f)| (0..f.matches.len()).map(move |mi| (fi, mi)))
-            .collect()
+    pub fn search_row_count(&self) -> usize {
+        self.search.results.files.iter().map(|f| 1 + if self.search.collapsed.contains(&f.path) { 0 } else { f.matches.len() }).sum()
+    }
+
+    /// Virtualized list: allocate only the rows actually visible, even at
+    /// 100,000 results. Binary search locates the first file in O(log files).
+    pub fn search_visible_rows(&self, start: usize, count: usize) -> Vec<(usize, Option<usize>)> {
+        if count == 0 { return Vec::new(); }
+        let offsets = self.rebuild_search_rows();
+        if offsets.is_empty() { return Vec::new(); }
+        let mut fi = offsets.partition_point(|&offset| offset <= start).saturating_sub(1);
+        let mut out = Vec::with_capacity(count);
+        for row in start..start.saturating_add(count) {
+            while fi + 1 < offsets.len() && row >= offsets[fi + 1] { fi += 1; }
+            if fi >= offsets.len() { break; }
+            let delta = row - offsets[fi];
+            let f = &self.search.results.files[fi];
+            if delta > f.matches.len() || (delta > 0 && self.search.collapsed.contains(&f.path)) { break; }
+            out.push((fi, delta.checked_sub(1)));
+        }
+        out
+    }
+
+    pub fn search_row_position(&self, fi: usize, mi: usize) -> Option<usize> {
+        let f = self.search.results.files.get(fi)?;
+        let offset: usize = self.search.results.files[..fi].iter().map(|f| 1 + if self.search.collapsed.contains(&f.path) { 0 } else { f.matches.len() }).sum();
+        if self.search.collapsed.contains(&f.path) { Some(offset) } else { Some(offset + 1 + mi) }
     }
 
     fn search_move(&mut self, delta: isize) {
-        let hits = self.search_hits();
-        if hits.is_empty() {
-            return;
-        }
-        let n = hits.len() as isize;
-        let next = match self
-            .search
-            .selected
-            .and_then(|s| hits.iter().position(|h| *h == s))
-        {
-            Some(i) => (i as isize + delta).rem_euclid(n),
-            None if delta < 0 => n - 1,
-            None => 0,
-        };
-        let (fi, mi) = hits[next as usize];
-        self.search.selected = Some((fi, mi));
-        if let Some(f) = self.search.results.files.get(fi) {
-            // Keyboard navigation should never land on a hidden row.
-            self.search.collapsed.remove(&f.path);
+        let total = self.search_row_count();
+        if total == 0 { self.search.selected = None; return; }
+        let current = self.search.selected.and_then(|(fi, mi)| self.search_row_position(fi, mi)).unwrap_or(0);
+        let row = current.saturating_add_signed(delta).min(total - 1);
+        let page = self.layout.search_list.height.max(1) as usize;
+        if row < self.search.scroll { self.search.scroll = row; }
+        else if row >= self.search.scroll + page { self.search.scroll = row + 1 - page; }
+        if let Some((fi, mi)) = self.search_visible_rows(row, 1).first().copied() {
+            self.search.selected = mi.map(|mi| (fi, mi)).or(Some((fi, 0)));
         }
     }
 
@@ -2642,10 +2767,17 @@ impl App {
         let Some(m) = f.matches.get(mi) else {
             return;
         };
-        let (path, line, start, end) = (f.path.clone(), m.line, m.start, m.end);
+        let (path, line, start, end, kind) = (f.path.clone(), m.line, m.start, m.end, m.kind);
         self.search.selected = Some((fi, mi));
+        if kind == search::MatchKind::DirectoryName {
+            self.explorer.reveal(&path);
+            self.explorer.expand();
+            self.show_sidebar = true;
+            self.toast("Directory revealed in Explorer", ToastKind::Info);
+            return;
+        }
         self.open_file(&path);
-        if let Some(e) = self.editor_mut() {
+        if kind == search::MatchKind::Content && let Some(e) = self.editor_mut() {
             let line = line.min(e.doc.len_lines().saturating_sub(1));
             let len = e.doc.line_len(line);
             let s = e.doc.idx(line, start.min(len));
@@ -2730,6 +2862,7 @@ impl App {
     }
 
     fn search_replace_all(&mut self) {
+        if !self.search_replacement_ready() { return; }
         let Some(re) = self.search_regex() else {
             return;
         };
@@ -2757,6 +2890,7 @@ impl App {
     }
 
     fn search_replace_file(&mut self) {
+        if !self.search_replacement_ready() { return; }
         if !self.search_hit_valid() {
             self.toast("Select a result first", ToastKind::Info);
             return;
@@ -2780,6 +2914,11 @@ impl App {
 
     /// Replace just the selected occurrence.
     pub fn search_replace_one(&mut self, fi: usize, mi: usize) {
+        if !self.search_replacement_ready() { return; }
+        if !self.search.results.files.get(fi).and_then(|f| f.matches.get(mi)).is_some_and(|m| m.kind == search::MatchKind::Content) {
+            self.toast("Name matches are read-only; select a content match to replace", ToastKind::Info);
+            return;
+        }
         let Some(re) = self.search_regex() else {
             return;
         };
@@ -2862,10 +3001,19 @@ impl App {
                 self.search_replace_file();
                 return;
             }
-            5 => {
-                self.close_search();
+            5 => { self.close_search(); return; }
+            6 => self.search.options.content = !self.search.options.content,
+            7 => self.search.options.file_names = !self.search.options.file_names,
+            8 => self.search.options.directory_names = !self.search.options.directory_names,
+            9 => {
+                self.search.options.ignore_binary = !self.search.options.ignore_binary;
+                self.persist_search_preferences();
+            }
+            10 => {
+                if self.search_running() { self.cancel_search(); } else { self.refresh_search(); }
                 return;
             }
+            11 => { self.toggle_replace_search(); return; }
             _ => return,
         }
         self.update_search();
@@ -2877,6 +3025,7 @@ impl App {
             SearchField::Root,
             SearchField::Dirs,
             SearchField::Filter,
+            SearchField::Limit,
         ];
         if self.search.replace {
             fields.insert(1, SearchField::Replace);
@@ -2886,6 +3035,7 @@ impl App {
             .position(|f| *f == self.search.field)
             .unwrap_or(0);
         let n = fields.len();
+        if self.search.field == SearchField::Limit && !self.search.limit_error { self.persist_search_preferences(); }
         self.search.field = fields[if back { (i + n - 1) % n } else { (i + 1) % n }];
     }
 
@@ -2920,6 +3070,11 @@ impl App {
                 return;
             }
             (KeyCode::Enter, false, false, false) => {
+                if self.search.field == SearchField::Limit {
+                    self.update_search();
+                    if !self.search.limit_error { self.persist_search_preferences(); }
+                    return;
+                }
                 if self.search.replace && self.search.field == SearchField::Replace {
                     self.search_replace_one_selected();
                 } else {
@@ -2927,12 +3082,12 @@ impl App {
                 }
                 return;
             }
-            (KeyCode::F(5), ..) => {
-                // Re-run the search after editing files behind the panel.
-                self.search.key = None;
-                self.update_search();
-                return;
-            }
+            (KeyCode::F(5), ..) => { self.refresh_search(); return; }
+            (KeyCode::Char('1'), _, _, true) => { self.search_button(6); return; }
+            (KeyCode::Char('2'), _, _, true) => { self.search_button(7); return; }
+            (KeyCode::Char('3'), _, _, true) => { self.search_button(8); return; }
+            (KeyCode::Char('b'), _, _, true) => { self.search_button(9); return; }
+            (KeyCode::Char('l'), _, _, true) => { self.search.field = SearchField::Limit; return; }
             (KeyCode::Up, ..) => {
                 self.search_move(-1);
                 return;
@@ -3215,6 +3370,8 @@ impl App {
     fn on_mouse(&mut self, m: MouseEvent) {
         let pos = Position::new(m.column, m.row);
         let l = self.layout.clone();
+        let (cw, ch) = self.image_cell_pixels;
+        let image_viewport = (u32::from(cw) * u32::from(l.text.width), u32::from(ch) * u32::from(l.text.height));
         match m.kind {
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
                 let d: isize = if m.kind == MouseEventKind::ScrollDown {
@@ -3229,8 +3386,8 @@ impl App {
                             .clamp(0, n.saturating_sub(1) as isize)
                             as usize;
                     }
-                } else if self.search.visible && l.search_box.contains(pos) {
-                    let rows = self.search_rows().len();
+                } else if self.search.visible && l.search_list.contains(pos) {
+                    let rows = self.search_row_count();
                     let max = rows.saturating_sub(l.search_list.height as usize);
                     self.search.scroll =
                         (self.search.scroll as isize + d).clamp(0, max as isize) as usize;
@@ -3247,7 +3404,7 @@ impl App {
                         (self.explorer.scroll as isize + d).clamp(0, max as isize) as usize;
                 } else if let Some(e) = self.editor_mut() {
                     if let Some(crate::document::Preview::Image(image)) = e.doc.preview.as_mut() {
-                        image.zoom_by(if d > 0 { -1 } else { 1 });
+                        image.zoom_at_size(if d > 0 { -1 } else { 1 }, image_viewport.0, image_viewport.1);
                         return;
                     }
                     if m.modifiers.contains(KeyModifiers::SHIFT) {
@@ -3366,6 +3523,11 @@ impl App {
             return;
         }
         if self.search.visible && l.search_box.contains(pos) {
+            if l.search_scrollbar.contains(pos) {
+                self.drag = Some(Drag::SearchScrollbar);
+                self.search_scroll_to(pos.y);
+                return;
+            }
             if let Some((_, b)) = l.search_buttons.iter().find(|(r, _)| r.contains(pos)) {
                 self.search_button(*b);
                 return;
@@ -3377,6 +3539,7 @@ impl App {
                     1 => SearchField::Replace,
                     2 => SearchField::Root,
                     3 => SearchField::Dirs,
+                    5 => SearchField::Limit,
                     _ => SearchField::Filter,
                 };
                 self.update_search();
@@ -3545,6 +3708,15 @@ impl App {
         }
     }
 
+    fn search_scroll_to(&mut self, y: u16) {
+        let track = self.layout.search_scrollbar;
+        let rows = self.search_row_count();
+        let page = self.layout.search_list.height as usize;
+        let max = rows.saturating_sub(page);
+        let at = y.saturating_sub(track.y) as usize;
+        self.search.scroll = (at * max / track.height.max(1) as usize).min(max);
+    }
+
     fn mouse_drag(&mut self, pos: Position) {
         let l = self.layout.clone();
         match self.drag {
@@ -3597,6 +3769,7 @@ impl App {
                     e.scroll_to_line(target.saturating_sub(half));
                 }
             }
+            Some(Drag::SearchScrollbar) => self.search_scroll_to(pos.y),
             Some(Drag::SidebarResize) => {
                 self.sidebar_width = pos.x.saturating_sub(l.sidebar.x).clamp(16, 80);
             }

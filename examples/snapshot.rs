@@ -21,12 +21,7 @@ use termed::app::App;
 
 fn mouse(kind: MouseEventKind, at: &str) -> Vec<Event> {
     let (x, y) = at.split_once(',').unwrap();
-    vec![Event::Mouse(MouseEvent {
-        kind,
-        column: x.parse().unwrap(),
-        row: y.parse().unwrap(),
-        modifiers: KeyModifiers::NONE,
-    })]
+    vec![Event::Mouse(MouseEvent::new(kind, x.parse().unwrap(), y.parse().unwrap(), KeyModifiers::NONE))]
 }
 
 fn key(spec: &str) -> Vec<Event> {
@@ -121,6 +116,7 @@ fn main() -> anyhow::Result<()> {
             let until = std::time::Instant::now() + std::time::Duration::from_millis(ms.parse()?);
             while std::time::Instant::now() < until {
                 app.pump_agent();
+                app.pump_search();
                 term.draw(|f| termed::ui::draw(f, &mut app, true))?;
                 std::thread::sleep(std::time::Duration::from_millis(30));
             }
@@ -134,6 +130,7 @@ fn main() -> anyhow::Result<()> {
                 && (app.agent.is_working() || app.agent.pending_permission().is_some())
             {
                 app.pump_agent();
+                app.pump_search();
                 term.draw(|f| termed::ui::draw(f, &mut app, true))?;
                 std::thread::sleep(std::time::Duration::from_millis(30));
             }
@@ -142,6 +139,7 @@ fn main() -> anyhow::Result<()> {
         for ev in key(k) {
             app.handle_event(ev);
             app.pump_agent();
+            app.pump_search();
             term.draw(|f| termed::ui::draw(f, &mut app, true))?;
         }
     }

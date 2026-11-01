@@ -1943,6 +1943,7 @@ dependencies = [
  "clap",
  "ignore",
  "image",
+ "memchr",
  "nucleo-matcher",
  "ratatui",
  "regex",

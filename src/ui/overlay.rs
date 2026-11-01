@@ -603,450 +603,207 @@ fn put_hit_text(
     }
 }
 
-/// Find/Replace in Files: inputs, options and a grouped results list.
+/// Find/Replace in Files: a full-height, virtualized result workbench.
 pub fn render_search(buf: &mut Buffer, editor: Rect, app: &mut App) -> Option<Position> {
-    if !app.search.visible {
-        return None;
-    }
+    use crate::app::SearchField;
+    if !app.search.visible { return None; }
     let pal = app.theme.palette.clone();
-    let nerd = app.settings.nerd_font;
     let compact = app.compact;
     let replace = app.search.replace;
-    let rows = app.search_rows();
-    let w = if compact {
-        editor.width
-    } else {
-        (editor.width.saturating_mul(4) / 5)
-            .clamp(50, 96)
-            .min(editor.width.saturating_sub(4))
+    let w = if compact { editor.width } else {
+        (editor.width.saturating_mul(9) / 10).clamp(60, 120).min(editor.width.saturating_sub(2))
     };
-    if w < 30 || editor.height < 7 {
-        return None;
-    }
-    // rows: query, [replace], root, dirs, files, status, results; border.
-    let fixed = 7 + u16::from(replace);
-    let max_h = editor.height.saturating_sub(u16::from(!compact));
-    if max_h <= fixed {
-        return None;
-    }
-    let list_rows = (rows.len() as u16).clamp(1, 12).min(max_h - fixed);
-    let h = fixed + list_rows;
-    let x = if compact {
-        editor.x
-    } else {
-        editor.x + (editor.width - w) / 2
-    };
-    let y = editor.y + u16::from(!compact);
-    let r = Rect::new(x, y, w, h);
-    panel(
-        buf,
-        r,
-        pal.accent,
-        pal.popup_bg,
-        Some(if replace {
-            "Replace in Files"
-        } else {
-            "Find in Files"
-        }),
-    );
-    app.layout.search_box = r;
+    // query, targets, root, dirs, files, limit/options, progress, footer + borders.
+    let fixed = 10 + u16::from(replace);
+    let h = editor.height.saturating_sub(u16::from(!compact));
+    if w < 30 || h <= fixed { return None; }
+    let r = Rect::new(editor.x + (editor.width - w) / 2, editor.y + u16::from(!compact), w, h);
     let bg = pal.popup_bg;
+    panel(buf, r, pal.accent, bg, Some(if replace { "Replace in Files" } else { "Find in Files" }));
+    app.layout.search_box = r;
     let focused = app.focus == Focus::Search;
     let mut caret = None;
-
-    // ------------------------------------------------------------ query row
+    let active_field = app.search.field;
+    let mut field = |buf: &mut Buffer, y, id, icon: &str, text: &str, cursor, hint: &str, target| {
+        put(buf, r.x + 2, y, icon, bold(fgbg(pal.accent, bg)), r.right());
+        let input_width = if id == 0 { r.width.saturating_sub(17) } else { r.width.saturating_sub(7) };
+        let c = input(buf, Rect::new(r.x + 5, y, input_width, 1),
+            text, cursor, hint, pal.popup_fg, pal.popup_dim, pal.input_bg);
+        if focused && active_field == target { caret = Some(c); }
+        app.layout.search_fields.push((Rect::new(r.x + 1, y, r.width - 2, 1), id));
+    };
     let qy = r.y + 1;
-    put(buf, r.x + 2, qy, "⌕", bold(fgbg(pal.accent, bg)), r.right());
-    let opts_w = 9;
-    let qx = r.x + 4;
-    let qw = r.right().saturating_sub(2 + opts_w).saturating_sub(qx);
-    let c = input(
-        buf,
-        Rect::new(qx, qy, qw, 1),
-        &app.search.query,
-        app.search.query_cursor,
-        "Search",
-        pal.popup_fg,
-        pal.popup_dim,
-        pal.input_bg,
-    );
-    if focused && app.search.field == crate::app::SearchField::Query {
-        caret = Some(c);
-    }
-    if app.search.query_selected && !app.search.query.is_empty() {
-        let qn = width(&app.search.query).min(qw.saturating_sub(1));
-        for i in 0..qn {
-            super::util::set_bg(buf, qx + i, qy, pal.selection);
-        }
-    }
-    app.layout
-        .search_fields
-        .push((Rect::new(r.x + 1, qy, r.width - 2, 1), 0));
-    let mut bx = r.x + 4 + qw + 1;
-    for (i, (label, on)) in [
-        ("Aa", app.search.case_sensitive),
-        ("ab", app.search.whole_word),
-        (".*", app.search.regex),
-    ]
-    .iter()
-    .enumerate()
-    {
-        let st = if *on {
-            bold(fgbg(pal.accent_fg, pal.accent))
-        } else {
-            fgbg(pal.popup_dim, pal.input_bg)
-        };
+    field(buf, qy, 0, "⌕", &app.search.query, app.search.query_cursor,
+        "Search text or names…", SearchField::Query);
+    // Overlay the familiar compact matcher toggles at the end of the query.
+    let mut bx = r.right().saturating_sub(10);
+    for (i, (label, on)) in [("Aa", app.search.case_sensitive), ("ab", app.search.whole_word), (".*", app.search.regex)].iter().enumerate() {
+        let st = if *on { bold(fgbg(pal.accent_fg, pal.accent)) } else { fgbg(pal.popup_fg, pal.input_bg) };
         put(buf, bx, qy, label, st, r.right());
-        app.layout
-            .search_buttons
-            .push((Rect::new(bx, qy, 3, 1), i as u8));
+        app.layout.search_buttons.push((Rect::new(bx, qy, 3, 1), i as u8));
         bx += 3;
     }
-
-    // ---------------------------------------------------------- replace row
-    let ry = r.y + 2;
+    if app.search.query_selected && !app.search.query.is_empty() {
+        let qx = r.x + 5;
+        let end = (qx + width(&app.search.query)).min(bx);
+        for x in qx..end { super::util::set_bg(buf, x, qy, pal.selection); }
+    }
+    let mut y = qy + 1;
     if replace {
-        put(buf, r.x + 2, ry, "⇄", bold(fgbg(pal.accent, bg)), r.right());
-        let btn_w = 12;
-        let rw = r.right().saturating_sub(2 + btn_w).saturating_sub(r.x + 4);
-        let c = input(
-            buf,
-            Rect::new(r.x + 4, ry, rw, 1),
-            &app.search.replacement,
-            app.search.replace_cursor,
-            "Replace with ($1, $2 for groups)",
-            pal.popup_fg,
-            pal.popup_dim,
-            pal.input_bg,
-        );
-        if focused && app.search.field == crate::app::SearchField::Replace {
-            caret = Some(c);
-        }
-        app.layout
-            .search_fields
-            .push((Rect::new(r.x + 1, ry, r.width - 2, 1), 1));
-        let btn_x = r.right().saturating_sub(1 + btn_w);
-        let st = fgbg(pal.popup_fg, mix(bg, pal.popup_fg, 0.12));
-        put(buf, btn_x, ry, "⇄ All", st, r.right());
-        app.layout
-            .search_buttons
-            .push((Rect::new(btn_x, ry, 5, 1), 3));
-        put(buf, btn_x + 6, ry, "⇄ File", st, r.right());
-        app.layout
-            .search_buttons
-            .push((Rect::new(btn_x + 6, ry, 6, 1), 4));
+        field(buf, y, 1, "⇄", &app.search.replacement, app.search.replace_cursor,
+            "Replace content with… ($1 for capture groups)", SearchField::Replace);
+        y += 1;
     }
-
-    // ------------------------------------------------------------ root row
-    let root_y = r.y + 2 + u16::from(replace);
-    put(
-        buf,
-        r.x + 2,
-        root_y,
-        "⌂",
-        bold(fgbg(pal.accent, bg)),
-        r.right(),
-    );
+    let target_y = y;
+    put(buf, r.x + 2, y, "IN", fgbg(pal.popup_dim, bg), r.right());
+    let mut x = r.x + 5;
+    for (label, on, id) in [
+        (if compact { "Text" } else { "Content" }, app.search.options.content, 6),
+        (if compact { "Files" } else { "File names" }, app.search.options.file_names, 7),
+        (if compact { "Dirs" } else { "Directory names" }, app.search.options.directory_names, 8),
+    ] {
+        let text = format!("{} {label}", if on { "✓" } else { "○" });
+        let bw = width(&text) + 2;
+        let st = if on { bold(fgbg(pal.accent_fg, pal.accent)) } else { fgbg(pal.popup_fg, pal.input_bg) };
+        put(buf, x, y, &format!(" {text} "), st, r.right());
+        app.layout.search_buttons.push((Rect::new(x, y, bw, 1), id));
+        x += bw + 1;
+    }
+    y += 1;
     let project = crate::search::root_label(&app.explorer.root);
-    let root_hint = if compact {
-        project.clone()
+    field(buf, y, 2, "⌂", &app.search.root, app.search.root_cursor,
+        &format!("Folder · {project}"), SearchField::Root);
+    y += 1;
+    field(buf, y, 3, "▤", &app.search.dirs, app.search.dirs_cursor,
+        if compact { "Folders: src;!bin" } else { "Only folders: src;!bin   (! excludes)" }, SearchField::Dirs);
+    y += 1;
+    field(buf, y, 4, "⚑", &app.search.filter, app.search.filter_cursor,
+        if compact { "Files: *.rs;!*.lock" } else { "File filter: *.rs;*.toml;!*.lock" }, SearchField::Filter);
+    y += 1;
+    let limit_w = 8;
+    let lx = r.right().saturating_sub(limit_w + 2);
+    put(buf, r.x + 2, y, if compact { "Max" } else { "Result limit" }, fgbg(pal.popup_fg, bg), lx);
+    let c = input(buf, Rect::new(lx, y, limit_w, 1), &app.search.limit_input,
+        app.search.limit_cursor, "10000", if app.search.limit_error { pal.error } else { pal.popup_fg },
+        pal.popup_dim, pal.input_bg);
+    if focused && app.search.field == SearchField::Limit { caret = Some(c); }
+    app.layout.search_fields.push((Rect::new(lx, y, limit_w, 1), 5));
+    let binary = format!(" {} Skip binary (NUL) ", if app.search.options.ignore_binary { "✓" } else { "○" });
+    let binary_x = r.x + (if compact { 6 } else { 15 });
+    if binary_x + width(&binary) < lx {
+        let st = if app.search.options.ignore_binary { fgbg(pal.accent, bg) } else { fgbg(pal.popup_dim, bg) };
+        put(buf, binary_x, y, &binary, st, lx);
+        app.layout.search_buttons.push((Rect::new(binary_x, y, width(&binary), 1), 9));
     } else {
-        format!("search in: {project}")
-    };
-    let c = input(
-        buf,
-        Rect::new(r.x + 4, root_y, r.width.saturating_sub(6), 1),
-        &app.search.root,
-        app.search.root_cursor,
-        &root_hint,
-        if app.search.missing_root {
-            pal.error
-        } else {
-            pal.popup_fg
-        },
-        pal.popup_dim,
-        pal.input_bg,
-    );
-    if focused && app.search.field == crate::app::SearchField::Root {
-        caret = Some(c);
+        // Phone: binary toggle replaces the verbose label, stays touch-accessible.
+        put(buf, r.x + 2, y, "NUL", fgbg(pal.popup_fg, bg), lx);
+        let label = if app.search.options.ignore_binary { "✓ Skip" } else { "○ Include" };
+        let st = fgbg(pal.accent, bg);
+        put(buf, r.x + 6, y, label, st, lx);
+        app.layout.search_buttons.push((Rect::new(r.x + 2, y, lx.saturating_sub(r.x + 2), 1), 9));
     }
-    app.layout
-        .search_fields
-        .push((Rect::new(r.x + 1, root_y, r.width - 2, 1), 2));
-
-    // ------------------------------------------------------------ dirs row
-    let dyy = root_y + 1;
-    put(
-        buf,
-        r.x + 2,
-        dyy,
-        "▤",
-        bold(fgbg(pal.accent, bg)),
-        r.right(),
-    );
-    let dirs_hint = if compact {
-        "src;!bin;!obj"
-    } else {
-        "dirs: src;!bin;!obj   (plain = only these, ! = skip)"
-    };
-    let c = input(
-        buf,
-        Rect::new(r.x + 4, dyy, r.width.saturating_sub(6), 1),
-        &app.search.dirs,
-        app.search.dirs_cursor,
-        &dirs_hint,
-        pal.popup_fg,
-        pal.popup_dim,
-        pal.input_bg,
-    );
-    if focused && app.search.field == crate::app::SearchField::Dirs {
-        caret = Some(c);
-    }
-    app.layout
-        .search_fields
-        .push((Rect::new(r.x + 1, dyy, r.width - 2, 1), 3));
-
-    // ----------------------------------------------------------- files row
-    let fy = dyy + 1;
-    put(buf, r.x + 2, fy, "⚑", bold(fgbg(pal.accent, bg)), r.right());
-    let fw = r.width.saturating_sub(6);
-    let filter_hint = if compact {
-        "*.cs;!*.csproj"
-    } else {
-        "files: *.cs;!*.csproj   (globs, ! excludes)"
-    };
-    let c = input(
-        buf,
-        Rect::new(r.x + 4, fy, fw, 1),
-        &app.search.filter,
-        app.search.filter_cursor,
-        &filter_hint,
-        pal.popup_fg,
-        pal.popup_dim,
-        pal.input_bg,
-    );
-    if focused && app.search.field == crate::app::SearchField::Filter {
-        caret = Some(c);
-    }
-    app.layout
-        .search_fields
-        .push((Rect::new(r.x + 1, fy, r.width - 2, 1), 4));
-
-    // ----------------------------------------------------------- status row
-    let sy = fy + 1;
-    let status = {
-        let results = &app.search.results;
-        if app.search.error {
-            "Invalid pattern".to_string()
-        } else if app.search.missing_root {
-            format!(
-                "No such folder: {}",
-                crate::search::root_label(&app.search.root_path)
-            )
-        } else if app.search.query.is_empty() {
-            "Type a query to search every file in the project".to_string()
-        } else if let Some(error) = results.warnings.first() {
-            format!("Search incomplete: {error}")
-        } else if results.matches == 0 {
-            format!(
-                "No results · {} files scanned (check root and filters)",
-                results.scanned
-            )
-        } else {
-            let mut s = format!(
-                "{} match{} in {} file{}",
-                results.matches,
-                if results.matches == 1 { "" } else { "es" },
-                results.files.len(),
-                if results.files.len() == 1 { "" } else { "s" }
-            );
-            if results.truncated {
-                s.push_str(" · showing the first results");
-            } else {
-                s.push_str(&format!(" · {} scanned", results.scanned));
-            }
-            // When the search is rooted somewhere else, say where.
-            if !app.search.root.trim().is_empty() {
-                s.push_str(&format!(
-                    " · in {}",
-                    crate::search::root_label(&app.search.root_path)
-                ));
-            }
-            s
+    y += 1;
+    if replace {
+        let mut x = r.x + 2;
+        for (label, id) in [(" Replace all ", 3), (" Replace file ", 4), (" Find only ", 11)] {
+            put(buf, x, y, label, fgbg(pal.popup_fg, pal.input_bg), r.right());
+            app.layout.search_buttons.push((Rect::new(x, y, width(label), 1), id));
+            x += width(label) + 1;
         }
-    };
-    let sc = if app.search.error || app.search.missing_root {
-        pal.error
-    } else if !app.search.results.warnings.is_empty() {
-        pal.warning
-    } else {
-        pal.popup_dim
-    };
-    let close_x = r.right().saturating_sub(2);
-    put(
-        buf,
-        r.x + 3,
-        sy,
-        &ellipsize(&status, close_x.saturating_sub(r.x + 4) as usize),
-        fgbg(sc, bg),
-        close_x,
-    );
-    put(buf, close_x, sy, "×", fgbg(pal.popup_fg, bg), r.right());
-    app.layout
-        .search_buttons
-        .push((Rect::new(close_x, sy, 1, 1), 5));
-
-    // --------------------------------------------------------- results list
-    let list = Rect::new(
-        r.x + 1,
-        sy + 1,
-        r.width.saturating_sub(2),
-        r.bottom().saturating_sub(1).saturating_sub(sy + 1),
-    );
+        y += 1;
+    }
+    let _status_y = y;
+    let running = app.search_running();
+    let action = if running { "■ Stop" } else { "↻ Run" };
+    let action_x = r.right().saturating_sub(10);
+    let status = app.search_progress_label();
+    let color = if app.search.error || app.search.limit_error { pal.error }
+        else if !app.search.results.warnings.is_empty() || app.search.results.truncated { pal.warning }
+        else if running { pal.accent } else { pal.popup_fg };
+    put(buf, r.x + 2, y, &ellipsize(&status, action_x.saturating_sub(r.x + 3) as usize), fgbg(color, bg), action_x);
+    put(buf, action_x, y, action, bold(fgbg(pal.accent, bg)), r.right());
+    app.layout.search_buttons.push((Rect::new(action_x, y, 6, 1), 10));
+    let close_x = r.right().saturating_sub(3);
+    put(buf, close_x, y, "×", fgbg(pal.popup_fg, bg), r.right());
+    app.layout.search_buttons.push((Rect::new(close_x, y, 1, 1), 5));
+    y += 1;
+    let list = Rect::new(r.x + 1, y, r.width.saturating_sub(3), r.bottom().saturating_sub(y + 2));
     app.layout.search_list = list;
-    if rows.is_empty() {
-        let msg = if app.search.error {
-            "Fix the pattern to see results"
-        } else if app.search.missing_root {
-            "That folder does not exist - clear the root box to search the project"
-        } else if app.search.query.is_empty() {
-            "Filter with globs: dirs src;!bin   files *.cs;!*.csproj"
-        } else {
-            "No matches"
-        };
-        put(
-            buf,
-            list.x + 2,
-            list.y,
-            &ellipsize(msg, list.width.saturating_sub(4) as usize),
-            fgbg(pal.popup_dim, bg),
-            list.right(),
-        );
-        return focused.then_some(caret).flatten();
-    }
-    if list.height == 0 {
-        return focused.then_some(caret).flatten();
-    }
-    // Keep the selected row on screen.
-    let selected_row = app
-        .search
-        .selected
-        .and_then(|(fi, mi)| rows.iter().position(|(f, m)| *f == fi && *m == Some(mi)));
-    if let Some(sr) = selected_row {
-        if sr < app.search.scroll {
-            app.search.scroll = sr;
-        } else if sr >= app.search.scroll + list.height as usize {
-            app.search.scroll = sr + 1 - list.height as usize;
-        }
-    }
-    let max_scroll = rows.len().saturating_sub(list.height as usize);
+    let rows = app.search_row_count();
+    let page = list.height as usize;
+    let max_scroll = rows.saturating_sub(page);
     app.search.scroll = app.search.scroll.min(max_scroll);
-
-    for row in 0..list.height as usize {
-        let idx = app.search.scroll + row;
-        let Some(&(fi, mi)) = rows.get(idx) else {
-            break;
-        };
-        let Some(f) = app.search.results.files.get(fi) else {
-            continue;
-        };
+    let visible = app.search_visible_rows(app.search.scroll, page);
+    if rows == 0 {
+        let msg = if app.search.error { "Fix the pattern or folder to continue" }
+            else if app.search.limit_error { "Enter a result limit from 1 to 100000" }
+            else if running { "Searching… results appear here as they arrive" }
+            else if app.search.query.is_empty() { "Try a symbol, filename, or folder name" }
+            else { "No matches — check targets, folder, and filters" };
+        put(buf, list.x + 2, list.y + 1, &ellipsize(msg, list.width.saturating_sub(4) as usize), fgbg(pal.popup_dim, bg), list.right());
+    }
+    let track = Rect::new(list.right(), list.y, 1, list.height);
+    app.layout.search_scrollbar = track;
+    if rows > page && page > 0 {
+        fill(buf, track, pal.input_bg);
+        let thumb = (page * page / rows).clamp(1, page) as u16;
+        let at = (app.search.scroll * (page - thumb as usize) / max_scroll.max(1)) as u16;
+        fill(buf, Rect::new(track.x, track.y + at, 1, thumb), pal.accent);
+    }
+    let nerd = app.settings.nerd_font;
+    for (row, (fi, mi)) in visible.into_iter().enumerate() {
+        let Some(f) = app.search.results.files.get(fi) else { continue; };
         let y = list.y + row as u16;
         match mi {
             None => {
                 let hbg = mix(bg, pal.bg, 0.4);
                 fill(buf, Rect::new(list.x, y, list.width, 1), hbg);
                 let collapsed = app.search.collapsed.contains(&f.path);
-                let mut x = put(
-                    buf,
-                    list.x + 1,
-                    y,
-                    if collapsed { "▸" } else { "▾" },
-                    fgbg(pal.popup_dim, hbg),
-                    list.right(),
-                );
-                let icon = icons::file_icon(&f.rel, nerd);
-                x = put(
-                    buf,
-                    x + 1,
-                    y,
-                    icon.glyph,
-                    fgbg(icon.color, hbg),
-                    list.right(),
-                );
-                let name_w = (list.width as usize).saturating_sub(14);
-                let label = ellipsize(&f.rel, name_w);
-                put(
-                    buf,
-                    x + 1,
-                    y,
-                    &label,
-                    bold(fgbg(pal.popup_fg, hbg)),
-                    list.right(),
-                );
+                let is_dir = f.matches.first().is_some_and(|m| m.kind == crate::search::MatchKind::DirectoryName);
+                let mut x = put(buf, list.x + 1, y, if collapsed { "▸" } else { "▾" }, fgbg(pal.popup_dim, hbg), list.right());
+                let icon = if is_dir { icons::file_icon("folder", nerd) } else { icons::file_icon(&f.rel, nerd) };
+                x = put(buf, x + 1, y, icon.glyph, fgbg(icon.color, hbg), list.right());
                 let count = format!("{} ", f.matches.len());
-                put(
-                    buf,
-                    list.right().saturating_sub(width(&count) + 1),
-                    y,
-                    &count,
-                    fgbg(pal.popup_dim, hbg),
-                    list.right(),
-                );
-                app.layout
-                    .search_files
-                    .push((Rect::new(list.x, y, list.width, 1), fi));
+                let name_w = (list.width as usize).saturating_sub(12);
+                put(buf, x + 1, y, &ellipsize(&f.rel, name_w), bold(fgbg(pal.popup_fg, hbg)), list.right());
+                put(buf, list.right().saturating_sub(width(&count) + 1), y, &count, fgbg(pal.popup_dim, hbg), list.right());
+                app.layout.search_files.push((Rect::new(list.x, y, list.width, 1), fi));
             }
             Some(mi) => {
-                let Some(hit) = f.matches.get(mi) else {
-                    continue;
-                };
+                let Some(hit) = f.matches.get(mi) else { continue; };
                 let selected = app.search.selected == Some((fi, mi));
                 let hbg = if selected { pal.popup_selected } else { bg };
                 fill(buf, Rect::new(list.x, y, list.width, 1), hbg);
-                if selected {
-                    put(buf, list.x, y, "▌", fgbg(pal.accent, hbg), list.right());
-                }
-                let lnum = format!("{:>5}", hit.line + 1);
-                let mut x = put(
-                    buf,
-                    list.x + 2,
-                    y,
-                    &lnum,
-                    fgbg(pal.gutter_fg, hbg),
-                    list.right(),
-                );
-                x += 1;
+                if selected { put(buf, list.x, y, "▌", fgbg(pal.accent, hbg), list.right()); }
+                let name_hit = hit.kind != crate::search::MatchKind::Content;
+                let lnum = if name_hit { " name".into() } else { format!("{:>5}", hit.line + 1) };
+                let x = put(buf, list.x + 2, y, &lnum, fgbg(pal.gutter_fg, hbg), list.right()) + 1;
                 let mut right = list.right();
-                if replace {
+                if replace && !name_hit {
                     let btn = Rect::new(list.right().saturating_sub(2), y, 2, 1);
                     put(buf, btn.x, y, "⇄", fgbg(pal.popup_dim, hbg), list.right());
-                    app.layout.search_replace_hits.push((btn, (fi, mi)));
+                    app.layout.search_replace_hits.push((btn, (fi,mi)));
                     right = btn.x.saturating_sub(1);
                 }
-                let hl = if selected {
-                    bold(fgbg(pal.accent_fg, pal.accent))
-                } else {
-                    bold(fgbg(pal.match_fg, hbg))
-                };
-                put_hit_text(
-                    buf,
-                    x,
-                    y,
-                    &hit.text,
-                    hit.start,
-                    hit.end,
-                    fgbg(pal.popup_fg, hbg),
-                    hl,
-                    right,
-                );
-                app.layout
-                    .search_hits
-                    .push((Rect::new(list.x, y, list.width, 1), (fi, mi)));
+                let hl = if selected { bold(fgbg(pal.accent_fg, pal.accent)) } else { bold(fgbg(pal.match_fg, hbg)) };
+                put_hit_text(buf, x, y, &hit.text, hit.start.saturating_sub(hit.text_offset),
+                    hit.end.saturating_sub(hit.text_offset), fgbg(pal.popup_fg, hbg), hl, right);
+                app.layout.search_hits.push((Rect::new(list.x, y, list.width, 1), (fi,mi)));
             }
         }
     }
+    let footer_y = r.bottom() - 2;
+    let left = if rows == 0 { 0 } else { app.search.scroll + 1 };
+    let summary = format!("{left}–{} / {rows} rows", (app.search.scroll + page).min(rows));
+    put(buf, r.x + 2, footer_y, &summary, fgbg(pal.popup_dim, bg), r.right());
+    let hint = if compact { "Tab fields · ↑↓ · Enter" } else if replace { "Ctrl+Enter all · Alt+Enter file · Ctrl+Shift+Enter one" }
+        else { "Tab fields · ↑↓/PgUp/PgDn · Enter open · F5 refresh · Alt+1/2/3 targets" };
+    let hx = r.x + 24;
+    put(buf, hx, footer_y, &ellipsize(hint, r.right().saturating_sub(hx + 1) as usize), fgbg(pal.popup_dim, bg), r.right());
+    let _ = target_y;
     focused.then_some(caret).flatten()
 }
+
 
 pub fn render_dialog(buf: &mut Buffer, screen: Rect, app: &mut App) {
     let pal = app.theme.palette.clone();

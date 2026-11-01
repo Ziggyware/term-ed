@@ -75,7 +75,7 @@ termed adapts to phone terminals such as Termux, Blink, Termius and iSH. Below 8
 
 ![Termed Studio displaying an image from inside an expanded ZIP](docs/studio-assets.png)
 
-- **Real image previews:** PNG, JPEG, GIF, WebP, BMP and ICO open on a read-only, theme-aware canvas with transparency, fit/zoom/pan and original-byte export. `+` / `-` zoom, arrows pan, `0` fits; the controls also work by click/tap. SVG stays editable source. The portable half-block renderer needs no terminal graphics protocol; image resolution follows the terminal grid.
+- **Real image previews:** PNG, JPEG, GIF, WebP, BMP and ICO open on a read-only, theme-aware canvas with transparency, fit/zoom/pan and original-byte export. `+` / `-` zoom, arrows pan, `0` fits, `1` shows actual pixels (1:1); the controls also work by click/tap. SVG stays editable source. Kitty and iTerm2 terminals get native-resolution graphics; other terminals use the portable half-block renderer, whose resolution follows the terminal grid.
 - **ZIPs as folders and files:** expand a ZIP in Explorer to browse its virtual folders, edit text members and view image members without extracting. `Ctrl+S` saves a text member with a temporary-file rebuild and conflict checks. Select the ZIP and press **Shift+Enter** to open its read-only overview; Save As copies the archive itself. Text members can also be exported or saved as new members.
 - **Termed Studio:** an optional professional palette with layered navy surfaces, a restrained cool accent and readable secondary text. Try `termed -t "Termed Studio" .`, or choose it in the theme picker. Existing defaults are unchanged.
 
@@ -83,25 +83,30 @@ See [images, archive safety, controls and UI/UX research](docs/assets-and-interf
 
 ### Find in files
 
-`Ctrl+Shift+F` (or **Find in Files** in the command palette) opens the panel above the editor. Results update as you type, include unsaved editor buffers (even new or ignored files with a path), and are grouped by file: click a file header to collapse it, click a hit to open it.
+`Ctrl+Shift+F` (or **Find in Files** in the command palette) opens the panel above the editor. Search runs asynchronously: the editor stays responsive, a live progress line shows scanned files/matches/skips and the current path, and **Stop** (or `Esc`) cancels. Results stream in as they are found, include unsaved editor buffers (even new or ignored files with a path), and are grouped by file: click a file header to collapse it, click a hit to open it. The result list is virtualized and capped by a configurable **Limit** (default 10,000, max 100,000) instead of a hidden per-file cap.
 
-The panel has four boxes, cycled with `Tab`: the **query**, the **root** to search in (empty means the project folder; absolute paths, `~` and relative paths such as `../other` are accepted), the **dirs** filter (`src` searches only that folder, `!bin;!obj;!node_modules` skips those folders at any depth) and the **files** filter (`*.cs;!*.csproj`, with `*`, `?`, `[...]` and `**`). Directories are matched against the folder path, files against the name and the path tail, so `src/*.rs` works where it appears.
+The targets are independently selectable: **Content**, **File names** and **Directory names** (`Alt+1` / `Alt+2` / `Alt+3`). **Skip binary (NUL)** (`Alt+b`) ignores any file containing a zero byte for content scans; file/directory-name targets still match those paths. The limit is persisted in user preferences (`search.max_results`) and can be edited in the panel (`Alt+l`), where an invalid value is rejected instead of silently clamped.
+
+The fields are cycled with `Tab`: **query**, optional **replace**, **root** (empty means the project folder; absolute paths, `~` and relative paths such as `../other` are accepted), **dirs** (`src` searches only that folder, `!bin;!obj;!node_modules` skips those folders at any depth), **files** (`*.cs;!*.csproj`, with `*`, `?`, `[...]` and `**`) and **limit**. Directories are matched against the folder path, files against the name and the path tail, so `src/*.rs` works where it appears.
 
 | Key | Action |
 | --- | --- |
-| `Tab` / `Shift+Tab` | Next / previous box (query, replace, root, dirs, files) |
+| `Tab` / `Shift+Tab` | Next / previous field |
 | `↑` / `↓`, `PgUp` / `PgDn` | Move through the hits |
 | `Enter` | Open the selected hit (in the replace box: replace it) |
 | `Ctrl+Enter` | Replace every hit |
 | `Ctrl+Shift+Enter` | Replace only the selected hit |
 | `Alt+Enter` | Replace every hit in the selected file |
+| `Alt+1` / `Alt+2` / `Alt+3` | Toggle content / file-name / directory-name targets |
+| `Alt+B` | Toggle skip-binary (NUL) |
+| `Alt+L` | Edit the result limit |
 | `Alt+C` / `Alt+W` / `Alt+R` | Toggle case sensitivity, whole word, regex |
 | `F5` | Re-run the search after changes made behind the panel |
-| `Esc` | Close the panel |
+| `Esc` | Stop a running search, otherwise close the panel |
 
 Directory scopes also work below intermediate folders (`src`, `**/src`, `packages/*/src`). Explicit filters still apply to open buffers. Missing/inaccessible roots and filesystem errors are reported instead of silently returning an unexplained empty result. **Search** in the desktop title bar is an alternative to `Ctrl+Shift+F` for terminals that cannot distinguish shifted Ctrl keys.
 
-Regex mode supports capture groups in the replacement (`$1`, `${name}`). Matches inside a folder excluded by the filter are never touched, even by Replace All.
+Regex mode supports capture groups in the replacement (`$1`, `${name}`). Matches inside a folder excluded by the filter are never touched, even by Replace All. Replacement requires a completed **Content** search and refuses truncated result lists; raise the limit or narrow the filters first. Content files are bounded to 16 MiB (2 MiB for replacement) and oversized files are reported as skips rather than silently searched.
 
 ### Settings, AI configuration, sub-agents and skills
 
@@ -186,10 +191,10 @@ Some combinations (Ctrl+Shift+…, Ctrl+Enter, Ctrl+[) can only be told apart in
 | Syntax highlighting | [syntect](https://github.com/trishume/syntect) + [two-face](https://github.com/CosmicHorrorDev/two-face) | Sublime Text / TextMate grammars with bat's extended set of 192 languages, the same grammar format VS Code uses. |
 | Fuzzy matching | [nucleo-matcher](https://github.com/helix-editor/nucleo) | The fzf-quality matcher from Helix, used for quick open and the palette. |
 | File tree | [ignore](https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore) | ripgrep's walker; respects `.gitignore`. |
-| Image preview | [image](https://github.com/image-rs/image) | Bounded decoding, EXIF orientation, alpha-aware half-block canvas. |
+| Image preview | [image](https://github.com/image-rs/image) | Bounded decoding, EXIF orientation, premultiplied viewport sampling, native Kitty/iTerm2 graphics with half-block fallback. |
 | ZIP folders | [zip](https://github.com/zip-rs/zip2) | Virtual member paths, bounded reads and atomic container replacement. |
 | Change margin | [similar](https://github.com/mitsuhiko/similar) | Fast line diff against the saved file. |
-| Find / replace | [regex](https://github.com/rust-lang/regex) | Linear-time regex with capture-group replacement. |
+| Find / replace | [regex](https://github.com/rust-lang/regex) + [ignore](https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore) + [memchr](https://github.com/BurntSushi/memchr) | Parallel cancellable walk, batched streaming results, SIMD NUL detection and linear-time regex replacement. |
 | AI agents | [Agent Client Protocol](https://agentclientprotocol.com) + [serde_json](https://github.com/serde-rs/json) + [ureq](https://github.com/algesten/ureq) | ACP is the open standard Zed and JetBrains use for coding agents. ureq (with rustls and bundled root certificates) lets the built-in agent reach free models from anywhere, including Android. |
 | Text width | [unicode-width](https://github.com/unicode-rs/unicode-width) | Correct columns for CJK and wide characters. |
 | Plugins | JSON-RPC 2.0 over stdio | Line-delimited JSON, the same transport as LSP and ACP, so any language can be a plugin. See [docs/plugins.md](docs/plugins.md). |

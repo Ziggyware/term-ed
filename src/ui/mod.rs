@@ -20,6 +20,7 @@ use crate::theme::mix;
 use util::{bold, ellipsize, fg, fgbg, fill, put, put_char, width};
 
 pub fn draw(frame: &mut Frame, app: &mut App, truecolor: bool) {
+    app.graphics.pending = None;
     let area = frame.area();
     app.layout = Layout::default();
     let buf = frame.buffer_mut();
@@ -164,6 +165,9 @@ pub fn draw(frame: &mut Frame, app: &mut App, truecolor: bool) {
         app,
         toasts_top,
     );
+    if app.palette.is_some() || app.dialog.is_some() || app.search.visible || app.find.visible || !app.toasts.is_empty() {
+        app.graphics.pending = None;
+    }
     if app.palette.is_some() {
         cursor = overlay::render_palette(buf, area, app);
     }

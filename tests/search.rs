@@ -47,6 +47,7 @@ fn type_text(app: &mut App, text: &str) {
     for c in text.chars() {
         key(app, KeyCode::Char(c), KeyModifiers::NONE);
     }
+    app.finish_search();
 }
 
 fn screen(term: &Terminal<TestBackend>) -> String {
@@ -232,6 +233,7 @@ fn panel_searches_filters_opens_and_replaces() {
     app.search.replacement = "struct".to_string();
     app.run(Command::ReplaceInFiles);
     assert!(app.search.replace);
+    app.finish_search();
     key(&mut app, KeyCode::Enter, KeyModifiers::CONTROL);
 
     let open = app
@@ -436,7 +438,7 @@ fn panel_renders_the_root_and_filter_rows() {
     assert!(screen.contains("*.cs;!*.csproj"), "{screen}");
     // Four hit-testable fields: query, root, dirs, files.
     let ids: Vec<u8> = app.layout.search_fields.iter().map(|(_, id)| *id).collect();
-    assert_eq!(ids, vec![0, 2, 3, 4]);
+    assert_eq!(ids, vec![0, 2, 3, 4, 5]);
 }
 
 #[test]
@@ -543,6 +545,7 @@ fn pasted_query_replaces_the_prefilled_selection() {
     app.run(Command::FindInFiles);
     assert!(app.search.query_selected);
     app.handle_event(Event::Paste("Console".into()));
+    app.finish_search();
     assert_eq!(app.search.query, "Console");
     assert_eq!(app.search.results.matches, 2);
 }
@@ -583,4 +586,128 @@ fn unreadable_roots_report_an_error_instead_of_a_clean_empty_result() {
     )
     .unwrap();
     assert!(!result.warnings.is_empty());
+}
+
+
+#[test]
+fn async_search_reports_progress_and_cancels_without_blocking() {
+    if common::isolate("async_search_reports_progress_and_cancels_without_blocking") { return; }
+    let root = project("async-progress");
+    for i in 0..120 {
+        std::fs::write(root.join(format!("file-{i:03}.txt")), format!("needle {i}\n")).unwrap();
+    }
+    let mut job = termed::search::search_async(&root, &Query::new("needle"),
+        &FilterSet::default(), &HashMap::new(), termed::search::SearchOptions::default()).unwrap();
+    let mut results = termed::search::Results::default();
+    let mut saw_running = false;
+    let mut saw_progress = false;
+    while job.running {
+        job.pump(&mut results);
+        saw_running |= job.running;
+        saw_progress |= job.progress.visited > 0 || job.progress.scanned > 0;
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    job.pump(&mut results);
+    assert!(saw_running);
+    assert!(saw_progress);
+    // The fixture's original files do not contain "needle".
+    assert_eq!(results.matches, 120);
+
+    let mut cancelled = termed::search::search_async(&root, &Query::new("needle"),
+        &FilterSet::default(), &HashMap::new(), termed::search::SearchOptions::default()).unwrap();
+    cancelled.cancel();
+    let mut partial = termed::search::Results::default();
+    while cancelled.running { cancelled.pump(&mut partial); std::thread::yield_now(); }
+    cancelled.pump(&mut partial);
+    assert!(cancelled.is_cancelled());
+    assert!(partial.matches <= 120);
+}
+
+#[test]
+fn content_file_and_directory_targets_are_independently_selectable() {
+    if common::isolate("content_file_and_directory_targets_are_independently_selectable") { return; }
+    let root = std::env::temp_dir().join(format!("termed-targets-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("needle-dir")).unwrap();
+    std::fs::write(root.join("needle.txt"), "other\n").unwrap();
+    std::fs::write(root.join("content.txt"), "needle\n").unwrap();
+    let query = Query::new("needle");
+    let filters = FilterSet::default();
+    let content = termed::search::search_with_options(&root, &query, &filters, &HashMap::new(),
+        &termed::search::SearchOptions { content: true, file_names: false, directory_names: false, ..Default::default() }).unwrap();
+    assert_eq!(content.matches, 1);
+    assert_eq!(content.files[0].rel, "content.txt");
+    assert_eq!(content.files[0].matches[0].kind, termed::search::MatchKind::Content);
+    let files = termed::search::search_with_options(&root, &query, &filters, &HashMap::new(),
+        &termed::search::SearchOptions { content: false, file_names: true, directory_names: false, ..Default::default() }).unwrap();
+    assert_eq!(files.matches, 1);
+    assert_eq!(files.files[0].rel, "needle.txt");
+    assert_eq!(files.files[0].matches[0].kind, termed::search::MatchKind::FileName);
+    let dirs = termed::search::search_with_options(&root, &query, &filters, &HashMap::new(),
+        &termed::search::SearchOptions { content: false, file_names: false, directory_names: true, ..Default::default() }).unwrap();
+    assert_eq!(dirs.matches, 1);
+    assert_eq!(dirs.files[0].rel, "needle-dir");
+    assert_eq!(dirs.files[0].matches[0].kind, termed::search::MatchKind::DirectoryName);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn nul_anywhere_skips_binary_content_and_limit_is_configurable() {
+    if common::isolate("nul_anywhere_skips_binary_content_and_limit_is_configurable") { return; }
+    let root = std::env::temp_dir().join(format!("termed-binary-limit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let mut binary = vec![b'a'; 32 * 1024];
+    binary.push(0);
+    binary.extend_from_slice(b"needle");
+    std::fs::write(root.join("late.bin"), binary).unwrap();
+    std::fs::write(root.join("many.txt"), "needle\n".repeat(20)).unwrap();
+    let options = termed::search::SearchOptions { max_results: 5, ..Default::default() };
+    let result = termed::search::search_with_options(&root, &Query::new("needle"),
+        &FilterSet::default(), &HashMap::new(), &options).unwrap();
+    assert_eq!(result.matches, 5);
+    assert!(result.truncated);
+    assert_eq!(result.skipped_binary, 1);
+    assert_eq!(result.files.len(), 1);
+    assert_eq!(result.files[0].rel, "many.txt");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn result_limit_field_validates_and_persists() {
+    if common::isolate("result_limit_field_validates_and_persists") { return; }
+    let root = project("limit-persist");
+    let mut app = App::new(root.clone(), vec![root.join("src/Program.cs")], "Visual Studio Dark", false);
+    app.run(Command::FindInFiles);
+    app.search.field = SearchField::Limit;
+    app.search.limit_input.clear();
+    app.search.limit_cursor = 0;
+    type_text(&mut app, "25");
+    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(!app.search.limit_error);
+    assert_eq!(app.search.options.max_results, 25);
+    assert_eq!(app.preferences.search.max_results, 25);
+    app.search.limit_input.clear();
+    app.search.limit_cursor = 0;
+    type_text(&mut app, "0");
+    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(app.search.limit_error);
+    assert_eq!(app.search.options.max_results, 25);
+}
+
+#[test]
+fn replace_refuses_a_truncated_result_list() {
+    if common::isolate("replace_refuses_a_truncated_result_list") { return; }
+    let root = project("replace-capped");
+    let path = root.join("many.txt");
+    std::fs::write(&path, "needle\n".repeat(10)).unwrap();
+    let mut app = App::new(root.clone(), vec![path.clone()], "Visual Studio Dark", false);
+    app.run(Command::ReplaceInFiles);
+    app.search.options.max_results = 3;
+    app.search.limit_input = "3".into();
+    type_text(&mut app, "needle");
+    app.search.replacement = "changed".into();
+    assert!(app.search.results.truncated);
+    key(&mut app, KeyCode::Enter, KeyModifiers::CONTROL);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "needle\n".repeat(10));
 }

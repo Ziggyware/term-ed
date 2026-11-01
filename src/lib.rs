@@ -17,6 +17,7 @@ pub mod editor;
 pub mod explorer;
 pub mod fuzzy;
 pub mod generated_tools;
+pub mod graphics;
 pub mod highlight;
 pub mod icons;
 pub mod image_view;

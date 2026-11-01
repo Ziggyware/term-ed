@@ -168,6 +168,10 @@ fn main() -> Result<()> {
     }
 
     let mut terminal = ratatui::init();
+    if let Ok(size) = ratatui::crossterm::terminal::window_size()
+        && size.width > 0 && size.height > 0 && size.columns > 0 && size.rows > 0 {
+            app.image_cell_pixels = ((size.width / size.columns).max(1), (size.height / size.rows).max(1));
+        }
     let enhanced = supports_keyboard_enhancement().unwrap_or(false);
     let mut out = stdout();
     execute!(
@@ -185,6 +189,7 @@ fn main() -> Result<()> {
     }
 
     let result = run(&mut terminal, &mut app, truecolor);
+    let _ = app.graphics.clear(&mut stdout());
 
     if enhanced {
         let _ = execute!(out, PopKeyboardEnhancementFlags);
@@ -204,13 +209,28 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App, truecolor: bool) 
     loop {
         if dirty {
             terminal.draw(|f| ui::draw(f, app, truecolor))?;
-            dirty = false;
+            if app.graphics.repaint_needed() {
+                // Ratatui's diff cannot know that a native image covered its
+                // cells. Redraw the full cell layer before placing/clearing
+                // native pixels so overlays and pans never leave stale cells.
+                terminal.clear()?;
+                terminal.draw(|f| ui::draw(f, app, truecolor))?;
+            }
+            let mut graphics_failed = false;
+            if let Err(e) = app.graphics.present(&mut stdout()) {
+                app.graphics.protocol = termed::graphics::Protocol::HalfBlock;
+                app.toast(format!("Native graphics unavailable ({e}); using half-blocks"), termed::app::ToastKind::Info);
+                graphics_failed = true;
+            }
+            dirty = graphics_failed;
         }
         if app.quit {
             return Ok(());
         }
         let timeout = if app.busy() {
             Duration::from_millis(1)
+        } else if app.search_running() {
+            Duration::from_millis(30)
         } else if app.agent.running() || app.agent_animating() || app.plugins.running() {
             // Pick up streamed agent and plugin output promptly.
             Duration::from_millis(40)
@@ -218,7 +238,14 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App, truecolor: bool) 
             Duration::from_millis(250)
         };
         if event::poll(timeout)? {
-            app.handle_event(event::read()?);
+            let event = event::read()?;
+            if matches!(event, event::Event::Resize(..)) {
+                if let Ok(size) = ratatui::crossterm::terminal::window_size() && size.columns > 0 && size.rows > 0 {
+                    app.image_cell_pixels = ((size.width / size.columns).max(1), (size.height / size.rows).max(1));
+                }
+                app.graphics.last_resize();
+            }
+            app.handle_event(event);
             // Drain queued events (fast typing, mouse drags) before redrawing.
             while event::poll(Duration::ZERO)? {
                 app.handle_event(event::read()?);
@@ -234,8 +261,13 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App, truecolor: bool) 
         if app.pump_plugins() {
             dirty = true;
         }
-        if app.tick() || app.busy() || app.agent_animating() {
+        if app.tick() || app.busy() || app.agent_animating() || app.search_running() {
             dirty = true;
+        }
+        // Search debounce must expire even when the terminal sends no input.
+        if app.search.pending_since.is_some() {
+            let changed = app.pump_search();
+            dirty |= changed;
         }
     }
 }
