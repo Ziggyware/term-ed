@@ -79,28 +79,41 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) {
     if canvas.width == 0 || canvas.height == 0 {
         return;
     }
-    let (pixels, scale) = image.sample(canvas.width, canvas.height);
+    let protocol = app.graphics.protocol;
+    let native = protocol != crate::graphics::Protocol::HalfBlock;
+    let (cw, ch) = app.image_cell_pixels;
+    let key = format!("{}:{}:{}:{}:{}:{}:{}:{:?}:{:?}", app.active, canvas.x, canvas.y,
+        canvas.width, canvas.height, image.zoom, image.actual_pixels, image.pan_x, image.pan_y);
+    let (pixels, scale) = if native {
+        image.sample_pixels(u32::from(canvas.width) * u32::from(cw), u32::from(canvas.height) * u32::from(ch))
+    } else { image.sample(canvas.width, canvas.height) };
+    if native {
+        app.graphics.stage(crate::graphics::Frame { key, area: canvas,
+            image: pixels.clone(), protocol });
+    }
     let iw = pixels.width() as u16;
-    let ih = pixels.height().div_ceil(2) as u16;
-    let x0 = canvas.x + (canvas.width - iw) / 2;
-    let y0 = canvas.y + (canvas.height - ih) / 2;
-    for y in 0..ih {
-        for x in 0..iw {
-            let checker = if (x / 2 + y) % 2 == 0 {
-                mix(stage, pal.fg, 0.08)
-            } else {
-                mix(stage, pal.fg, 0.16)
-            };
-            let top = pixels.get_pixel(u32::from(x), u32::from(y) * 2).0;
-            let bottom = if u32::from(y) * 2 + 1 < pixels.height() {
-                pixels.get_pixel(u32::from(x), u32::from(y) * 2 + 1).0
-            } else {
-                [0, 0, 0, 0]
-            };
-            if let Some(cell) = buf.cell_mut((x0 + x, y0 + y)) {
-                cell.set_symbol("▀")
-                    .set_fg(composite(top, checker))
-                    .set_bg(composite(bottom, checker));
+    if !native {
+        let ih = pixels.height().div_ceil(2) as u16;
+        let x0 = canvas.x + (canvas.width - iw) / 2;
+        let y0 = canvas.y + (canvas.height - ih) / 2;
+        for y in 0..ih {
+            for x in 0..iw {
+                let checker = if (x / 2 + y) % 2 == 0 {
+                    mix(stage, pal.fg, 0.08)
+                } else {
+                    mix(stage, pal.fg, 0.16)
+                };
+                let top = pixels.get_pixel(u32::from(x), u32::from(y) * 2).0;
+                let bottom = if u32::from(y) * 2 + 1 < pixels.height() {
+                    pixels.get_pixel(u32::from(x), u32::from(y) * 2 + 1).0
+                } else {
+                    [0, 0, 0, 0]
+                };
+                if let Some(cell) = buf.cell_mut((x0 + x, y0 + y)) {
+                    cell.set_symbol("▀")
+                        .set_fg(composite(top, checker))
+                        .set_bg(composite(bottom, checker));
+                }
             }
         }
     }
@@ -109,17 +122,20 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) {
         buf,
         area.x + 1,
         foot,
-        &format!("{:.0}% · +/- zoom · arrows pan", scale * 100.0),
+        &format!("{} · {:.0}% · 1 = 1:1 · arrows pan", app.graphics.protocol.label(), scale * 100.0),
         fgbg(pal.sidebar_dim, pal.bg),
         area.right(),
     );
     let mut x = area.x + 1;
-    for (label, command) in [
-        (" Fit ", Command::ImageFit),
-        (" − ", Command::ImageZoomOut),
-        (" + ", Command::ImageZoomIn),
-        (" Export… ", Command::SaveAs),
-    ] {
+    let compact = area.width < 38;
+    let controls: &[(&str, Command)] = if compact {
+        &[(" Fit ", Command::ImageFit), ("1:1", Command::ImageActualSize),
+            ("−", Command::ImageZoomOut), ("+", Command::ImageZoomIn), ("⤓", Command::SaveAs)]
+    } else {
+        &[(" Fit ", Command::ImageFit), (" 1:1 ", Command::ImageActualSize),
+            (" − ", Command::ImageZoomOut), (" + ", Command::ImageZoomIn), (" Export… ", Command::SaveAs)]
+    };
+    for &(label, command) in controls {
         let w = width(label);
         if x + w > area.right() {
             break;

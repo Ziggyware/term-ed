@@ -5,6 +5,7 @@ pub enum Command {
     ImageZoomIn,
     ImageZoomOut,
     ImageFit,
+    ImageActualSize,
     OpenArchiveFile,
     QuickOpen,
     CommandPalette,
@@ -88,6 +89,7 @@ cmds! {
     ImageZoomIn, "Image: Zoom In", "+";
     ImageZoomOut, "Image: Zoom Out", "-";
     ImageFit, "Image: Fit to View", "0";
+    ImageActualSize, "Image: Actual Size (1:1)", "1";
     OpenArchiveFile, "Archive: Open Selected ZIP as File", "Shift+Enter (Explorer)";
     QuickOpen, "Go to File...", "Ctrl+P";
     CommandPalette, "Show All Commands", "Ctrl+Shift+P / F1";

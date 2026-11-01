@@ -240,6 +240,11 @@ impl App {
         self.settings.line_numbers = prefs.editor.line_numbers;
         self.settings.word_wrap = prefs.editor.word_wrap;
         self.settings.toolbar = prefs.editor.toolbar;
+        self.search.options.max_results = prefs.search.max_results;
+        self.search.options.ignore_binary = prefs.search.ignore_binary;
+        self.search.limit_input = prefs.search.max_results.to_string();
+        self.search.limit_error = false;
+        self.update_search();
         if !prefs.editor.theme.is_empty() {
             self.set_theme(&prefs.editor.theme);
         }

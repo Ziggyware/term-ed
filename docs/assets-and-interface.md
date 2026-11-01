@@ -9,8 +9,9 @@
 Existing PNG, JPEG, GIF, WebP, BMP and ICO files open in a **read-only image canvas**, including image members inside ZIP files. The loader detects image signatures as well as extensions; binary image bytes are no longer converted into lossy text.
 
 - Aspect-preserving fit, centered image, transparency checkerboard and format/dimension/file-size metadata.
+- **Actual pixels (1:1)**: `1` or the **1:1** control shows one source pixel per terminal pixel where the terminal supports native graphics; zooming out from 1:1 preserves magnification using the real viewport.
 - JPEG EXIF orientation is applied to the preview without changing the original bytes.
-- Viewport-sized rendering cache: zooming does not allocate an enormous zoomed bitmap.
+- Viewport-sized rendering cache: zooming does not allocate an enormous zoomed bitmap. Downscaling uses premultiplied alpha with Lanczos/triangle filtering and a mip step; panning happens before resizing.
 - Text editing, replacement and editor plugins cannot modify the preview. **Save As** exports the original encoded bytes, not a re-encoded approximation or the empty text buffer.
 
 | Control | Action |
@@ -19,14 +20,16 @@ Existing PNG, JPEG, GIF, WebP, BMP and ICO files open in a **read-only image can
 | Mouse wheel over the viewer | Zoom in / out |
 | Arrow keys | Pan a zoomed image |
 | `0` or `Home` | Fit and reset pan |
-| **Fit**, **−**, **+** | Click/tap viewer controls |
+| `1` | Actual pixels (1:1) |
+| **Fit**, **1:1**, **−**, **+** | Click/tap viewer controls |
 | **Export…** or `Ctrl+Alt+S` | Export the original image to a regular file |
 
-The command palette also includes **Image: Zoom In**, **Image: Zoom Out** and **Image: Fit to View**. Select/open the same image again to refresh a cached preview after an external change; merely switching tabs preserves its current view.
+The command palette also includes **Image: Zoom In**, **Image: Zoom Out**, **Image: Fit to View** and **Image: Actual Size (1:1)**. Select/open the same image again to refresh a cached preview after an external change; merely switching tabs preserves its current view.
 
 ### Format and display limits
 
-- The canvas uses Unicode half-blocks and terminal colors. It works without Kitty or Sixel support, but its resolution is limited by the terminal grid. Truecolor gives the best result; `TERMED_TRUECOLOR=1` can force it when detection misses your terminal.
+- On Kitty, Ghostty and WezTerm the canvas uses the Kitty graphics protocol; on iTerm2 it uses inline PNG images. These paths transmit full-resolution pixels for the visible viewport rather than approximating them with terminal cells. `TERMED_IMAGE_PROTOCOL=kitty|iterm2|half-block` overrides detection. Native placements are cleared when overlays open and the cell layer is repainted before redraw so images never cover dialogs.
+- Other terminals use Unicode half-blocks and terminal colors. That portable path needs no graphics protocol, but its resolution is limited by the terminal grid. Truecolor gives the best result; `TERMED_TRUECOLOR=1` can force it when detection misses your terminal. Sixel is not implemented.
 - Animation is not played; GIF/animated image previews display a static frame.
 - SVG remains editable XML source. TIFF, AVIF and other image codecs are not enabled; unsupported or corrupt images report an error instead of opening as garbage text.
 - Input is capped at **32 MiB**, decoded dimensions at **16 megapixels**, and the image decoder's allocation budget at **128 MiB**. This is a decoder budget, not a process-wide memory limit. Ordinary text opens also have a 32 MiB input budget and require valid UTF-8.
@@ -109,12 +112,12 @@ termed -t "Termed Studio" pictures/example.png
 
 Or choose **Termed Studio** in the theme picker through Settings or **Preferences: Color Theme**. Theme selection through the UI persists with the existing settings system.
 
-Further polish worth pursuing separately: optional native Kitty/Sixel graphics for sharper images, asynchronous archive/search work for very large projects, and a dedicated high-contrast/focus-navigation audit. These are recommendations, not implemented features.
+Further polish worth pursuing separately: Sixel support, asynchronous archive enumeration for very large containers, and a dedicated high-contrast/focus-navigation audit. These are recommendations, not implemented features.
 
 ## Verification
 
 `tests/assets.rs` covers real image codecs, orientation, original-byte exports, resize/zoom/pan controls, corrupt files, resource limits, ZIP traversal/CRC/conflict safety, folder and file views, member saves/undo, aliases, read-only mutation guards, live search and Studio contrast. The automation and built-in agent unit tests also exercise binary-preview protections.
 
-The combined **121-test suite passed** against the real application/library sources in the separate offline harness, and the all-targets check passed in that harness. A pseudo-terminal smoke run opened a ZIP-member image and exited cleanly after zoom/pan/fit input. The headless snapshot example rendered the frame above. Desktop/phone image layouts are exercised at 140 × 42, 80 × 24, 46 × 30 and 28 × 18 cells.
+The combined **185-test suite passed** against the real application/library sources in the separate offline harness, and the all-targets check passed in that harness. A pseudo-terminal smoke run opened a ZIP-member image and exited cleanly after zoom/pan/fit input. The headless snapshot example rendered the frame above. Desktop/phone image layouts are exercised at 140 × 42, 80 × 24, 46 × 30 and 28 × 18 cells.
 
-The offline harness uses alternate GitHub-sourced dependency versions and reduced features; it is **not** a locked-dependency or HTTPS-transport verification. The production manifest/lockfile remain registry-based. Normal `cargo test --locked` and `cargo clippy --all-targets --locked` still need registry access. Native-terminal graphics behavior has not been manually verified on each supported terminal/platform.
+The offline harness uses alternate GitHub-sourced dependency versions and reduced features; it is **not** a locked-dependency or HTTPS-transport verification. The production manifest/lockfile remain registry-based. Normal `cargo test --locked` and `cargo clippy --all-targets --locked` still need registry access. Native-terminal graphics behavior has automated staging/clearing tests, but has not been manually verified on each supported terminal/platform.

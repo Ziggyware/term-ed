@@ -733,6 +733,7 @@ fn read_only_previews_block_every_text_command_and_do_not_pollute_project_search
     a.search.visible = true;
     a.search.query = "needle-only-in-filename".into();
     a.update_search();
+    a.finish_search();
     assert!(a.search.results.files.is_empty());
     a.open_file(&path.join("needle-only-in-filename.txt"));
     a.editor_mut()
@@ -740,9 +741,53 @@ fn read_only_previews_block_every_text_command_and_do_not_pollute_project_search
         .replace_document("live archive text needle");
     a.search.query = "live archive text needle".into();
     a.update_search();
+    a.finish_search();
     assert_eq!(a.search.results.files.len(), 1);
     assert_eq!(
         a.search.results.files[0].path,
         path.join("needle-only-in-filename.txt")
     );
+}
+
+
+#[test]
+fn actual_size_mode_preserves_source_pixels_and_native_graphics_stage_once() {
+    if common::isolate("actual_size_mode_preserves_source_pixels_and_native_graphics_stage_once") { return; }
+    let root = project("actual-size");
+    let file = root.join("art.png");
+    fs::write(&file, png()).unwrap();
+    let mut a = app(&root, &file);
+    let Some(Preview::Image(p)) = a.editor_mut().unwrap().doc.preview.as_mut() else { panic!() };
+    p.actual_size();
+    let (before, scale) = p.sample_pixels(4, 3);
+    assert_eq!(scale, 1.0);
+    assert_eq!(before.dimensions(), (4, 3));
+    let first = *before.get_pixel(0, 0);
+    p.pan_x = 1;
+    let (after, _) = p.sample_pixels(4, 3);
+    assert_ne!(first, *after.get_pixel(0, 0));
+    // Zooming from 1:1 uses the real viewport, not the terminal cell grid.
+    p.zoom_at_size(0, 8, 6);
+    assert!(!p.actual_pixels);
+    assert_eq!(p.scale_for(8, 6), 1.0);
+
+    a.graphics.protocol = termed::graphics::Protocol::Kitty;
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    terminal.draw(|f| termed::ui::draw(f, &mut a, true)).unwrap();
+    assert!(a.graphics.pending.is_some());
+    let mut out = Vec::new();
+    a.graphics.present(&mut out).unwrap();
+    assert!(String::from_utf8_lossy(&out).contains("\x1b_Ga=T,f=100"));
+    terminal.draw(|f| termed::ui::draw(f, &mut a, true)).unwrap();
+    let mut again = Vec::new();
+    a.graphics.present(&mut again).unwrap();
+    assert!(again.is_empty());
+    // An overlay removes native pixels and invalidates the cell diff.
+    a.run(Command::FindInFiles);
+    terminal.draw(|f| termed::ui::draw(f, &mut a, true)).unwrap();
+    assert!(a.graphics.pending.is_none());
+    assert!(a.graphics.repaint_needed());
+    let mut cleared = Vec::new();
+    a.graphics.present(&mut cleared).unwrap();
+    assert!(String::from_utf8_lossy(&cleared).contains("a=d"));
 }

@@ -12,19 +12,21 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::{Duration, Instant};
 
 use ignore::WalkBuilder;
 use regex::{Regex, RegexBuilder};
 
-/// Larger files are skipped: they are rarely source, and searching them
-/// would make every keystroke slow.
-pub const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
-/// Most matches kept across the whole project.
-pub const MAX_MATCHES: usize = 2_000;
-/// Most matches kept for a single file.
-pub const MAX_MATCHES_PER_FILE: usize = 200;
-/// Most files read before stopping; protects against huge trees.
-pub const MAX_FILES: usize = 4_000;
+pub const DEFAULT_RESULT_LIMIT: usize = 10_000;
+pub const MAX_RESULT_LIMIT: usize = 100_000;
+/// Per-worker input bound, not a project-wide file or result limit.
+pub const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+/// Replacement has a separate conservative per-file bound.
+pub const MAX_REPLACE_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_PREVIEW_CHARS: usize = 2_048;
 
 // ================================================================ query
 
@@ -61,6 +63,7 @@ impl Query {
             pattern = format!(r"\b(?:{pattern})\b");
         }
         RegexBuilder::new(&pattern)
+            .size_limit(2 * 1024 * 1024)
             .case_insensitive(!self.case_sensitive)
             .build()
     }
@@ -512,11 +515,11 @@ impl TextFile {
             return Ok(None);
         }
         let meta = std::fs::metadata(path)?;
-        if meta.len() > MAX_FILE_BYTES {
+        if meta.len() > MAX_REPLACE_FILE_BYTES {
             return Ok(None);
         }
         let bytes = std::fs::read(path)?;
-        if looks_binary(&bytes) {
+        if memchr::memchr(0, &bytes).is_some() {
             return Ok(None);
         }
         let Ok(mut text) = String::from_utf8(bytes) else {
@@ -542,10 +545,6 @@ impl TextFile {
     }
 }
 
-/// A NUL byte near the start almost always means binary.
-fn looks_binary(bytes: &[u8]) -> bool {
-    bytes.iter().take(8 * 1024).any(|b| *b == 0)
-}
 
 /// Project-relative path, with `/` separators on every platform.
 pub fn relative(root: &Path, path: &Path) -> String {
@@ -629,189 +628,485 @@ pub fn root_label(root: &Path) -> String {
 
 // ================================================================ search
 
-/// One occurrence on one line.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Hit {
-    /// 0-based line number.
-    pub line: usize,
-    /// Char columns within the line.
-    pub start: usize,
-    pub end: usize,
-    /// The full line, without its newline.
-    pub text: String,
+/// Independent search targets. Content replacement never renames files or folders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchOptions {
+    pub content: bool,
+    pub file_names: bool,
+    pub directory_names: bool,
+    pub ignore_binary: bool,
+    pub max_results: usize,
 }
 
-/// Matches in one file.
+impl Default for SearchOptions {
+    fn default() -> Self {
+        Self { content: true, file_names: false, directory_names: false,
+            ignore_binary: true, max_results: DEFAULT_RESULT_LIMIT }
+    }
+}
+
+impl SearchOptions {
+    pub fn any_target(&self) -> bool {
+        self.content || self.file_names || self.directory_names
+    }
+    pub fn limit(&self) -> usize {
+        self.max_results.clamp(1, MAX_RESULT_LIMIT)
+    }
+    /// One extra probe distinguishes "exactly at the limit" from "capped".
+    fn probe_limit(&self) -> usize { self.limit().saturating_add(1) }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MatchKind {
+    #[default]
+    Content,
+    FileName,
+    DirectoryName,
+}
+
+/// One occurrence on one line, or one name hit (line zero).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hit {
+    pub line: usize,
+    /// Character columns, relative to `text` (not a truncated source line).
+    pub start: usize,
+    pub end: usize,
+    pub text: String,
+    /// Character offset of this preview in the original line.
+    pub text_offset: usize,
+    pub kind: MatchKind,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileHits {
     pub path: PathBuf,
-    /// Relative path with `/` separators, for display and filtering.
     pub rel: String,
     pub matches: Vec<Hit>,
 }
 
-/// Everything a search found.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Progress {
+    pub visited: usize,
+    pub scanned: usize,
+    pub skipped_binary: usize,
+    pub skipped_large: usize,
+    pub current: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Results {
     pub files: Vec<FileHits>,
     pub matches: usize,
-    /// Files read (after filtering).
     pub scanned: usize,
-    /// A cap was hit; there may be more matches.
+    pub visited: usize,
+    pub skipped_binary: usize,
+    pub skipped_large: usize,
+    /// The user-requested result budget was reached; no hidden per-file cap.
     pub truncated: bool,
-    /// Up to three filesystem errors, rather than silently reporting no hits.
     pub warnings: Vec<String>,
 }
 
 impl Results {
-    pub fn is_empty(&self) -> bool {
-        self.matches == 0
+    pub fn is_empty(&self) -> bool { self.matches == 0 }
+    pub fn progress(&self) -> Progress {
+        Progress { visited: self.visited, scanned: self.scanned,
+            skipped_binary: self.skipped_binary, skipped_large: self.skipped_large,
+            current: String::new() }
+    }
+    /// Merge a worker batch in path order without rescanning every hit.
+    fn merge(&mut self, mut files: Vec<FileHits>, limit: usize) {
+        // Incoming batches are sorted once; existing files are already ordered.
+        // Only files that receive new hits are re-sorted, not the whole list.
+        for f in &mut files { f.matches.sort_by_key(|m| (m.kind as u8, m.line, m.start)); }
+        files.sort_by(|a,b| a.rel.cmp(&b.rel));
+        let mut merged = Vec::with_capacity(self.files.len() + files.len());
+        let old = std::mem::take(&mut self.files);
+        let mut a = old.into_iter().peekable();
+        let mut b = files.into_iter().peekable();
+        while a.peek().is_some() || b.peek().is_some() {
+            let next = match (a.peek(), b.peek()) {
+                (Some(x), Some(y)) if x.rel <= y.rel => a.next().unwrap(),
+                (_, Some(_)) => b.next().unwrap(),
+                _ => a.next().unwrap(),
+            };
+            if merged.last().is_some_and(|last: &FileHits| last.path == next.path) {
+                let last = merged.last_mut().unwrap();
+                last.matches.extend(next.matches);
+                last.matches.sort_by_key(|m| (m.kind as u8, m.line, m.start));
+            } else { merged.push(next); }
+        }
+        self.files = merged;
+        let total: usize = self.files.iter().map(|f| f.matches.len()).sum();
+        self.truncated |= total > limit;
+        self.matches = 0;
+        for file in &mut self.files {
+            let take = limit.saturating_sub(self.matches).min(file.matches.len());
+            file.matches.truncate(take);
+            self.matches += take;
+        }
+        self.files.retain(|f| !f.matches.is_empty());
     }
 }
 
-/// Search the project. `overrides` holds the in-memory text of open editors,
-/// so unsaved edits are searched too.
-pub fn search(
-    root: &Path,
-    query: &Query,
-    filter: &FilterSet,
-    overrides: &HashMap<PathBuf, String>,
-) -> Result<Results, regex::Error> {
-    let mut out = Results::default();
-    if query.is_empty() {
-        return Ok(out);
+#[derive(Default)]
+struct Counters {
+    cancel: AtomicBool,
+    matches: AtomicUsize,
+    visited: AtomicUsize,
+    scanned: AtomicUsize,
+    skipped_binary: AtomicUsize,
+    skipped_large: AtomicUsize,
+    warnings: AtomicUsize,
+}
+
+enum Update {
+    Batch(Vec<FileHits>),
+    Current(String),
+    Warning(String),
+    Error(String),
+    Done,
+}
+
+/// Cancellation is cooperative and lock-free. Dropping a job also cancels it;
+/// the UI never joins a filesystem worker or waits for a worker mutex.
+pub struct SearchJob {
+    rx: Receiver<Update>,
+    counters: Arc<Counters>,
+    pub options: SearchOptions,
+    pub progress: Progress,
+    pub running: bool,
+    pub error: Option<String>,
+    pub warnings: Vec<String>,
+    started: Instant,
+}
+
+impl SearchJob {
+    pub fn cancel(&self) { self.counters.cancel.store(true, Ordering::Relaxed); }
+    pub fn elapsed(&self) -> Duration { self.started.elapsed() }
+    pub fn is_cancelled(&self) -> bool { self.counters.cancel.load(Ordering::Relaxed) }
+
+    /// Bounded, nonblocking inbox drain. Call once per UI tick.
+    pub fn pump(&mut self, out: &mut Results) -> bool {
+        let before = (out.matches, out.files.len(), self.progress.visited,
+            self.progress.scanned, self.progress.skipped_binary, self.progress.skipped_large,
+            self.progress.current.clone(), self.warnings.len(), self.running, self.error.is_some());
+        let mut merged_hits = 0usize;
+        for _ in 0..256 {
+            let msg = match self.rx.try_recv() {
+                Ok(msg) => msg,
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.running = false;
+                    break;
+                }
+            };
+            match msg {
+                Update::Batch(files) => {
+                    merged_hits += files.iter().map(|f| f.matches.len()).sum::<usize>();
+                    out.merge(files, self.options.limit());
+                    if out.truncated { self.cancel(); }
+                    // Keep a single UI tick bounded even when many worker
+                    // batches arrive together; the next tick drains the rest.
+                    if merged_hits >= 8192 { break; }
+                }
+                Update::Current(path) => self.progress.current = path,
+                Update::Warning(w) => { if self.warnings.len() < 3 { self.warnings.push(w); } }
+                Update::Error(e) => { self.error = Some(e); self.cancel(); }
+                Update::Done => self.running = false,
+            }
+        }
+        self.progress.visited = self.counters.visited.load(Ordering::Relaxed);
+        self.progress.scanned = self.counters.scanned.load(Ordering::Relaxed);
+        self.progress.skipped_binary = self.counters.skipped_binary.load(Ordering::Relaxed);
+        self.progress.skipped_large = self.counters.skipped_large.load(Ordering::Relaxed);
+        out.visited = self.progress.visited;
+        out.scanned = self.progress.scanned;
+        out.skipped_binary = self.progress.skipped_binary;
+        out.skipped_large = self.progress.skipped_large;
+        out.warnings.clone_from(&self.warnings);
+        if !self.running { self.progress.current.clear(); }
+        before != (out.matches, out.files.len(), self.progress.visited,
+            self.progress.scanned, self.progress.skipped_binary, self.progress.skipped_large,
+            self.progress.current.clone(), self.warnings.len(), self.running, self.error.is_some())
     }
+}
+
+impl Drop for SearchJob {
+    fn drop(&mut self) { self.cancel(); }
+}
+
+pub fn search_async(root: &Path, query: &Query, filter: &FilterSet,
+    overrides: &HashMap<PathBuf, String>, options: SearchOptions) -> Result<SearchJob, regex::Error> {
     let re = query.compile()?;
-
     let root = absolute_path(root);
-    let overrides: HashMap<PathBuf, &String> = overrides
-        .iter()
-        .map(|(p, text)| (absolute_path(p), text))
-        .collect();
-    let walk_root = root.clone();
-    let walk_filter = filter.clone();
-    let mut builder = WalkBuilder::new(&root);
-    builder
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .require_git(false)
-        .sort_by_file_path(|a, b| a.cmp(b))
-        .filter_entry(move |e| {
-            if e.file_name() == ".git" || crate::credentials::is_private_path(e.path()) {
-                return false;
-            }
-            if e.depth() > 0 && e.file_type().is_some_and(|t| t.is_dir()) {
-                return walk_filter.allows_dir(&relative(&walk_root, e.path()));
-            }
-            true
+    let overrides: Arc<HashMap<PathBuf, String>> = Arc::new(overrides.iter()
+        .map(|(p,t)| (absolute_path(p), t.clone())).collect());
+    let filter = filter.clone();
+    let counters = Arc::new(Counters::default());
+    let (tx, rx) = mpsc::channel();
+    let job_counters = counters.clone();
+    if !root.is_dir() {
+        let _ = tx.send(Update::Error(format!("Folder does not exist: {}", root.display())));
+        let _ = tx.send(Update::Done);
+    } else if query.is_empty() || !options.any_target() {
+        let _ = tx.send(Update::Done);
+    } else {
+        let spawned = std::thread::Builder::new().name("termed-search".into()).spawn(move || {
+            run_search(root, re, filter, overrides, options, counters, tx);
         });
+        if let Err(e) = spawned {
+            let _ = job_counters.cancel.swap(true, Ordering::Relaxed);
+            return Err(regex::Error::Syntax(format!("Cannot start search: {e}")));
+        }
+    }
+    Ok(SearchJob { rx, counters: job_counters, options, progress: Progress::default(),
+        running: true, error: None, warnings: Vec::new(), started: Instant::now() })
+}
 
-    // Search open buffers first, even if they are new, ignored or no longer
-    // on disk. They must not be lost behind the disk-walk file limit.
-    let mut open: Vec<_> = overrides.keys().collect();
-    open.sort();
-    for path in open {
-        if !path.starts_with(&root) || crate::credentials::is_private_path(path) {
-            continue;
-        }
-        let rel = relative(&root, path);
-        if rel.split('/').any(|part| part == ".git") || !filter.matches_file(&rel) {
-            continue;
-        }
-        let text = overrides[path];
-        if text.len() as u64 > MAX_FILE_BYTES {
-            continue;
-        }
-        collect_hits(&mut out, path, rel, text, &re);
-        if out.matches >= MAX_MATCHES {
-            break;
-        }
+/// Synchronous API for tools/tests. Interactive callers use `search_async`.
+pub fn search(root: &Path, query: &Query, filter: &FilterSet,
+    overrides: &HashMap<PathBuf, String>) -> Result<Results, regex::Error> {
+    search_with_options(root, query, filter, overrides, &SearchOptions::default())
+}
+
+pub fn search_with_options(root: &Path, query: &Query, filter: &FilterSet,
+    overrides: &HashMap<PathBuf, String>, options: &SearchOptions) -> Result<Results, regex::Error> {
+    let mut job = search_async(root, query, filter, overrides, *options)?;
+    let mut out = Results::default();
+    while job.running {
+        job.pump(&mut out);
+        if job.running { std::thread::sleep(Duration::from_millis(1)); }
     }
-    if out.matches < MAX_MATCHES {
-        for entry in builder.build() {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e) => {
-                    if out.warnings.len() < 3 {
-                        out.warnings.push(e.to_string());
-                    }
-                    continue;
-                }
-            };
-            if !entry.file_type().is_some_and(|t| t.is_file()) {
-                continue;
-            }
-            let path = entry.path();
-            if overrides.contains_key(&absolute_path(path)) {
-                continue;
-            }
-            let rel = relative(&root, path);
-            if !filter.matches_file(&rel) {
-                continue;
-            }
-            if out.scanned >= MAX_FILES {
-                out.truncated = true;
-                break;
-            }
-            let file = match TextFile::read_checked(path) {
-                Ok(Some(file)) => file,
-                Ok(None) => continue,
-                Err(e) => {
-                    if out.warnings.len() < 3 {
-                        out.warnings.push(format!("{}: {e}", path.display()));
-                    }
-                    continue;
-                }
-            };
-            collect_hits(&mut out, path, rel, &file.text, &re);
-            if out.matches >= MAX_MATCHES {
-                break;
-            }
-        }
-    }
-    out.files.sort_by(|a, b| a.rel.cmp(&b.rel));
+    job.pump(&mut out);
+    if let Some(error) = &job.error { out.warnings.push(error.clone()); }
     Ok(out)
 }
 
-fn collect_hits(out: &mut Results, path: &Path, rel: String, text: &str, re: &Regex) {
-    out.scanned += 1;
-    let mut hits = Vec::new();
-    'lines: for (line_no, raw) in text.split('\n').enumerate() {
-        let line = raw.strip_suffix('\r').unwrap_or(raw);
-        let mut scanned_byte = 0;
-        let mut scanned_char = 0;
-        for m in re.find_iter(line).filter(|m| m.start() != m.end()) {
-            if out.matches >= MAX_MATCHES || hits.len() >= MAX_MATCHES_PER_FILE {
-                out.truncated = true;
-                break 'lines;
-            }
-            scanned_char += line[scanned_byte..m.start()].chars().count();
-            let start = scanned_char;
-            let matched_chars = line[m.start()..m.end()].chars().count();
-            let end = start + matched_chars;
-            scanned_char = end;
-            scanned_byte = m.end();
-            hits.push(Hit {
-                line: line_no,
-                start,
-                end,
-                text: line.to_string(),
-            });
-            out.matches += 1;
+struct SearchContext {
+    root: PathBuf,
+    re: Regex,
+    filter: FilterSet,
+    overrides: Arc<HashMap<PathBuf, String>>,
+    options: SearchOptions,
+    counters: Arc<Counters>,
+    tx: Sender<Update>,
+}
+
+impl SearchContext {
+    fn stopped(&self) -> bool {
+        self.counters.cancel.load(Ordering::Relaxed)
+            || self.counters.matches.load(Ordering::Relaxed) >= self.options.probe_limit()
+    }
+    fn send_files(&self, files: &mut Vec<FileHits>) {
+        if files.is_empty() { return; }
+        let n: usize = files.iter().map(|f| f.matches.len()).sum();
+        self.counters.matches.fetch_add(n, Ordering::Relaxed);
+        let _ = self.tx.send(Update::Batch(std::mem::take(files)));
+    }
+    fn warn(&self, text: String) {
+        if self.counters.warnings.fetch_add(1, Ordering::Relaxed) < 3 {
+            let _ = self.tx.send(Update::Warning(text));
         }
     }
-    if !hits.is_empty() {
-        out.files.push(FileHits {
-            path: path.to_path_buf(),
-            rel,
-            matches: hits,
-        });
+    fn name_hit(&self, path: &Path, kind: MatchKind) -> Option<FileHits> {
+        let name = path.file_name()?.to_string_lossy();
+        let m = self.re.find(&name).filter(|m| !m.is_empty())?;
+        Some(FileHits { path: path.to_path_buf(), rel: relative(&self.root, path),
+            matches: vec![Hit { line: 0, start: name[..m.start()].chars().count(),
+                end: name[..m.end()].chars().count(), text: name.into_owned(),
+                text_offset: 0, kind }] })
     }
-    if out.matches >= MAX_MATCHES {
-        out.truncated = true;
+    fn visit(&self, entry: &ignore::DirEntry, batch: &mut Vec<FileHits>) {
+        if self.stopped() { return; }
+        self.counters.visited.fetch_add(1, Ordering::Relaxed);
+        let path = entry.path();
+        let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
+        let is_file = entry.file_type().is_some_and(|t| t.is_file());
+        if is_file && self.overrides.contains_key(&absolute_path(path)) { return; }
+        if entry.depth() > 0 && is_dir && self.options.directory_names
+            && let Some(hit) = self.name_hit(path, MatchKind::DirectoryName) { batch.push(hit); }
+        if !is_file { self.send_files(batch); return; }
+        let rel = relative(&self.root, path);
+        if !self.filter.matches_file(&rel) { self.send_files(batch); return; }
+        let _ = self.tx.send(Update::Current(rel.clone()));
+        let mut local = Vec::new();
+        if self.options.file_names && let Some(hit) = self.name_hit(path, MatchKind::FileName) {
+            local.push(hit);
+        }
+        let live = self.overrides.get(&absolute_path(path));
+        if self.options.content {
+            self.counters.scanned.fetch_add(1, Ordering::Relaxed);
+            let text = if let Some(text) = live {
+                if self.options.ignore_binary && text.as_bytes().contains(&0) {
+                    self.counters.skipped_binary.fetch_add(1, Ordering::Relaxed);
+                    None
+                } else { Some(Cow::Borrowed(text.as_str())) }
+            } else {
+                match read_search_file(path, self.options.ignore_binary, &self.counters) {
+                    Ok(Some(text)) => Some(Cow::Owned(text)),
+                    Ok(None) => None,
+                    Err(e) => { self.warn(format!("{}: {e}", path.display())); None }
+                }
+            };
+            if let Some(text) = text {
+                let remaining = self.options.probe_limit().saturating_sub(self.counters.matches.load(Ordering::Relaxed));
+                collect_hits_limit(&mut local, path, rel, &text, &self.re, remaining, || self.stopped());
+            }
+        }
+        if !local.is_empty() {
+            batch.push(FileHits { path: path.to_path_buf(),
+                rel: local[0].rel.clone(), matches: local.into_iter().flat_map(|f| f.matches).collect() });
+        }
+        if batch.len() >= 32 || batch.iter().map(|f| f.matches.len()).sum::<usize>() >= 256 {
+            self.send_files(batch);
+        }
     }
+}
+
+fn run_search(root: PathBuf, re: Regex, filter: FilterSet, overrides: Arc<HashMap<PathBuf, String>>,
+    options: SearchOptions, counters: Arc<Counters>, tx: Sender<Update>) {
+    let ctx = SearchContext { root: root.clone(), re, filter: filter.clone(),
+        overrides: overrides.clone(), options, counters: counters.clone(), tx: tx.clone() };
+    let mut keys: Vec<_> = overrides.keys().collect();
+    keys.sort();
+    for path in keys {
+        if ctx.stopped() { break; }
+        if !path.starts_with(&root) || crate::credentials::is_private_path(path) { continue; }
+        let rel = relative(&root, path);
+        if rel.split('/').any(|p| p == ".git") || !filter.matches_file(&rel) { continue; }
+        let _ = tx.send(Update::Current(rel.clone()));
+        counters.visited.fetch_add(1, Ordering::Relaxed);
+        let mut hits = Results::default();
+        if options.file_names && let Some(f) = ctx.name_hit(path, MatchKind::FileName) {
+            hits.files.push(f); hits.matches += 1;
+        }
+        if options.content {
+            counters.scanned.fetch_add(1, Ordering::Relaxed);
+            let text = &overrides[path];
+            if options.ignore_binary && memchr::memchr(0, text.as_bytes()).is_some() {
+                counters.skipped_binary.fetch_add(1, Ordering::Relaxed);
+            } else {
+                collect_hits_limit(&mut hits.files, path, rel, text, &ctx.re,
+                    options.probe_limit().saturating_sub(counters.matches.load(Ordering::Relaxed)), || ctx.stopped());
+                hits.matches = hits.files.iter().map(|f| f.matches.len()).sum();
+            }
+        }
+        counters.matches.fetch_add(hits.matches, Ordering::Relaxed);
+        if !hits.files.is_empty() { let _ = tx.send(Update::Batch(hits.files)); }
+    }
+    if !ctx.stopped() {
+        let walk_root = root.clone();
+        let mut builder = WalkBuilder::new(&root);
+        builder.hidden(false).git_ignore(true).git_global(true).git_exclude(true)
+            .require_git(false).follow_links(false)
+            .threads(std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(2, 8))
+            .filter_entry(move |e| {
+                if counters.cancel.load(Ordering::Relaxed) || e.file_name() == ".git"
+                    || crate::credentials::is_private_path(e.path()) { return false; }
+                if e.depth() > 0 && e.file_type().is_some_and(|t| t.is_dir()) {
+                    return filter.allows_dir(&relative(&walk_root, e.path()));
+                }
+                true
+            });
+        let walker = builder.build_parallel();
+        struct Builder(SearchContext);
+        impl<'s> ignore::ParallelVisitorBuilder<'s> for Builder {
+            fn build(&mut self) -> Box<dyn ignore::ParallelVisitor + 's> {
+                let ctx = SearchContext { root: self.0.root.clone(), re: self.0.re.clone(),
+                    filter: self.0.filter.clone(), overrides: self.0.overrides.clone(),
+                    options: self.0.options, counters: self.0.counters.clone(), tx: self.0.tx.clone() };
+                Box::new(Visitor { ctx, batch: Vec::new() })
+            }
+        }
+        walker.visit(&mut Builder(ctx));
+    }
+    let _ = tx.send(Update::Done);
+}
+
+struct Visitor { ctx: SearchContext, batch: Vec<FileHits> }
+impl ignore::ParallelVisitor for Visitor {
+    fn visit(&mut self, entry: Result<ignore::DirEntry, ignore::Error>) -> ignore::WalkState {
+        match entry {
+            Ok(entry) => self.ctx.visit(&entry, &mut self.batch),
+            Err(e) => self.ctx.warn(e.to_string()),
+        }
+        if self.ctx.stopped() {
+            self.ctx.send_files(&mut self.batch);
+            ignore::WalkState::Quit
+        } else { ignore::WalkState::Continue }
+    }
+}
+impl Drop for Visitor {
+    fn drop(&mut self) { self.ctx.send_files(&mut self.batch); }
+}
+
+fn read_search_file(path: &Path, ignore_binary: bool, counters: &Counters) -> std::io::Result<Option<String>> {
+    use std::io::Read;
+    if crate::credentials::is_private_path(path) { return Ok(None); }
+    let file = std::fs::File::open(path)?;
+    if file.metadata()?.len() > MAX_FILE_BYTES {
+        counters.skipped_large.fetch_add(1, Ordering::Relaxed);
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        counters.skipped_large.fetch_add(1, Ordering::Relaxed);
+        return Ok(None);
+    }
+    // SIMD NUL detection examines EVERY byte, not just an 8 KiB prefix.
+    if ignore_binary && memchr::memchr(0, &bytes).is_some() {
+        counters.skipped_binary.fetch_add(1, Ordering::Relaxed);
+        return Ok(None);
+    }
+    let mut text = String::from_utf8(bytes).map_err(|e| std::io::Error::new(
+        std::io::ErrorKind::InvalidData, format!("not UTF-8: {e}")))?;
+    if text.contains("\r\n") { text = text.replace("\r\n", "\n"); }
+    Ok(Some(text))
+}
+
+fn collect_hits_limit(out: &mut Vec<FileHits>, path: &Path, rel: String, text: &str,
+    re: &Regex, limit: usize, cancelled: impl Fn() -> bool) {
+    let mut hits = Vec::new();
+    let mut total = 0;
+    for (line_no, raw) in text.split('\n').enumerate() {
+        if line_no % 64 == 0 && cancelled() { break; }
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        // Count a minified line once, then slide the preview window forward in
+        // O(line + matches) instead of rescanning from the start for every hit.
+        let line_chars = if line.len() > MAX_PREVIEW_CHARS { line.chars().count() } else { line.len() };
+        let mut preview_byte = 0;
+        let mut preview_char = 0;
+        let mut scanned_byte = 0;
+        let mut scanned_char = 0;
+        for m in re.find_iter(line).filter(|m| !m.is_empty()) {
+            if total >= limit { break; }
+            scanned_char += line[scanned_byte..m.start()].chars().count();
+            let start = scanned_char;
+            let end = start + line[m.start()..m.end()].chars().count();
+            scanned_char = end;
+            scanned_byte = m.end();
+            // Bounded previews for minified files; full columns remain valid.
+            let (preview, offset) = if line_chars > MAX_PREVIEW_CHARS {
+                let left = start.saturating_sub(MAX_PREVIEW_CHARS / 4);
+                while preview_char < left {
+                    let Some(ch) = line[preview_byte..].chars().next() else { break; };
+                    preview_byte += ch.len_utf8();
+                    preview_char += 1;
+                }
+                let mut preview: String = line[preview_byte..].chars().take(MAX_PREVIEW_CHARS).collect();
+                let trim = preview.trim_end_matches('\r').len();
+                preview.truncate(trim);
+                (preview, preview_char)
+            } else { (line.to_string(), 0) };
+            hits.push(Hit { line: line_no, start, end, text: preview,
+                text_offset: offset, kind: MatchKind::Content });
+            total += 1;
+            if total % 256 == 0 && cancelled() { break; }
+        }
+        if total >= limit { break; }
+    }
+    if !hits.is_empty() { out.push(FileHits { path: path.to_path_buf(), rel, matches: hits }); }
 }
 
 // ================================================================ replace
@@ -912,6 +1207,61 @@ mod tests {
     use super::*;
 
     #[test]
+    fn binary_detection_checks_beyond_the_old_prefix() {
+        let dir = std::env::temp_dir().join(format!("termed-nul-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("late.bin");
+        let mut bytes = vec![b'x'; 16 * 1024];
+        bytes.push(0); bytes.extend_from_slice(b"needle");
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(read_search_file(&path, true, &Counters::default()).unwrap().is_none());
+        assert!(read_search_file(&path, false, &Counters::default()).unwrap().is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn result_budget_has_no_hidden_per_file_cap() {
+        let dir = std::env::temp_dir().join(format!("termed-budget-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("many.txt"), "needle\n".repeat(600)).unwrap();
+        let options = SearchOptions { max_results: 500, ..Default::default() };
+        let result = search_with_options(&dir, &Query::new("needle"), &FilterSet::default(), &HashMap::new(), &options).unwrap();
+        assert_eq!(result.matches, 500);
+        assert_eq!(result.files[0].matches.len(), 500);
+        assert!(result.truncated);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn minified_unicode_previews_slide_without_rescanning() {
+        let line = format!("{}needle{}needle", "é".repeat(3000), "é".repeat(3000));
+        let re = Regex::new("needle").unwrap();
+        let mut out = Results::default();
+        collect_hits_limit(&mut out.files, Path::new("min.txt"), "min.txt".into(), &line, &re, 10, || false);
+        let hits = &out.files[0].matches;
+        assert_eq!(hits.len(), 2);
+        assert_eq!((hits[0].start, hits[0].end), (3000, 3006));
+        assert_eq!((hits[1].start, hits[1].end), (6006, 6012));
+        for hit in hits {
+            assert!(hit.text.chars().count() <= MAX_PREVIEW_CHARS);
+            assert!(hit.text.contains("needle"));
+            assert_eq!(hit.text_offset, hit.start.saturating_sub(MAX_PREVIEW_CHARS / 4));
+        }
+    }
+
+    #[test]
+    fn exact_result_limit_is_not_marked_truncated() {
+        let dir = std::env::temp_dir().join(format!("termed-exact-limit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("five.txt"), "needle\n".repeat(5)).unwrap();
+        let options = SearchOptions { max_results: 5, ..Default::default() };
+        let result = search_with_options(&dir, &Query::new("needle"), &FilterSet::default(), &HashMap::new(), &options).unwrap();
+        assert_eq!(result.matches, 5);
+        assert!(!result.truncated);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn filter_example_from_the_spec() {
         let f = FilterSet::parse(r"*.cs*;!*.csproj;!bin\");
         assert!(f.matches_file("Program.cs"));
@@ -985,7 +1335,7 @@ mod tests {
     fn hit_columns_advance_once_through_unicode_lines() {
         let mut out = Results::default();
         let re = Regex::new("é").unwrap();
-        collect_hits(&mut out, Path::new("unicode.txt"), "unicode.txt".into(), "aé éé", &re);
+        collect_hits_limit(&mut out.files, Path::new("unicode.txt"), "unicode.txt".into(), "aé éé", &re, 100, || false);
         let columns: Vec<(usize, usize)> = out.files[0]
             .matches
             .iter()

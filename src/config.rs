@@ -175,8 +175,7 @@ impl AgentConfig {
         if self.backend == "custom" && crate::plugin::split_command(&self.command).is_empty() {
             bail!("A custom ACP agent needs a command");
         }
-        if !self.endpoint.is_empty()
-            && !(self.endpoint.starts_with("https://") || self.endpoint.starts_with("http://"))
+        if !(self.endpoint.is_empty() || self.endpoint.starts_with("https://") || self.endpoint.starts_with("http://"))
         {
             bail!("The API endpoint must start with http:// or https://");
         }
@@ -324,10 +323,23 @@ impl Default for EditorConfig {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchConfig {
+    pub max_results: usize,
+    pub ignore_binary: bool,
+}
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self { max_results: crate::search::DEFAULT_RESULT_LIMIT, ignore_binary: true }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Preferences {
     pub version: u32,
+    pub search: SearchConfig,
     pub editor: EditorConfig,
     pub agent: AgentConfig,
     pub sub_agents: Vec<SubAgentConfig>,
@@ -351,6 +363,7 @@ impl Default for Preferences {
         Self {
             version: 2,
             editor: EditorConfig::default(),
+            search: SearchConfig::default(),
             agent: AgentConfig::default(),
             sub_agents: vec![reviewer, tester, coordinator],
             disabled_skills: Vec::new(),
@@ -401,6 +414,9 @@ impl Preferences {
             bail!("Unsupported settings version {}", self.version);
         }
         self.agent.validate()?;
+        if !(1..=crate::search::MAX_RESULT_LIMIT).contains(&self.search.max_results) {
+            bail!("Search result limit must be between 1 and 100000");
+        }
         if self.sub_agents.len() > 16 {
             bail!("At most 16 sub-agent profiles are supported");
         }
