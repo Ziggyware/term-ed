@@ -1318,6 +1318,16 @@ impl Worker {
             }
             out = format!("…{}", &out[start..]);
         }
+        // A WSL relay error means the shell was a launcher stub (bash.exe /
+        // wsl.exe in the Windows system directory), not a real shell.
+        if out.contains("CreateProcessCommon") {
+            out.push_str(
+                "\n[hint: this shell relayed to WSL instead of running the command \
+                 (a launcher stub like C:\\Windows\\System32\\bash.exe). Use a real \
+                 shell — Git for Windows' sh, or cmd.exe — or set TERMED_SHELL \
+                 accordingly.]",
+            );
+        }
         let code = match status {
             Some(s) => format!("exit code {}", s.code().unwrap_or(-1)),
             None => "stopped (timeout or cancelled)".into(),

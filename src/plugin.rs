@@ -304,30 +304,41 @@ pub fn parse_manifest(dir: &Path, text: &str, origin: Origin) -> Option<Plugin> 
     })
 }
 
-/// Look a program up on PATH. Plugin manifests name executables, and a
-/// missing one is a manifest problem rather than a crash.
-pub fn which_program(program: &str) -> Option<PathBuf> {
+/// Every existing file a program name resolves to, in lookup order: an
+/// explicit path is just itself, a bare name is tried in each PATH directory
+/// (with the Windows extensions appended).
+pub fn path_candidates(program: &str) -> Vec<PathBuf> {
     let path = Path::new(program);
     if path.components().count() > 1 || path.is_absolute() {
-        return path.is_file().then(|| path.to_path_buf());
+        return path
+            .is_file()
+            .then(|| vec![path.to_path_buf()])
+            .unwrap_or_default();
     }
     let dirs = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
         .unwrap_or_default();
+    let mut out = Vec::new();
     for dir in dirs {
         let candidate = dir.join(program);
         if candidate.is_file() {
-            return Some(candidate);
+            out.push(candidate);
         }
         #[cfg(windows)]
         for ext in ["exe", "cmd", "bat"] {
             let candidate = dir.join(format!("{program}.{ext}"));
             if candidate.is_file() {
-                return Some(candidate);
+                out.push(candidate);
             }
         }
     }
-    None
+    out
+}
+
+/// Look a program up on PATH. Plugin manifests name executables, and a
+/// missing one is a manifest problem rather than a crash.
+pub fn which_program(program: &str) -> Option<PathBuf> {
+    path_candidates(program).into_iter().next()
 }
 
 pub fn split_command(s: &str) -> Vec<String> {
