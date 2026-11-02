@@ -15,6 +15,31 @@ pub enum CommandPolicy {
     Ask,
     Deny,
     RiskAssessed,
+    /// Never ask: run every command the risk policy does not block. Chosen
+    /// with **Never ask** on a permission card or in the agent settings.
+    Allow,
+}
+
+impl CommandPolicy {
+    /// How much freedom a policy grants, used to keep a delegated agent from
+    /// widening the permissions of the agent that delegated to it.
+    pub fn rank(self) -> u8 {
+        match self {
+            CommandPolicy::Deny => 0,
+            CommandPolicy::Ask => 1,
+            CommandPolicy::RiskAssessed => 2,
+            CommandPolicy::Allow => 3,
+        }
+    }
+
+    /// The stricter of two policies.
+    pub fn intersect(self, other: Self) -> Self {
+        if self.rank() <= other.rank() {
+            self
+        } else {
+            other
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -203,12 +228,11 @@ impl AgentConfig {
         }
         child.read_only |= parent.read_only;
         child.plugins &= parent.plugins && !child.read_only;
-        child.commands = if child.read_only || parent.commands == CommandPolicy::Deny {
+        // A child may narrow its parent's command permissions, never widen them.
+        child.commands = if child.read_only {
             CommandPolicy::Deny
-        } else if parent.commands == CommandPolicy::Ask && child.commands != CommandPolicy::Deny {
-            CommandPolicy::Ask
         } else {
-            child.commands
+            child.commands.intersect(parent.commands)
         };
         for name in &parent.denied_plugins {
             if !child.denied_plugins.contains(name) {
@@ -647,4 +671,51 @@ pub fn workspace_path(root: &Path, input: &str) -> Result<PathBuf, String> {
         );
     }
     Ok(path)
+}
+
+#[cfg(test)]
+mod command_policy_tests {
+    use super::*;
+
+    #[test]
+    fn never_ask_round_trips_through_settings_json() {
+        let agent = AgentConfig {
+            commands: CommandPolicy::Allow,
+            ..Default::default()
+        };
+        let text = serde_json::to_string(&agent).unwrap();
+        assert!(text.contains("\"commands\":\"allow\""), "{text}");
+        let back: AgentConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.commands, CommandPolicy::Allow);
+    }
+
+    #[test]
+    fn delegated_agents_cannot_widen_command_permissions() {
+        let child = AgentConfig {
+            commands: CommandPolicy::Allow,
+            ..Default::default()
+        };
+        for (parent, expected) in [
+            (CommandPolicy::Ask, CommandPolicy::Ask),
+            (CommandPolicy::Deny, CommandPolicy::Deny),
+            (CommandPolicy::RiskAssessed, CommandPolicy::RiskAssessed),
+            (CommandPolicy::Allow, CommandPolicy::Allow),
+        ] {
+            let parent = AgentConfig {
+                commands: parent,
+                ..Default::default()
+            };
+            assert_eq!(child.restricted_by(&parent).commands, expected);
+        }
+        // A stricter child stays strict.
+        let strict = AgentConfig {
+            commands: CommandPolicy::Deny,
+            ..Default::default()
+        };
+        let parent = AgentConfig {
+            commands: CommandPolicy::Allow,
+            ..Default::default()
+        };
+        assert_eq!(strict.restricted_by(&parent).commands, CommandPolicy::Deny);
+    }
 }

@@ -123,6 +123,7 @@ fn value(field: Field, a: &AgentConfig) -> String {
             CommandPolicy::Ask => "ask",
             CommandPolicy::Deny => "deny",
             CommandPolicy::RiskAssessed => "risk_assessed",
+            CommandPolicy::Allow => "allow",
         }
         .into(),
         Field::Plugins => on(a.plugins).into(),
@@ -168,7 +169,7 @@ fn hint(field: Field) -> &'static str {
             "Built-in: block edits, shell and plugins. External ACP processes are trusted, not sandboxed"
         }
         Field::Commands => {
-            "ask (default), deny, or risk_assessed (auto-allow low-risk commands); high-risk commands stay blocked"
+            "ask (default), deny, risk_assessed (auto-allow low-risk commands), or allow (never ask); destructive commands stay blocked"
         }
         Field::Plugins => {
             "Discover plugins and request execution; every AI plugin command needs approval"
@@ -611,7 +612,8 @@ impl App {
                 config.commands = match config.commands {
                     CommandPolicy::Ask => CommandPolicy::Deny,
                     CommandPolicy::Deny => CommandPolicy::RiskAssessed,
-                    CommandPolicy::RiskAssessed => CommandPolicy::Ask,
+                    CommandPolicy::RiskAssessed => CommandPolicy::Allow,
+                    CommandPolicy::Allow => CommandPolicy::Ask,
                 };
                 true
             }

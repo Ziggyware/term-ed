@@ -875,7 +875,7 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
     let tx = field.x + 3;
     if input.is_empty() {
         let hint = if app.agent.pending_permission().is_some() {
-            "Tap a button above, or press 1-3".to_string()
+            "Tap a button above, or press its number".to_string()
         } else {
             format!("Ask {agent_name} to change or explain code…")
         };

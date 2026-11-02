@@ -3990,6 +3990,49 @@ impl App {
         }
     }
 
+    /// Answer a permission card. `Never ask` is a standing decision for the
+    /// built-in agent, so it is kept for the rest of the session (the agent
+    /// enforces that itself) and saved to the user's agent settings so later
+    /// sessions do not ask either.
+    fn answer_permission(&mut self, entry: usize, option: Option<&str>) {
+        self.agent.choose(entry, option);
+        let never = option == Some("never")
+            && self.agent.spec.as_ref().is_some_and(|s| s.builtin)
+            && self.agent.entries.get(entry).is_some_and(|e| {
+                matches!(e, agent::Entry::Permission(p)
+                    if p.options.iter().any(|(id, _, _)| id.as_str() == "never"))
+            });
+        if never
+            && self.preferences.agent.commands != crate::config::CommandPolicy::Allow
+        {
+            self.persist_never_ask();
+        }
+    }
+
+    /// Store "never ask" in the user settings without restarting the running
+    /// turn. The live agent already has the same permission for this session.
+    fn persist_never_ask(&mut self) {
+        let mut prefs = self.preferences.clone();
+        prefs.agent.commands = crate::config::CommandPolicy::Allow;
+        let saved = self
+            .ensure_preferences_writable()
+            .and_then(|()| prefs.validate())
+            .and_then(|()| prefs.save(&self.explorer.root));
+        match saved {
+            Ok(()) => {
+                self.preferences.agent.commands = crate::config::CommandPolicy::Allow;
+                // Keep the live configuration in step with the saved file so a
+                // later agent restart does not start asking again.
+                self.agent.options.commands = crate::config::CommandPolicy::Allow;
+                self.toast(
+                    "Never ask saved: the AI runs commands without approval (destructive ones are still blocked)",
+                    ToastKind::Success,
+                );
+            }
+            Err(e) => self.toast(format!("Settings: {e:#}"), ToastKind::Error),
+        }
+    }
+
     fn agent_target(&mut self, t: AgentTarget) {
         match t {
             AgentTarget::OpenFile(p, line) => {
@@ -4001,7 +4044,7 @@ impl App {
                     self.show_agent = false;
                 }
             }
-            AgentTarget::Permission(i, opt) => self.agent.choose(i, Some(&opt)),
+            AgentTarget::Permission(i, opt) => self.answer_permission(i, Some(&opt)),
             AgentTarget::Retry => {
                 self.agent.available = agent::detect_agents();
                 if self.agent.spec.is_none() {
@@ -4053,7 +4096,7 @@ impl App {
                 _ => None,
             };
             if let Some(o) = opt {
-                self.agent.choose(i, Some(&o));
+                self.answer_permission(i, Some(&o));
             }
             return;
         }
