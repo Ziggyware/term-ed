@@ -105,6 +105,8 @@ inventing a tool call.
 | `max_steps` | 30 | 1–100 model rounds; default reviewer/tester=12, coordinator=18; inherited minimum |
 | `max_output_tokens` | 4096 | 256–16384 completion tokens; inherited minimum |
 | `generated_tools` | true | Pure interpreted transformations only; inherited capability intersection |
+| `toolkit` | true | The 100 extra host tools; inherited capability intersection, and write tools stay hidden when a worker is read-only |
+| `toolkit_groups` | all | Empty means every group; a child keeps only the groups its parent already has, and an empty intersection disables the toolkit for that child |
 
 Builtin tool calls execute in order; this is not a parallel batch scheduler or a
 background always-running agent service. The active-task cap covers nesting and
@@ -129,7 +131,9 @@ root→coordinator→reviewer tree; it contains **no secret**:
     "task_timeout_secs": 300,
     "stall_timeout_secs": 150,
     "max_output_tokens": 4096,
-    "generated_tools": true
+    "generated_tools": true,
+    "toolkit": true,
+    "toolkit_groups": ["workspace", "text", "buffers", "search", "git"]
   }
 }
 ```
@@ -142,6 +146,10 @@ brief containing the root goal, ancestor objectives and acceptance criteria,
 current objective, lineage/IDs/depth, inherited constraints, capabilities,
 remaining time, relevant reference snapshots and a fresh live-buffer excerpt.
 It does **not** copy the parent's entire conversation/tool history.
+
+The `capabilities` block in a delegate brief includes `toolkit` and
+`toolkit_groups`, so a specialist is told which groups it may use. Group
+selection is intersected with the parent's, never expanded.
 
 Project and ancestor instructions are carried in the worker's system context;
 the specialist role cannot widen programmatic restrictions. Required skill

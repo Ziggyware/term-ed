@@ -714,7 +714,7 @@ pub fn catalog() -> Vec<Spec> {
         "patch_file",
         Filesystem,
         Write,
-        "Apply up to 32 exact, unique text replacements to a file atomically; nothing is written if any edit fails.",
+        "Preview, then atomically apply up to 32 exact, unique text replacements to a file. Nothing is written if any edit fails.",
         objp(
             json!({
                 "path": file(),
@@ -722,7 +722,9 @@ pub fn catalog() -> Vec<Spec> {
                     "type":"object",
                     "properties":{"old_text":sp("Text that must match exactly once"),"new_text":sp("Replacement")},
                     "required":["old_text","new_text"]
-                }))
+                })),
+                "dry_run": bp("Only validate and show the diff; default true"),
+                "confirm": sp("Must be exactly APPLY when dry_run is false")
             }),
             &["edits"],
         ),
@@ -1700,6 +1702,36 @@ where
 {
     let mut scanned = 0usize;
     let mut seen: HashSet<PathBuf> = HashSet::new();
+    if base.is_file() {
+        if crate::credentials::is_private_path(base) {
+            return 0;
+        }
+        let Ok(meta) = std::fs::metadata(base) else {
+            return 0;
+        };
+        if !meta.is_file() || meta.len() > MAX_SCAN_BYTES {
+            return 0;
+        }
+        let name = base
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let relative = display(app, base);
+        let included = include.is_empty()
+            || crate::search::glob_match(include, &relative)
+            || crate::search::glob_match(include, &name);
+        let excluded = !exclude.is_empty()
+            && (crate::search::glob_match(exclude, &relative)
+                || crate::search::glob_match(exclude, &name));
+        if !included || excluded {
+            return 0;
+        }
+        if let Some(text) = live_text(app, base).or_else(|| std::fs::read_to_string(base).ok()) {
+            let _ = visit(&relative, &text);
+            return 1;
+        }
+        return 0;
+    }
     for relative in crate::explorer::project_files(base, max_files) {
         let path = base.join(&relative);
         if crate::credentials::is_private_path(&path) {
@@ -1959,7 +1991,7 @@ fn dispatch(app: &mut App, options: &AgentConfig, name: &str, a: Args) -> ToolRe
         "describe_tool" => describe_tool(options, a),
         "get_agent_settings" => get_agent_settings(options),
         "list_editor_commands" => list_editor_commands(a),
-        "run_editor_command" => run_editor_command(app, a),
+        "run_editor_command" => run_editor_command(app, options, a),
         "open_palette" => open_palette(app, a),
         "focus_panel" => focus_panel(app, a),
         "scratchpad_write" => scratchpad_write(app, a),
@@ -3211,7 +3243,10 @@ fn indent_report(app: &mut App, a: Args) -> ToolResult {
             spaces[bucket] += 1;
         }
     }
-    let dominant = if tabs >= spaces[1] + spaces[2] + spaces[3] + spaces[4] {
+    let space_total = spaces[1] + spaces[2] + spaces[3] + spaces[4];
+    let dominant = if tabs == 0 && space_total == 0 {
+        "none"
+    } else if tabs >= space_total {
         "tabs"
     } else {
         "spaces"
@@ -3925,6 +3960,43 @@ fn patch_file(app: &mut App, a: Args) -> ToolResult {
         }
         pairs.push((old.to_string(), new.to_string()));
     }
+    let dry_run = a.at("dry_run").and_then(Value::as_bool).unwrap_or(true);
+    if !dry_run && a.text("confirm") != "APPLY" {
+        return Err("confirm must be exactly APPLY when dry_run is false".into());
+    }
+    if dry_run {
+        let path = buffer_path(app, &a)?;
+        let (before, _) = read_text(app, &path, 4 * 1024 * 1024)?;
+        let mut after = before.clone();
+        let mut preview: Vec<Value> = Vec::with_capacity(pairs.len());
+        for (index, (old, new)) in pairs.iter().enumerate() {
+            let matches = after.matches(old.as_str()).count();
+            if matches != 1 {
+                return Err(format!(
+                    "edit {} matched {matches} times; each old_text must match exactly once, so nothing would be written",
+                    index + 1
+                ));
+            }
+            after = after.replacen(old.as_str(), new, 1);
+            preview.push(json!({
+                "edit": index + 1,
+                "old": cut(old, 200),
+                "new": cut(new, 200)
+            }));
+        }
+        let diff = similar::TextDiff::from_lines(&before, &after)
+            .unified_diff()
+            .context_radius(2)
+            .header("before", "after")
+            .to_string();
+        return Ok(json!({
+            "dry_run": true,
+            "path": display(app, &path),
+            "edits": preview,
+            "diff": cut(&diff, 20_000),
+            "note": "Nothing was written; repeat with dry_run=false and confirm=APPLY to apply"
+        }));
+    }
     edit_document(app, &a, |text| {
         let mut current = text.to_string();
         for (index, (old, new)) in pairs.iter().enumerate() {
@@ -3974,6 +4046,7 @@ fn save_buffer(app: &mut App, a: Args) -> ToolResult {
 fn save_all_buffers(app: &mut App) -> ToolResult {
     let mut saved = Vec::new();
     let mut errors = Vec::new();
+    let root = app.explorer.root.clone();
     for index in 0..app.editors.len() {
         let Some(editor) = app.editors.get_mut(index) else {
             continue;
@@ -3986,7 +4059,7 @@ fn save_all_buffers(app: &mut App) -> ToolResult {
         match editor.doc.save() {
             Ok(()) => saved.push(json!({
                 "name": name,
-                "path": path.as_ref().map(|p| display(app, p))
+                "path": path.as_ref().map(|p| crate::search::relative(&root, p))
             })),
             Err(error) => errors.push(format!("{name}: {error:#}")),
         }
@@ -5572,7 +5645,11 @@ fn get_agent_settings(options: &AgentConfig) -> ToolResult {
         "instructions_bytes": options.instructions.len(),
         "read_only": options.read_only,
         "commands": policy_label(options.commands),
-        "plugins": options.plugins,
+        "plugins": {
+            "enabled": options.plugins,
+            "allowed": options.allowed_plugins,
+            "denied": options.denied_plugins
+        },
         "sub_agents": options.sub_agents,
         "generated_tools": options.generated_tools,
         "toolkit": {
@@ -5617,7 +5694,37 @@ fn normalize_id(text: &str) -> String {
         .collect()
 }
 
-fn run_editor_command(app: &mut App, a: Args) -> ToolResult {
+/// Editor commands that change buffer or file content, blocked for read-only agents.
+fn command_edits_content(id: &str) -> bool {
+    matches!(
+        id,
+        "NewFile"
+            | "Save"
+            | "SaveAs"
+            | "SaveAll"
+            | "Undo"
+            | "Redo"
+            | "Cut"
+            | "Paste"
+            | "Replace"
+            | "ReplaceInFiles"
+            | "ToggleComment"
+            | "Indent"
+            | "Outdent"
+            | "MoveLineUp"
+            | "MoveLineDown"
+            | "DuplicateLineDown"
+            | "DuplicateLineUp"
+            | "DeleteLine"
+            | "InsertLineBelow"
+            | "InsertLineAbove"
+            | "ConvertIndentToSpaces"
+            | "ConvertIndentToTabs"
+            | "ToggleLineEnding"
+    )
+}
+
+fn run_editor_command(app: &mut App, options: &AgentConfig, a: Args) -> ToolResult {
     let input = a.string("command")?;
     let wanted = normalize_id(&input);
     if wanted.is_empty() {
@@ -5634,6 +5741,11 @@ fn run_editor_command(app: &mut App, a: Args) -> ToolResult {
     let id = format!("{:?}", command.cmd);
     if matches!(id.as_str(), "Quit" | "AgentNewChat" | "AgentStop") {
         return Err(format!("{id} is blocked for AI tools because it ends work or the session"));
+    }
+    if options.read_only && command_edits_content(&id) {
+        return Err(format!(
+            "{id} edits buffers or files, and this agent is read-only"
+        ));
     }
     let title = command.title;
     let cmd = command.cmd;
@@ -5813,4 +5925,290 @@ fn session_summary(app: &mut App, options: &AgentConfig) -> ToolResult {
         },
         "note": "Use list_functions for this task's generated functions and task_status for task detail"
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::automation::{Reply, Source};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    };
+    use std::time::{Duration, Instant};
+
+    fn app(tag: &str) -> App {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "termed-toolkit-{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "beta\nalpha\n").unwrap();
+        std::fs::write(root.join("b.txt"), "do not change\n").unwrap();
+        App::new(
+            root.clone(),
+            vec![root.join("a.txt")],
+            "Visual Studio Dark",
+            false,
+        )
+    }
+
+    fn tool(app: &mut App, name: &str, args: Value) -> ToolResult {
+        let (tx, rx) = mpsc::channel();
+        app.host_tool(Source::Main, Reply::Mcp(tx), name, args);
+        let start = Instant::now();
+        loop {
+            app.pump_agent();
+            app.pump_plugins();
+            match rx.try_recv() {
+                Ok(result) => return result,
+                Err(mpsc::TryRecvError::Disconnected) => panic!("host reply was dropped"),
+                Err(_) => {}
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "toolkit tool did not answer"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn names(options: &AgentConfig) -> Vec<String> {
+        tools(options).into_iter().map(|tool| tool.name).collect()
+    }
+
+    #[test]
+    fn catalog_is_unique_and_matches_group_counts() {
+        let all = catalog();
+        assert_eq!(all.len(), 100, "the catalog advertises exactly 100 tools");
+        let mut seen: HashSet<&str> = HashSet::new();
+        for spec in &all {
+            assert!(seen.insert(spec.name), "duplicate tool name {}", spec.name);
+            assert!(!spec.description.is_empty(), "{} needs a description", spec.name);
+            assert!(
+                spec.schema.is_object(),
+                "{} needs an object schema",
+                spec.name
+            );
+        }
+        for group in Group::ALL {
+            let count = all.iter().filter(|spec| spec.group == group).count();
+            assert_eq!(count, 10, "group {} lists {count} tools", group.id());
+        }
+        assert_eq!(group_ids().len(), 10);
+    }
+
+    #[test]
+    fn permissions_decide_which_tools_are_advertised() {
+        let mut options = AgentConfig::default();
+        let baseline = names(&options);
+        assert_eq!(baseline.len(), 100);
+        assert!(baseline.iter().any(|name| name == "delete_path"));
+        assert!(baseline.iter().any(|name| name == "git_status"));
+
+        options.toolkit = false;
+        assert!(names(&options).is_empty());
+        assert!(!contains(&options, "workspace_info"));
+
+        let mut read_only = AgentConfig::default();
+        read_only.read_only = true;
+        let visible = names(&read_only);
+        assert!(!visible.iter().any(|name| is_write(name)));
+        assert!(visible.iter().any(|name| name == "read_lines"));
+        assert!(visible.iter().any(|name| name == "git_log"));
+        assert!(!contains(&read_only, "create_file"));
+        assert!(contains(&read_only, "list_buffers"));
+
+        let mut denied = AgentConfig::default();
+        denied.commands = CommandPolicy::Deny;
+        let visible = names(&denied);
+        assert!(visible.iter().any(|name| name == "delete_path"));
+        assert!(!visible.iter().any(|name| name == "git_status"));
+        assert!(!contains(&denied, "git_blame"));
+
+        let mut grouped = AgentConfig::default();
+        grouped.toolkit_groups = vec!["workspace".into(), "session".into()];
+        let visible = names(&grouped);
+        assert_eq!(visible.len(), 20);
+        assert!(visible.iter().any(|name| name == "workspace_info"));
+        assert!(visible.iter().any(|name| name == "session_summary"));
+        assert!(!contains(&grouped, "read_lines"));
+
+        grouped.toolkit_groups = vec!["nonsense".into()];
+        assert!(names(&grouped).is_empty());
+        assert!(!contains(&grouped, "session_summary"));
+    }
+
+    #[test]
+    fn read_only_agents_never_reach_mutating_toolkit_tools() {
+        let mut app = app("readonly");
+        app.agent.options.read_only = true;
+        let result = tool(
+            &mut app,
+            "create_file",
+            json!({"path": "b.txt", "content": "x", "overwrite": true}),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(app.explorer.root.join("b.txt")).unwrap(),
+            "do not change\n"
+        );
+        let result = tool(&mut app, "run_editor_command", json!({"command": "Edit: Undo"}));
+        assert!(result.is_err());
+        let result = tool(&mut app, "read_lines", json!({"path": "a.txt"}));
+        assert!(result.is_ok(), "read tools stay available: {result:?}");
+    }
+
+    #[test]
+    fn destructive_tools_require_explicit_confirmation() {
+        let mut app = app("confirm");
+        let err = tool(&mut app, "delete_path", json!({"path": "b.txt"})).unwrap_err();
+        assert!(err.contains("DELETE"), "{err}");
+        assert!(app.explorer.root.join("b.txt").exists());
+        let ok = tool(
+            &mut app,
+            "delete_path",
+            json!({"path": "b.txt", "confirm": "DELETE"}),
+        )
+        .unwrap();
+        assert_eq!(ok["deleted"], json!(true));
+        assert!(!app.explorer.root.join("b.txt").exists());
+
+        let err = tool(
+            &mut app,
+            "revert_buffer",
+            json!({"path": "a.txt", "confirm": "yes"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("DISCARD"), "{err}");
+
+        let err = tool(
+            &mut app,
+            "patch_file",
+            json!({
+                "path": "a.txt",
+                "edits": [{"old_text": "beta", "new_text": "gamma"}]
+            }),
+        )
+        .unwrap();
+        assert_eq!(err["dry_run"], json!(true));
+        assert_eq!(
+            std::fs::read_to_string(app.explorer.root.join("a.txt")).unwrap(),
+            "beta\nalpha\n",
+            "a dry run never writes"
+        );
+        let err = tool(
+            &mut app,
+            "patch_file",
+            json!({
+                "path": "a.txt",
+                "edits": [{"old_text": "beta", "new_text": "gamma"}],
+                "dry_run": false
+            }),
+        )
+        .unwrap_err();
+        assert!(err.contains("APPLY"), "{err}");
+    }
+
+    #[test]
+    fn edits_hit_live_buffers_instead_of_disk() {
+        let mut app = app("live");
+        let result = tool(
+            &mut app,
+            "patch_file",
+            json!({
+                "path": "a.txt",
+                "edits": [{"old_text": "beta", "new_text": "gamma"}],
+                "dry_run": false,
+                "confirm": "APPLY"
+            }),
+        )
+        .unwrap();
+        assert_eq!(result["changed"], json!(true));
+        let editor = app.editor().unwrap();
+        assert_eq!(editor.doc.rope.to_string(), "gamma\nalpha\n");
+        assert!(
+            editor.doc.is_dirty(),
+            "the live buffer must stay unsaved and undoable"
+        );
+        assert_eq!(
+            std::fs::read_to_string(app.explorer.root.join("a.txt")).unwrap(),
+            "beta\nalpha\n",
+            "disk is untouched"
+        );
+    }
+
+    #[test]
+    fn read_tools_report_real_workspace_facts() {
+        let mut app = app("read");
+        let info = tool(&mut app, "workspace_info", json!({})).unwrap();
+        assert!(info["bytes"].as_u64().unwrap() >= 22);
+        let listing = tool(&mut app, "list_directory", json!({})).unwrap();
+        let entries = listing["entries"].as_array().unwrap();
+        assert!(entries.iter().any(|entry| entry["name"] == json!("a.txt")));
+        let files = tool(&mut app, "find_files", json!({"pattern": "*.txt"})).unwrap();
+        assert_eq!(files["files"].as_array().unwrap().len(), 2);
+        let counts = tool(
+            &mut app,
+            "buffer_info",
+            json!({"path": "a.txt"}),
+        )
+        .unwrap();
+        assert!(counts["lines"].as_u64().unwrap() >= 2);
+        assert_eq!(counts["dirty"], json!(false));
+        let missing = tool(&mut app, "read_lines", json!({"path": "../escape.txt"}));
+        assert!(missing.is_err(), "path escapes must fail closed");
+    }
+
+    #[test]
+    fn scratchpad_is_bounded_and_session_scoped() {
+        let mut app = app("notes");
+        tool(
+            &mut app,
+            "scratchpad_write",
+            json!({"key": "plan", "value": "step one"}),
+        )
+        .unwrap();
+        let read = tool(&mut app, "scratchpad_read", json!({"key": "plan"})).unwrap();
+        assert_eq!(read["value"], json!("step one"));
+        let listed = tool(&mut app, "scratchpad_read", json!({})).unwrap();
+        assert_eq!(listed["count"], json!(1));
+        let deleted = tool(
+            &mut app,
+            "scratchpad_write",
+            json!({"key": "plan", "delete": true}),
+        )
+        .unwrap();
+        assert_eq!(deleted["existed"], json!(true));
+        let oversized = tool(
+            &mut app,
+            "scratchpad_write",
+            json!({"key": "big", "value": "x".repeat(5000)}),
+        );
+        assert!(oversized.is_err());
+    }
+
+    #[test]
+    fn session_tools_describe_the_toolkit_itself() {
+        let mut app = app("session");
+        let listed = tool(&mut app, "list_toolkit", json!({})).unwrap();
+        assert_eq!(listed["enabled"], json!(true));
+        assert_eq!(listed["groups"].as_array().unwrap().len(), 10);
+        let described = tool(
+            &mut app,
+            "describe_tool",
+            json!({"name": "delete_path"}),
+        )
+        .unwrap();
+        assert_eq!(described["group"], json!("filesystem"));
+        assert_eq!(described["kind"], json!("write"));
+        assert_eq!(described["enabled"], json!(true));
+        let commands = tool(&mut app, "list_editor_commands", json!({"filter": "save"})).unwrap();
+        assert!(commands["count"].as_u64().unwrap() >= 1);
+        let summary = tool(&mut app, "session_summary", json!({})).unwrap();
+        assert_eq!(summary["buffers"]["count"], json!(1));
+        assert!(summary["toolkit"]["tools"].as_u64().unwrap() == 100);
+    }
 }
