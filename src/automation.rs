@@ -71,6 +71,8 @@ pub struct Automation {
     pub delegations: usize,
     pub overwatch: Overwatch,
     functions: HashMap<Source, Registry>,
+    /// Bounded notes shared across toolkit calls in this editor session.
+    pub(crate) scratchpad: std::collections::BTreeMap<String, String>,
 }
 
 impl Automation {
@@ -298,6 +300,10 @@ impl App {
             "call_function"=>{
                 let result=self.automation.functions.get(&source).ok_or("No functions defined in this task".to_string()).and_then(|r|r.call(s("name"),args.get("arguments").unwrap_or(&Value::Null)));
                 self.reply_tool(reply,result);
+            }
+            other if crate::toolkit::contains(&options, other) => {
+                let result = crate::toolkit::call(self, &options, other, &args);
+                self.reply_tool(reply, result);
             }
             _ => self.reply_tool(reply, Err("Unknown automation tool".into())),
         }
@@ -659,7 +665,7 @@ impl App {
             constraints,
             context,
             remaining_seconds: deadline.saturating_duration_since(Instant::now()).as_secs(),
-            capabilities: json!({"read_only":config.read_only,"commands":config.commands,"plugins":config.plugins,"generated_tools":config.generated_tools,"may_delegate":config.sub_agents&&depth<config.max_agent_depth,"max_depth":config.max_agent_depth,"required_skills":config.skills,"global_delegations_remaining":self.agent.options.max_delegations.saturating_sub(self.automation.delegations+1),"deadline_inherited":true}),
+            capabilities: json!({"read_only":config.read_only,"commands":config.commands,"plugins":config.plugins,"generated_tools":config.generated_tools,"toolkit":config.toolkit,"toolkit_groups":config.toolkit_groups,"may_delegate":config.sub_agents&&depth<config.max_agent_depth,"max_depth":config.max_agent_depth,"required_skills":config.skills,"global_delegations_remaining":self.agent.options.max_delegations.saturating_sub(self.automation.delegations+1),"deadline_inherited":true}),
         };
         Ok((profile, config, brief, deadline))
     }

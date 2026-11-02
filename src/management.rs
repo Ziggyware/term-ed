@@ -58,6 +58,8 @@ enum Field {
     StallTimeout,
     GeneratedTools,
     OutputTokens,
+    Toolkit,
+    ToolkitGroups,
 }
 
 const FIELDS: &[(Field, &str)] = &[
@@ -83,6 +85,8 @@ const FIELDS: &[(Field, &str)] = &[
     (Field::StallTimeout, "Overwatch stall timeout (seconds)"),
     (Field::GeneratedTools, "Pure generated functions"),
     (Field::OutputTokens, "Model output token budget"),
+    (Field::Toolkit, "Extended AI toolkit"),
+    (Field::ToolkitGroups, "Toolkit groups"),
 ];
 
 fn on(b: bool) -> &'static str {
@@ -139,6 +143,8 @@ fn value(field: Field, a: &AgentConfig) -> String {
         Field::StallTimeout => a.stall_timeout_secs.to_string(),
         Field::GeneratedTools => on(a.generated_tools).into(),
         Field::OutputTokens => a.max_output_tokens.to_string(),
+        Field::Toolkit => on(a.toolkit).into(),
+        Field::ToolkitGroups => a.toolkit_groups.join(", "),
     }
 }
 
@@ -209,6 +215,12 @@ fn hint(field: Field) -> &'static str {
         }
         Field::OutputTokens => {
             "256–16384 requested completion tokens; router/OpenAI max_tokens; inherited workers cannot increase it"
+        }
+        Field::Toolkit => {
+            "100 workspace, text, buffer, edit, filesystem, search, git, UI, code and session tools; write tools never reach read-only agents"
+        }
+        Field::ToolkitGroups => {
+            "Comma-separated groups (workspace, text, buffers, edit, filesystem, search, git, ui, code, session); empty = all. Narrower groups reduce prompt size"
         }
     }
 }
@@ -604,6 +616,10 @@ impl App {
                 config.generated_tools = !config.generated_tools;
                 true
             }
+            Field::Toolkit => {
+                config.toolkit = !config.toolkit;
+                true
+            }
             Field::AutoContext => {
                 config.auto_context = !config.auto_context;
                 true
@@ -986,6 +1002,17 @@ fn set_field(a: &mut AgentConfig, field: Field, input: &str) -> Result<()> {
             a.max_steps = input
                 .parse()
                 .map_err(|_| anyhow::anyhow!("Enter a step budget from 1 to 100"))?
+        }
+        Field::ToolkitGroups => {
+            for group in csv(input) {
+                if !crate::toolkit::group_ids().contains(&group.as_str()) {
+                    anyhow::bail!(
+                        "Unknown toolkit group \"{group}\"; choose from {}",
+                        crate::toolkit::group_ids().join(", ")
+                    );
+                }
+            }
+            a.toolkit_groups = csv(input);
         }
         Field::AllowedPlugins => a.allowed_plugins = csv(input),
         Field::Skills => a.skills = csv(input),

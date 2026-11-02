@@ -74,6 +74,12 @@ pub struct AgentConfig {
     pub max_concurrent_tasks: usize,
     pub stall_timeout_secs: u64,
     pub generated_tools: bool,
+    /// Expose the extended host toolkit (workspace, text, buffer, edit,
+    /// filesystem, search, git, UI, code and session tools).
+    pub toolkit: bool,
+    /// Toolkit groups to expose; empty means every group. Sub-agents inherit
+    /// only groups their parent already has.
+    pub toolkit_groups: Vec<String>,
     pub max_output_tokens: usize,
     pub auto_context: bool,
 }
@@ -103,6 +109,8 @@ impl Default for AgentConfig {
             max_concurrent_tasks: 4,
             stall_timeout_secs: 150,
             generated_tools: true,
+            toolkit: true,
+            toolkit_groups: Vec::new(),
             max_output_tokens: 4096,
             auto_context: true,
         }
@@ -177,6 +185,14 @@ impl AgentConfig {
         }
         if self.instructions.len() > 16 * 1024 {
             bail!("Agent instructions must not exceed 16 KiB");
+        }
+        for group in &self.toolkit_groups {
+            if !crate::toolkit::group_ids().contains(&group.as_str()) {
+                bail!(
+                    "Unknown toolkit group \"{group}\"; choose from {}",
+                    crate::toolkit::group_ids().join(", ")
+                );
+            }
         }
         if !(1..=100).contains(&self.max_steps) {
             bail!("Max steps must be between 1 and 100");
@@ -274,6 +290,23 @@ impl AgentConfig {
         child.task_timeout_secs = child.task_timeout_secs.min(parent.task_timeout_secs);
         child.sub_agents &= parent.sub_agents;
         child.generated_tools &= parent.generated_tools;
+        child.toolkit &= parent.toolkit;
+        // A parent that narrowed groups keeps the child inside the same set.
+        if !parent.toolkit_groups.is_empty() {
+            child.toolkit_groups = if child.toolkit_groups.is_empty() {
+                parent.toolkit_groups.clone()
+            } else {
+                child
+                    .toolkit_groups
+                    .iter()
+                    .filter(|g| parent.toolkit_groups.iter().any(|p| p == *g))
+                    .cloned()
+                    .collect()
+            };
+            if child.toolkit_groups.is_empty() {
+                child.toolkit = false;
+            }
+        }
         child.max_agent_depth = child.max_agent_depth.min(parent.max_agent_depth);
         child.max_concurrent_tasks = child.max_concurrent_tasks.min(parent.max_concurrent_tasks);
         child.max_delegations = child.max_delegations.min(parent.max_delegations);

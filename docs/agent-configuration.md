@@ -46,6 +46,8 @@ The agent configuration menu exposes:
 | Concurrent tasks | 1–8 active tasks (default 4), including waiting coordinators; new delegation fails fast when full |
 | Overwatch stall timeout | 15–600 seconds (default 150); child/approval/plugin waits are exempt from idle detection, not absolute deadlines |
 | Pure generated functions | Enable bounded task-scoped data transformations; no generated code execution |
+| Extended AI toolkit | Expose the 100 extra host tools; write tools are hidden from read-only agents and git tools from `deny` |
+| Toolkit groups | Comma-separated groups (`workspace`, `text`, `buffers`, `edit`, `filesystem`, `search`, `git`, `ui`, `code`, `session`); empty means all. Fewer groups means a shorter tool prompt |
 | Model output token budget | 256–16384 (default 4096), inherited restrictively |
 
 Explicit settings take precedence over environment defaults. Custom provider requests use `Authorization: Bearer <value of api_key_env>`; missing credentials are reported without exposing their value. Custom endpoints use the explicitly chosen model rather than discovering/failing over to unrelated free models.
@@ -78,7 +80,9 @@ This is a partial configuration; omitted fields retain defaults:
     "denied_plugins": [],
     "skills": ["project-style"],
     "sub_agents": true,
-    "max_delegations": 3
+    "max_delegations": 3,
+    "toolkit": true,
+    "toolkit_groups": ["workspace", "text", "buffers", "edit", "search", "git"]
   }
 }
 ```
@@ -106,6 +110,33 @@ Plugin command execution times out after 120 seconds; unanswered plugin approval
 ### External ACP / MCP transport
 
 For external agents, termed supplies an authenticated **stdio MCP relay** in ACP's `mcpServers` list. It forwards requests to the live editor through a randomly authenticated loopback connection. Tools operate on the same buffers and approval cards as the built-in agent. The listener is not exposed on the network, the authentication value is session-local, and the relay writes JSON-RPC only to stdout. `--mcp-bridge` is an internal command, not a public unauthenticated tool server.
+
+## Extended host toolkit
+
+The host advertises 100 additional tools from a single catalog, in ten groups:
+
+| Group | Tools |
+| --- | --- |
+| `workspace` | `workspace_info`, `list_directory`, `tree_view`, `file_info`, `find_files`, `path_exists`, `workspace_stats`, `recent_files`, `file_checksum`, `directory_sizes` |
+| `text` | `read_lines`, `grep_context`, `todo_scan`, `word_stats`, `line_stats`, `whitespace_report`, `text_diff`, `buffer_disk_diff`, `json_query`, `regex_test` |
+| `buffers` | `list_buffers`, `buffer_info`, `get_selection`, `cursor_info`, `buffer_text`, `selection_count`, `bracket_balance`, `indent_report`, `buffer_changes`, `line_at` |
+| `edit` | `replace_in_buffer`, `replace_line_range`, `insert_lines`, `delete_lines`, `append_text`, `prepend_text`, `trim_trailing_whitespace`, `sort_lines`, `dedupe_lines`, `transform_case` |
+| `filesystem` | `create_file`, `create_directory`, `copy_path`, `move_path`, `delete_path`, `write_lines`, `patch_file`, `save_buffer`, `save_all_buffers`, `revert_buffer` |
+| `search` | `search_workspace`, `match_count`, `find_references`, `grep_patterns`, `list_large_files`, `list_empty_files`, `duplicate_basenames`, `replace_in_files`, `files_containing_all`, `symbol_search` |
+| `git` | `git_status`, `git_diff`, `git_log`, `git_show`, `git_branches`, `git_blame`, `git_file_history`, `git_remotes`, `git_stash_list`, `git_tags` |
+| `ui` | `notify_user`, `open_file`, `activate_buffer`, `close_buffer`, `go_to_line`, `select_range`, `list_themes`, `set_theme`, `toggle_view`, `get_ui_state` |
+| `code` | `detect_language`, `outline_symbols`, `dependency_summary`, `license_check`, `markdown_stats`, `import_summary`, `comment_ratio`, `function_sizes`, `test_map`, `json_validate` |
+| `session` | `list_toolkit`, `describe_tool`, `get_agent_settings`, `list_editor_commands`, `run_editor_command`, `open_palette`, `focus_panel`, `scratchpad_write`, `scratchpad_read`, `session_summary` |
+
+Every tool has a JSON schema, and the same catalog drives what is advertised, what is accepted and what runs, so a disabled or non-permitted tool is not merely hidden: the host rejects the call. Rules:
+
+- **Read-only.** `read_only` hides every mutating tool and rejects `run_editor_command` for commands that change content. Git tools are fixed-argv, read-only commands (`status`, `diff`, `log`, `show`, `branch`, `blame`, `log --follow`, `remote`, `stash list`, `tag --list`) with no shell, and they are hidden entirely when command permissions are `deny`.
+- **Live buffers first.** A tool that edits a file which is open in the editor replaces the buffer in one undo step and leaves it unsaved, instead of writing disk content over your unsaved work. `save_buffer`/`save_all_buffers` are the only toolkit calls that write buffers to disk, and `revert_buffer` needs `confirm: "DISCARD"`.
+- **Confirmation tokens.** Destructive calls fail closed without the literal token: `delete_path` requires `confirm: "DELETE"` (and `recursive: true` for a directory), `patch_file` and `replace_in_files` require `confirm: "APPLY"` when they are not dry runs, and `close_buffer` requires `DISCARD` to discard an edited buffer. `create_file`, `write_lines`, `copy_path` and `move_path` refuse to replace an existing path unless `overwrite` is true. `delete_path` also refuses the workspace root, paths inside `.git`, symlinks and files that have an open buffer.
+- **Bounded.** Paths go through the same `workspace_path` resolution as other tools, so `..` escapes, symlink escapes and credential files are rejected. Scans stop after 2,000 files or 512 KiB per file, directory listings and match lists are capped, and returned text is truncated at 96 KiB with an explicit note.
+- **Session notes.** `scratchpad_write`/`scratchpad_read` keep up to 64 keys and 32 KiB of notes for the current editor session. They are memory-only: nothing is written to disk and they disappear when termed exits.
+
+Sub-agents inherit the toolkit: a child keeps `toolkit` only if its parent has it and keeps only groups the parent already has, so a specialist can never gain a group its parent lacks.
 
 ## Sub-agents
 

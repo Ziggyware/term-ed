@@ -437,11 +437,20 @@ impl Worker {
             self.options.instructions,
             self.skill_context,
             if self.options.read_only {
-                "Read-only mode: do not change files or execute commands."
+                "Read-only mode: do not change files or execute commands. Read-only toolkit tools remain available."
             } else {
                 "Plugin tools operate on live unsaved editor buffers. Read their results; never overwrite plugin edits with stale disk content. Use list_skills/read_skill for relevant instructions and list_sub_agents/delegate_task for focused specialist work."
             }
-        )
+        ) + &if self.options.toolkit {
+            let groups = crate::toolkit::enabled_group_ids(&self.options);
+            format!(
+                "\n\nExtended toolkit ({} tools in: {}): workspace and file metadata, text analysis, live buffers, undoable edits, filesystem changes, workspace search, read-only git, UI navigation, code analysis and session notes. Call list_toolkit to see the exact names and enabled state, then describe_tool for a schema. Prefer buffer tools for files that are open (edits stay unsaved and undoable), read a file before editing it, and use notify_user when the user must act.",
+                crate::toolkit::tools(&self.options).len(),
+                groups.join(", ")
+            )
+        } else {
+            String::new()
+        }
     }
 
     /// One user turn: loop model → tools until the model stops calling tools.
@@ -797,10 +806,10 @@ impl Worker {
     fn run_tool(&mut self, id: &str, name: &str, a: &Value) -> String {
         let s = |k: &str| a.get(k).and_then(Value::as_str).unwrap_or("").to_string();
         if self.options.read_only
-            && matches!(
+            && (matches!(
                 name,
                 "edit_file" | "write_file" | "run_command" | "run_plugin"
-            )
+            ) || crate::toolkit::is_write(name))
         {
             self.tool_start(id, name, "other", None);
             self.tool_end(
