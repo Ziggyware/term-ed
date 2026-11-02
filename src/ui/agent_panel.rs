@@ -2,6 +2,8 @@
 //! permission prompts and a prompt box. Docked on the right on wide screens,
 //! a full-screen sheet on phones.
 
+use std::time::Duration;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -47,10 +49,23 @@ impl Row {
 /// Split styled segments into words and greedily wrap them to `w` columns.
 fn wrap_styled(segs: &[(String, Style)], w: usize, indent: &str) -> Vec<Vec<(String, Style)>> {
     let w = w.max(4);
+    let indent_w = UnicodeWidthStr::width(indent).min(w.saturating_sub(2));
+    let start_indent = || -> (Vec<(String, Style)>, usize) {
+        if indent_w > 0 {
+            (vec![(indent.to_string(), Style::default())], indent_w)
+        } else {
+            (Vec::new(), 0)
+        }
+    };
+
     let mut tokens: Vec<(String, Style)> = Vec::new();
     for (s, st) in segs {
         let mut cur = String::new();
         for c in s.chars() {
+            let c = if c == '\t' { ' ' } else { c };
+            if c.is_control() {
+                continue;
+            }
             if c == ' ' {
                 if !cur.is_empty() {
                     tokens.push((std::mem::take(&mut cur), *st));
@@ -64,40 +79,48 @@ fn wrap_styled(segs: &[(String, Style)], w: usize, indent: &str) -> Vec<Vec<(Str
             tokens.push((cur, *st));
         }
     }
+
     let mut lines: Vec<Vec<(String, Style)>> = vec![Vec::new()];
     let mut used = 0usize;
+
     for (tok, st) in tokens {
         let tw = UnicodeWidthStr::width(tok.as_str());
-        if tok == " " && used == 0 && lines.len() > 1 {
+        if tok == " " && (used == 0 || (lines.len() > 1 && used == indent_w)) {
             continue;
         }
-        if used + tw > w && used > 0 {
-            lines.push(vec![(indent.to_string(), Style::default())]);
-            used = UnicodeWidthStr::width(indent);
+        if used + tw > w && used > indent_w {
+            let (next_line, next_used) = start_indent();
+            lines.push(next_line);
+            used = next_used;
             if tok == " " {
                 continue;
             }
         }
-        if tw > w {
-            // Hard-break very long words (URLs, paths).
+        if used + tw > w {
+            // Hard-break very long words (URLs, paths) while preserving indent.
             let mut chunk = String::new();
             let mut cw = 0;
             for c in tok.chars() {
                 let ccw = c.width().unwrap_or(0);
-                if used + cw + ccw > w {
-                    lines
-                        .last_mut()
-                        .unwrap()
-                        .push((std::mem::take(&mut chunk), st));
-                    lines.push(Vec::new());
-                    used = 0;
+                if used + cw + ccw > w && (used + cw > indent_w) {
+                    if !chunk.is_empty() {
+                        lines
+                            .last_mut()
+                            .unwrap()
+                            .push((std::mem::take(&mut chunk), st));
+                    }
+                    let (next_line, next_used) = start_indent();
+                    lines.push(next_line);
+                    used = next_used;
                     cw = 0;
                 }
                 chunk.push(c);
                 cw += ccw;
             }
-            lines.last_mut().unwrap().push((chunk, st));
-            used += cw;
+            if !chunk.is_empty() {
+                lines.last_mut().unwrap().push((chunk, st));
+                used += cw;
+            }
             continue;
         }
         lines.last_mut().unwrap().push((tok, st));
@@ -113,8 +136,11 @@ fn chunk(s: &str, w: usize) -> Vec<String> {
     let mut used = 0;
     for c in s.chars() {
         let c = if c == '\t' { ' ' } else { c };
+        if c.is_control() {
+            continue;
+        }
         let cw = c.width().unwrap_or(0);
-        if used + cw > w {
+        if used + cw > w && used > 0 {
             out.push(String::new());
             used = 0;
         }
@@ -124,41 +150,77 @@ fn chunk(s: &str, w: usize) -> Vec<String> {
     out
 }
 
-/// Inline markdown: `code`, **bold**.
+/// Inline markdown: `code`, **bold**, *italic*.
 fn inline_md(line: &str, base: Style, code: Style) -> Vec<(String, Style)> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut in_code = false;
     let mut in_bold = false;
+    let mut in_italic = false;
     let mut chars = line.chars().peekable();
-    let style = |c: bool, b: bool| {
+    let style = |c: bool, b: bool, i: bool| {
         if c {
             code
-        } else if b {
-            base.add_modifier(Modifier::BOLD)
         } else {
-            base
+            let mut st = base;
+            if b {
+                st = st.add_modifier(Modifier::BOLD);
+            }
+            if i {
+                st = st.add_modifier(Modifier::ITALIC);
+            }
+            st
         }
     };
     while let Some(c) = chars.next() {
+        let c = if c == '\t' { ' ' } else { c };
+        if c.is_control() {
+            continue;
+        }
         if c == '`' {
-            out.push((std::mem::take(&mut cur), style(in_code, in_bold)));
+            if !cur.is_empty() {
+                out.push((std::mem::take(&mut cur), style(in_code, in_bold, in_italic)));
+            }
             in_code = !in_code;
-        } else if c == '*' && chars.peek() == Some(&'*') && !in_code {
-            chars.next();
-            out.push((std::mem::take(&mut cur), style(in_code, in_bold)));
-            in_bold = !in_bold;
+        } else if c == '*' && !in_code {
+            if chars.peek() == Some(&'*') {
+                chars.next();
+                if !cur.is_empty() {
+                    out.push((std::mem::take(&mut cur), style(in_code, in_bold, in_italic)));
+                }
+                in_bold = !in_bold;
+            } else {
+                if !cur.is_empty() {
+                    out.push((std::mem::take(&mut cur), style(in_code, in_bold, in_italic)));
+                }
+                in_italic = !in_italic;
+            }
         } else {
             cur.push(c);
         }
     }
-    out.push((cur, style(in_code, in_bold)));
-    out.retain(|(s, _)| !s.is_empty());
+    if !cur.is_empty() {
+        out.push((cur, style(in_code, in_bold, in_italic)));
+    }
     out
+}
+
+fn parse_ordered_list(trimmed: &str) -> Option<(&str, &str)> {
+    let dot = trimmed.find(". ")?;
+    if dot == 0 || dot > 4 {
+        return None;
+    }
+    let digits = &trimmed[..dot];
+    if digits.bytes().all(|b| b.is_ascii_digit()) {
+        Some((&trimmed[..dot + 2], &trimmed[dot + 2..]))
+    } else {
+        None
+    }
 }
 
 fn markdown(text: &str, w: usize, pal: &Palette, panel_bg: Color, rows: &mut Vec<Row>) {
     let base = Style::default().fg(pal.fg);
+    let dim = Style::default().fg(pal.popup_dim);
     let code_st = Style::default().fg(pal.match_fg);
     let code_bg = mix(panel_bg, Color::Black, 0.35);
     let mut in_fence = false;
@@ -183,19 +245,35 @@ fn markdown(text: &str, w: usize, pal: &Palette, panel_bg: Color, rows: &mut Vec
             continue;
         }
         let trimmed = line.trim_start();
+        if (trimmed.starts_with("---") || trimmed.starts_with("***"))
+            && trimmed.chars().all(|c| c == '-' || c == '*' || c == ' ')
+        {
+            rows.push(Row::text(
+                "─".repeat(w.min(48)),
+                Style::default().fg(pal.border),
+            ));
+            continue;
+        }
         let (prefix, body, st, indent) = if let Some(h) = trimmed.strip_prefix('#') {
             (
-                "",
+                String::new(),
                 h.trim_start_matches('#').trim(),
                 bold(Style::default().fg(pal.accent)),
                 "",
             )
-        } else if let Some(b) = trimmed.strip_prefix("- ").or(trimmed.strip_prefix("* ")) {
-            ("• ", b, base, "  ")
+        } else if let Some(b) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+            ("• ".to_string(), b, base, "  ")
+        } else if let Some((num, rest)) = parse_ordered_list(trimmed) {
+            (num.to_string(), rest, base, "   ")
+        } else if let Some(q) = trimmed.strip_prefix("> ").or_else(|| trimmed.strip_prefix('>')) {
+            ("▎ ".to_string(), q.trim_start(), dim.add_modifier(Modifier::ITALIC), "  ")
         } else {
-            ("", line, base, "")
+            (String::new(), line, base, "")
         };
-        let mut segs = vec![(prefix.to_string(), Style::default().fg(pal.accent))];
+        let mut segs = Vec::new();
+        if !prefix.is_empty() {
+            segs.push((prefix, Style::default().fg(pal.accent)));
+        }
         segs.extend(inline_md(body, st, code_st));
         for l in wrap_styled(&segs, w, indent) {
             rows.push(Row {
@@ -234,25 +312,38 @@ fn verb(kind: &str) -> &'static str {
     }
 }
 
-/// Changed lines of a diff snippet, as (sign, text).
-fn diff_lines(old: Option<&str>, new: &str) -> Vec<(char, String)> {
+/// Changed lines of a diff snippet: returns up to `limit` changed lines and the total changed count.
+fn diff_lines(old: Option<&str>, new: &str, limit: usize) -> (Vec<(char, String)>, usize) {
     let old = old.unwrap_or("");
-    let d = similar::TextDiff::from_lines(old, new);
-    let mut out = Vec::new();
+    let d = similar::TextDiff::configure()
+        .timeout(Duration::from_millis(20))
+        .diff_lines(old, new);
+    let mut out = Vec::with_capacity(limit.min(16));
+    let mut total = 0usize;
     for change in d.iter_all_changes() {
         let sign = match change.tag() {
             similar::ChangeTag::Delete => '-',
             similar::ChangeTag::Insert => '+',
             similar::ChangeTag::Equal => continue,
         };
-        out.push((sign, change.value().trim_end_matches('\n').to_string()));
+        total += 1;
+        if out.len() < limit {
+            out.push((
+                sign,
+                change
+                    .value()
+                    .trim_end_matches(['\n', '\r'])
+                    .to_string(),
+            ));
+        }
     }
-    out
+    (out, total)
 }
 
 fn build_rows(app: &App, w: usize, panel_bg: Color) -> Vec<Row> {
     let pal = &app.theme.palette;
     let a = &app.agent;
+    let working = a.is_working() || app.automation.busy();
     let dim = Style::default().fg(pal.popup_dim);
     let mut rows: Vec<Row> = Vec::new();
     let name = a.name();
@@ -288,10 +379,23 @@ fn build_rows(app: &App, w: usize, panel_bg: Color) -> Vec<Row> {
                 }
             }
             rows.push(Row::blank());
-            let label = " ⟳ Retry ";
+            let retry_label = " ⟳ Retry ";
+            let settings_label = " ⚙ AI settings ";
+            let rw = width(retry_label);
+            let sw = width(settings_label);
+            let mut buttons = vec![(0, rw, AgentTarget::Retry)];
+            let mut spans = vec![(retry_label.into(), bold(fgbg(pal.accent_fg, pal.accent)))];
+            if (rw + 1 + sw) as usize <= w {
+                spans.push((" ".into(), Style::default()));
+                spans.push((
+                    settings_label.into(),
+                    fgbg(pal.fg, mix(panel_bg, pal.fg, 0.12)),
+                ));
+                buttons.push((rw + 1, sw, AgentTarget::Settings));
+            }
             rows.push(Row {
-                spans: vec![(label.into(), bold(fgbg(pal.accent_fg, pal.accent)))],
-                buttons: vec![(0, width(label), AgentTarget::Retry)],
+                spans,
+                buttons,
                 ..Default::default()
             });
             if !a.entries.is_empty() {
@@ -342,13 +446,10 @@ fn build_rows(app: &App, w: usize, panel_bg: Color) -> Vec<Row> {
             ],
         };
         for s in suggestions {
-            let label = format!(" › {s} ");
+            let label = ellipsize(&format!(" › {s} "), w);
             let lw = width(&label).min(w as u16);
             rows.push(Row {
-                spans: vec![(
-                    ellipsize(&label, w),
-                    fgbg(pal.fg, mix(panel_bg, pal.fg, 0.08)),
-                )],
+                spans: vec![(label, fgbg(pal.fg, mix(panel_bg, pal.fg, 0.08)))],
                 buttons: vec![(0, lw, AgentTarget::Suggest(s))],
                 ..Default::default()
             });
@@ -399,7 +500,10 @@ fn build_rows(app: &App, w: usize, panel_bg: Color) -> Vec<Row> {
                     .fg(pal.popup_dim)
                     .add_modifier(Modifier::ITALIC);
                 let text = t.trim();
-                if i == last && a.is_working() {
+                if text.is_empty() {
+                    continue;
+                }
+                if i == last && working {
                     for l in wrap_text(&format!("∴ {text}"), w)
                         .into_iter()
                         .rev()
@@ -451,10 +555,10 @@ fn build_rows(app: &App, w: usize, panel_bg: Color) -> Vec<Row> {
                     ..Default::default()
                 });
                 for d in &t.diffs {
-                    let lines = diff_lines(d.old.as_deref(), &d.new);
                     let shown = 12;
+                    let (lines, total_changed) = diff_lines(d.old.as_deref(), &d.new, shown);
                     let target = Some(AgentTarget::OpenFile(d.path.clone(), None));
-                    for (sign, text) in lines.iter().take(shown) {
+                    for (sign, text) in &lines {
                         let (bg, fgc) = if *sign == '-' {
                             (
                                 mix(panel_bg, pal.diff_deleted, 0.28),
@@ -477,20 +581,26 @@ fn build_rows(app: &App, w: usize, panel_bg: Color) -> Vec<Row> {
                             });
                         }
                     }
-                    if lines.len() > shown {
+                    if total_changed > shown {
                         rows.push(Row::text(
-                            format!("    … {} more changed lines", lines.len() - shown),
+                            format!("    … {} more changed lines", total_changed - shown),
                             dim,
                         ));
                     }
                 }
                 if t.diffs.is_empty()
-                    && !matches!(t.kind.as_str(), "read" | "edit")
+                    && (!matches!(t.kind.as_str(), "read" | "edit")
+                        || t.status == ToolStatus::Failed)
                     && let Some(text) = &t.text
                 {
+                    let line_st = if t.status == ToolStatus::Failed {
+                        Style::default().fg(pal.error)
+                    } else {
+                        dim
+                    };
                     let all: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
                     for l in all.iter().take(4) {
-                        rows.push(Row::text(ellipsize(&format!("  │ {l}"), w), dim));
+                        rows.push(Row::text(ellipsize(&format!("  │ {l}"), w), line_st));
                     }
                     if all.len() > 4 {
                         rows.push(Row::text(
@@ -537,7 +647,7 @@ fn build_rows(app: &App, w: usize, panel_bg: Color) -> Vec<Row> {
                         };
                         let mut x = 0u16;
                         for (n, (id, label, kind)) in p.options.iter().enumerate() {
-                            let text = format!(" {} {label} ", n + 1);
+                            let text = ellipsize(&format!(" {} {label} ", n + 1), w);
                             let tw = width(&text);
                             if x + tw > w as u16 && x > 0 {
                                 rows.push(std::mem::take(&mut row));
@@ -572,7 +682,7 @@ fn build_rows(app: &App, w: usize, panel_bg: Color) -> Vec<Row> {
             }
         }
     }
-    if a.state == State::Working || (a.state == State::Starting && !a.entries.is_empty()) {
+    if working && !a.entries.is_empty() {
         let secs = a.turn_started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
         rows.push(Row::blank());
         rows.push(Row::text(
@@ -654,25 +764,27 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
         let label = label.rsplit('/').next().unwrap_or(&label).to_string();
         let free = app.agent.model.as_deref().is_some_and(is_free_model);
         let room = rx.saturating_sub(x + 3) as usize;
-        let chip = format!(
-            " {} ▾",
-            ellipsize(&label, room.saturating_sub(if free { 8 } else { 3 }))
-        );
-        let mx = x + 1;
-        x = put(buf, mx, inner.y, &chip, fgbg(pal.popup_dim, head_bg), rx);
-        if free && x + 6 < rx {
-            x = put(
-                buf,
-                x + 1,
-                inner.y,
-                " free ",
-                bold(fgbg(pal.accent_fg, pal.success)),
-                rx,
+        if room >= 6 {
+            let chip = format!(
+                " {} ▾",
+                ellipsize(&label, room.saturating_sub(if free { 8 } else { 3 }))
             );
+            let mx = x + 1;
+            x = put(buf, mx, inner.y, &chip, fgbg(pal.popup_dim, head_bg), rx);
+            if free && x + 6 < rx {
+                x = put(
+                    buf,
+                    x + 1,
+                    inner.y,
+                    " free ",
+                    bold(fgbg(pal.accent_fg, pal.success)),
+                    rx,
+                );
+            }
+            app.layout
+                .agent_targets
+                .push((Rect::new(mx, inner.y, x - mx, 1), AgentTarget::Model));
         }
-        app.layout
-            .agent_targets
-            .push((Rect::new(mx, inner.y, x - mx, 1), AgentTarget::Model));
     }
     put(buf, rx, inner.y, " ⚙ ", fgbg(pal.fg, head_bg), head.right());
     app.layout
@@ -703,7 +815,7 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
         .push((Rect::new(rx + 7, inner.y, 3, 1), AgentTarget::Close));
 
     // Input box (grows to 5 lines), with the attached-context chip above it.
-    let text_w = inner.width.saturating_sub(7) as usize;
+    let text_w = inner.width.saturating_sub(7).max(1) as usize;
     let input = app.agent.input.clone();
     let lines: Vec<String> = if input.is_empty() {
         vec![String::new()]
@@ -800,12 +912,15 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
                 .push((Rect::new(rx0 + bx, y, *bw, 1), t.clone()));
         }
     }
-    if app.agent.scroll > 0 {
+    if app.agent.scroll > 0 && body.height > 0 {
         let label = format!(" ↓ {} more ", app.agent.scroll);
+        let lw = width(&label);
+        let sx = body.right().saturating_sub(lw + 1);
+        let sy = body.bottom().saturating_sub(1);
         put(
             buf,
-            body.right().saturating_sub(width(&label) + 1),
-            body.bottom().saturating_sub(1),
+            sx,
+            sy,
             &label,
             bold(fgbg(pal.accent_fg, pal.accent)),
             body.right(),
@@ -817,11 +932,29 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
             buf,
             inner.x + 1,
             ctx_y,
-            &ellipsize(&format!("@ {c}"), inner.width as usize - 2),
+            &ellipsize(&format!("@ {c}"), inner.width.saturating_sub(2) as usize),
             fgbg(pal.popup_dim, panel_bg),
             inner.right(),
         );
     }
+
+    // Compute caret wrapped row/col before drawing the input slice so the
+    // 5-line input viewport scrolls to keep the caret visible.
+    let before: String = input.chars().take(app.agent.cursor).collect();
+    let mut caret_row = 0usize;
+    let mut caret_col = 0usize;
+    for (k, part) in before.split('\n').enumerate() {
+        let chunks = chunk(part, text_w);
+        if k > 0 {
+            caret_row += 1;
+        }
+        caret_row += chunks.len() - 1;
+        caret_col = UnicodeWidthStr::width(chunks.last().map(String::as_str).unwrap_or(""));
+    }
+    let max_skip = lines.len().saturating_sub(input_h as usize);
+    let skip = caret_row
+        .saturating_sub((input_h as usize).saturating_sub(1))
+        .min(max_skip);
 
     // Input.
     let ib = Rect::new(inner.x, box_top, inner.width, input_h + 1);
@@ -846,7 +979,7 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
         bold(fgbg(pal.accent, pal.input_bg)),
         field.right(),
     );
-    let working = app.agent.is_working();
+    let working = app.agent.is_working() || app.automation.busy();
     let (btn, btn_bg, target) = if working {
         (" ■ ", pal.error, AgentTarget::Stop)
     } else {
@@ -888,8 +1021,7 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
             bx,
         );
     } else {
-        let skip = lines.len().saturating_sub(input_h as usize);
-        for (k, l) in lines.iter().skip(skip).enumerate() {
+        for (k, l) in lines.iter().skip(skip).take(input_h as usize).enumerate() {
             put(
                 buf,
                 tx,
@@ -903,20 +1035,55 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
     if !focused {
         return None;
     }
-    // Caret: walk the wrapped lines to the cursor.
-    let before: String = input.chars().take(app.agent.cursor).collect();
-    let mut row = 0usize;
-    let mut col = 0usize;
-    for (k, part) in before.split('\n').enumerate() {
-        let chunks = chunk(part, text_w);
-        if k > 0 {
-            row += 1;
+    let vis = caret_row.checked_sub(skip)?;
+    Some(Position::new(
+        (tx + caret_col as u16).min(bx.saturating_sub(1)),
+        field.y + vis as u16,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrap_styled_preserves_indent_across_long_hard_broken_tokens() {
+        let segs = vec![
+            ("• ".to_string(), Style::default()),
+            (
+                "[https://nokey-router.ziggyware.deno.net/v1/chat/completions](https://nokey-router.ziggyware.deno.net/v1/chat/completions)".to_string(),
+                Style::default(),
+            ),
+        ];
+        let wrapped = wrap_styled(&segs, 20, "  ");
+        assert!(wrapped.len() >= 3);
+        for (idx, line) in wrapped.iter().enumerate() {
+            let line_width: usize = line
+                .iter()
+                .map(|(s, _)| UnicodeWidthStr::width(s.as_str()))
+                .sum();
+            assert!(line_width <= 20, "line {idx} exceeded width: {line_width}");
+            if idx > 0 {
+                assert_eq!(line[0].0, "  ", "continuation line {idx} lost indent");
+            }
         }
-        row += chunks.len() - 1;
-        col = UnicodeWidthStr::width(chunks.last().map(String::as_str).unwrap_or(""));
     }
-    let total_rows = lines.len();
-    let skip = total_rows.saturating_sub(input_h as usize);
-    let vis = row.checked_sub(skip)?;
-    Some(Position::new(tx + col as u16, field.y + vis as u16))
+
+    #[test]
+    fn inline_md_parses_code_bold_and_italic_and_normalizes_tabs() {
+        let base = Style::default();
+        let code = Style::default().fg(Color::Cyan);
+        let spans = inline_md("use `foo\tbar`, **bold**, and *italic*", base, code);
+        assert!(spans.iter().any(|(s, st)| s == "foo bar" && *st == code));
+        assert!(
+            spans
+                .iter()
+                .any(|(s, st)| s == "bold" && st.add_modifier == Modifier::BOLD)
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|(s, st)| s == "italic" && st.add_modifier == Modifier::ITALIC)
+        );
+    }
 }

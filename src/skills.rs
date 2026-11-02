@@ -3,7 +3,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
-use crate::config::{config_dir, valid_id};
+use crate::config::{AgentConfig, config_dir, valid_id};
 
 pub const MAX_SKILL_BYTES: u64 = 32 * 1024;
 
@@ -156,15 +156,24 @@ pub fn remove(root: &Path, skill: &Skill) -> Result<()> {
 
 pub fn context(skills: &[Skill], selected: &[String]) -> String {
     let mut text = String::new();
-    for skill in skills
-        .iter()
-        .filter(|s| s.enabled && selected.contains(&s.id))
-    {
-        if let Ok(body) = skill.read() {
-            if text.len() + body.len() > 96 * 1024 {
+    let mut seen = std::collections::HashSet::new();
+    for id in selected {
+        if !seen.insert(id) {
+            continue;
+        }
+        if let Some(skill) = skills.iter().find(|s| s.enabled && &s.id == id)
+            && let Ok(body) = skill.read()
+        {
+            let block = format!(
+                "\n\n<skill id=\"{}\" name=\"{}\">\n{}\n</skill>",
+                skill.id,
+                skill.name,
+                body.trim()
+            );
+            if text.len() + block.len() > 96 * 1024 {
                 break;
             }
-            text.push_str(&format!("\n\nSkill {}:\n{}", skill.id, body));
+            text.push_str(&block);
         }
     }
     text
@@ -186,7 +195,11 @@ pub fn required_context(skills: &[Skill], selected: &[String]) -> Result<String>
         let body = skill
             .read()
             .with_context(|| format!("Cannot load required skill {id}"))?;
-        let block = format!("\n\nSkill {id}:\n{body}");
+        let block = format!(
+            "\n\n<skill id=\"{id}\" name=\"{}\">\n{}\n</skill>",
+            skill.name,
+            body.trim()
+        );
         if context.len() + block.len() > 96 * 1024 {
             bail!(
                 "Required skills exceed 96 KiB; select fewer skills rather than omitting instructions"
@@ -195,4 +208,35 @@ pub fn required_context(skills: &[Skill], selected: &[String]) -> Result<String>
         context.push_str(&block);
     }
     Ok(context)
+}
+
+/// Renders the complete, prioritized instruction block for an agent configuration.
+pub fn format_instructions(options: &AgentConfig, skill_context: &str) -> String {
+    let mut sections = Vec::new();
+    let inherited: Vec<&str> = options
+        .inherited_instructions
+        .iter()
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !inherited.is_empty() {
+        sections.push(format!(
+            "<inherited_instructions priority=\"highest\">\n{}\n</inherited_instructions>",
+            inherited.join("\n\n---\n\n")
+        ));
+    }
+    let role = options.instructions.trim();
+    if !role.is_empty() {
+        sections.push(format!(
+            "<role_instructions priority=\"high\">\n{role}\n</role_instructions>"
+        ));
+    }
+    let skills = skill_context.trim();
+    if !skills.is_empty() {
+        sections.push(format!(
+            "<attached_skills priority=\"required\">\n{skills}\n</attached_skills>"
+        ));
+    }
+    sections.join("\n\n")
 }

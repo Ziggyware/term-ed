@@ -21,7 +21,12 @@ use termed::app::App;
 
 fn mouse(kind: MouseEventKind, at: &str) -> Vec<Event> {
     let (x, y) = at.split_once(',').unwrap();
-    vec![Event::Mouse(MouseEvent::new(kind, x.parse().unwrap(), y.parse().unwrap(), KeyModifiers::NONE))]
+    vec![Event::Mouse(MouseEvent {
+        kind,
+        column: x.parse().unwrap(),
+        row: y.parse().unwrap(),
+        modifiers: KeyModifiers::NONE,
+    })]
 }
 
 fn key(spec: &str) -> Vec<Event> {
@@ -145,7 +150,13 @@ fn main() -> anyhow::Result<()> {
     }
     term.draw(|f| termed::ui::draw(f, &mut app, true))?;
     let cursor = term.backend_mut().get_cursor_position().ok();
-    let cursor_visible = term.backend().cursor_visible();
+    // ratatui 0.29 keeps TestBackend's cursor flag private; show_cursor only sets
+    // that flag, so the cursor was visible iff showing it changes nothing.
+    let cursor_visible = {
+        let mut shown = term.backend().clone();
+        shown.show_cursor()?;
+        shown == *term.backend()
+    };
     let buf = term.backend().buffer().clone();
     let (w, h) = (buf.area.width, buf.area.height);
 

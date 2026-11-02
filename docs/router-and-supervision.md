@@ -102,7 +102,7 @@ inventing a tool call.
 | `max_concurrent_tasks` | 4 | 1–8 live specialists, including waiting coordinators; excess requests fail immediately, not queue indefinitely |
 | `task_timeout_secs` | 300 | 10–1800; root turn deadline, with each child deadline no later than its parent's |
 | `stall_timeout_secs` | 150 | 15–600 without agent activity; child/approval/plugin waits are exempt from idle detection, not absolute deadlines |
-| `max_steps` | 30 | 1–100 model rounds; default reviewer/tester=12, coordinator=18; inherited minimum |
+| `max_steps` | 2000 | 1–10000 model rounds; default reviewer/tester=12, coordinator=18; inherited minimum |
 | `max_output_tokens` | 4096 | 256–16384 completion tokens; inherited minimum |
 | `generated_tools` | true | Pure interpreted transformations only; inherited capability intersection |
 | `toolkit` | true | The 100 extra host tools; inherited capability intersection, and write tools stay hidden when a worker is read-only |

@@ -73,7 +73,7 @@ This is a partial configuration; omitted fields retain defaults:
     "model": "your-tool-capable-model",
     "api_key_env": "",
     "instructions": "Prefer small patches. Explain how to verify each change.",
-    "max_steps": 20,
+    "max_steps": 2000,
     "commands": "ask",
     "plugins": true,
     "allowed_plugins": ["text-tools", "stats", "todo"],

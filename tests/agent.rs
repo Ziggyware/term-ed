@@ -55,7 +55,7 @@ fn tap(app: &mut App, x: u16, y: u16) {
         MouseEventKind::Down(MouseButton::Left),
         MouseEventKind::Up(MouseButton::Left),
     ] {
-        app.handle_event(Event::Mouse(MouseEvent::new(kind, x, y, KeyModifiers::NONE)));
+        app.handle_event(Event::Mouse(MouseEvent { kind, column: x, row: y, modifiers: KeyModifiers::NONE }));
     }
 }
 

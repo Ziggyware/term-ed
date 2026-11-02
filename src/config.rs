@@ -95,7 +95,7 @@ impl Default for AgentConfig {
             api_key_env: String::new(),
             instructions: String::new(),
             inherited_instructions: Vec::new(),
-            max_steps: 30,
+            max_steps: 2000,
             read_only: false,
             commands: CommandPolicy::Ask,
             plugins: true,
@@ -346,7 +346,7 @@ impl Default for SubAgentConfig {
                 // Specialists inherit the parent's provider unless explicitly set.
                 provider: "auto".into(),
                 read_only: true,
-                max_steps: 12,
+                max_steps: 2000,
                 sub_agents: false,
                 ..Default::default()
             },

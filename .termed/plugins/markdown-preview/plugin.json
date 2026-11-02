@@ -1,0 +1,22 @@
+{
+  "name": "markdown-preview",
+  "version": "1.0.0",
+  "description": "Render Markdown to HTML and open in browser, or show terminal preview",
+  "author": "termed",
+  "command": [
+    "python3",
+    "main.py"
+  ],
+  "events": [],
+  "commands": [
+    {
+      "id": "preview",
+      "title": "Markdown: Preview in Browser",
+      "keys": "ctrl+shift+m"
+    },
+    {
+      "id": "preview-terminal",
+      "title": "Markdown: Terminal Preview"
+    }
+  ]
+}
