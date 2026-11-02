@@ -142,7 +142,7 @@ termed --mobile src/main.rs # force the phone layout
 
 On Android, install [Termux](https://termux.dev), run `pkg install rust git clang`, then `cargo install --path .`. The built-in AI agent also works there after router key setup.
 
-Commands the AI runs use the machine's own shell: `/bin/sh` on Linux, macOS, the BSDs and Android/Termux, and on Windows `sh` when Git for Windows, MSYS2, Cygwin or WSL provides it, otherwise `cmd.exe`. Set `TERMED_SHELL` to choose another one, for example `TERMED_SHELL="bash -c"` or `TERMED_SHELL="wsl bash -c"`.
+Commands the AI runs use the machine's own shell: `/bin/sh` on Linux, macOS, the BSDs and Android/Termux, and on Windows `sh` when Git for Windows, MSYS2, Cygwin or WSL provides it, otherwise `cmd.exe`. The `bash.exe`/`wsl.exe` launcher stubs in `C:\Windows\System32` are never picked automatically — they relay to WSL instead of running a shell and fail with `WSL ... ERROR: CreateProcessCommon:...`. Set `TERMED_SHELL` to choose another one, for example `TERMED_SHELL="bash -c"` or `TERMED_SHELL="wsl bash -c"`.
 
 You need a terminal with truecolor support to get the full look (Windows Terminal, iTerm2, WezTerm, kitty, Alacritty, GNOME Terminal and others). termed detects `COLORTERM=truecolor` and falls back to 256 colors when it isn't set; set `TERMED_TRUECOLOR=1` to force truecolor. Pass `--nerd-font` (or set `TERMED_NERD_FONT=1`) to use Nerd Font file icons.
 
