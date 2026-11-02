@@ -28,6 +28,7 @@ pub mod plugin;
 pub mod process_guard;
 pub mod provider;
 pub mod search;
+pub mod shell;
 pub mod skills;
 pub mod supervision;
 pub mod theme;

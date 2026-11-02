@@ -2,7 +2,8 @@
 //!
 //! It defaults to the authenticated NoKey Router and can also use compatible
 //! model providers. Its tool loop can list, read, search, edit and create files,
-//! and run commands (each command needs your approval).
+//! and run commands (each command needs your approval unless the user picks
+//! Never ask).
 //!
 //! It is pure Rust, so it works anywhere termed runs — including Termux on
 //! Android, where Node/Bun-based agents can't be installed. It speaks the same
@@ -12,7 +13,7 @@
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -204,7 +205,11 @@ fn tools_schema(options: &AgentConfig) -> Value {
         ),
         f(
             "run_command",
-            "Run a shell command in the project root (the user must approve it). Use for builds and tests.",
+            if options.commands == CommandPolicy::Allow {
+                "Run a shell command in the project root. Commands run without approval (the user chose Never ask). Use for builds and tests."
+            } else {
+                "Run a shell command in the project root (the user must approve it). Use for builds and tests."
+            },
             json!({"command":{"type":"string"}}),
             &["command"],
         ),
@@ -405,10 +410,13 @@ impl Worker {
     }
 
     fn system_prompt(&self) -> String {
+        let shell = crate::shell::detect()
+            .map(|shell| shell.label())
+            .unwrap_or_else(|| "no shell found".into());
         format!(
             "You are termed AI, a coding agent inside the termed code editor. The project root is {}. \
-             Platform: {}. Use the tools to explore, read, edit and create files and to run commands \
-             (the user approves each command). Read a file before editing it, and prefer edit_file \
+             Platform: {}. Shell commands run through {}. Use the tools to explore, read, edit and \
+             create files and to run commands ({}). Read a file before editing it, and prefer edit_file \
              with a small, unique old_text over rewriting whole files. Paths are relative to the \
              project root. When you are done, reply briefly in Markdown: what you changed and why.",
             self.cwd.display(),
@@ -416,6 +424,12 @@ impl Worker {
                 "Android (Termux)"
             } else {
                 std::env::consts::OS
+            },
+            shell,
+            if self.options.commands == CommandPolicy::Allow {
+                "commands run without asking, because the user chose Never ask"
+            } else {
+                "the user approves each command"
             }
         ) + &format!(
             "\n\nInherited project/ancestor rules (higher priority than the specialist role):\n{}\n\nCurrent role instructions:\n{}\n{}\n{}",
@@ -1107,8 +1121,13 @@ impl Worker {
     }
 
     /// Ask the user (through the panel) to approve something.
+    ///
+    /// `Always allow` silences approvals for the rest of the session, and
+    /// `Never ask` does the same while the panel records `allow` in the agent
+    /// settings, so later sessions do not ask either. Jev still blocks
+    /// commands it considers destructive.
     fn permission(&mut self, tool_id: &str, title: &str) -> bool {
-        if self.always_allow_commands {
+        if self.always_allow_commands || self.options.commands == CommandPolicy::Allow {
             return true;
         }
         self.next_id += 1;
@@ -1118,7 +1137,8 @@ impl Worker {
             "sessionId":"builtin","toolCall":{"toolCallId":tool_id,"title":title},
             "options":[{"optionId":"once","name":"Allow","kind":"allow_once"},
                        {"optionId":"always","name":"Always allow","kind":"allow_always"},
-                       {"optionId":"no","name":"Reject","kind":"reject_once"}]}}),
+                       {"optionId":"no","name":"Reject","kind":"reject_once"},
+                       {"optionId":"never","name":"Never ask","kind":"allow_always"}]}}),
         );
         loop {
             if self.cancel.load(Ordering::SeqCst) {
@@ -1129,16 +1149,32 @@ impl Worker {
                     let choice = v
                         .pointer("/result/outcome/optionId")
                         .and_then(Value::as_str)
-                        .unwrap_or("no");
-                    if choice == "always" {
-                        self.always_allow_commands = true;
-                    }
-                    return matches!(choice, "once" | "always");
+                        .unwrap_or("no")
+                        .to_string();
+                    return self.resolve_permission(&choice);
                 }
                 Ok(_) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(_) => return false,
             }
+        }
+    }
+
+    /// Apply the user's answer to a permission card and report whether the
+    /// action may proceed.
+    fn resolve_permission(&mut self, choice: &str) -> bool {
+        match choice {
+            "once" => true,
+            "always" => {
+                self.always_allow_commands = true;
+                true
+            }
+            "never" => {
+                self.always_allow_commands = true;
+                self.options.commands = CommandPolicy::Allow;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -1193,16 +1229,32 @@ impl Worker {
             }
         }
         let started = Instant::now();
-        let mut process = Command::new("sh");
+        // POSIX systems have /bin/sh, Windows usually does not: ask the shell
+        // module for whatever this machine actually provides instead of
+        // assuming `sh` exists.
+        let Some(shell) = crate::shell::detect() else {
+            let message = crate::shell::missing_message();
+            self.tool_end(id, false, vec![Self::text_block(&message)]);
+            return Ok(format!("Command failed. {message}"));
+        };
+        let mut process = shell.command(command);
         process
-            .arg("-c")
-            .arg(command)
             .current_dir(&self.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         crate::process_guard::configure(&mut process);
-        let mut child = process.spawn().map_err(|e| format!("cannot run: {e}"))?;
+        let mut child = process.spawn().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                format!(
+                    "cannot run with `{}`: {e}. Set TERMED_SHELL to another shell, \
+                     for example TERMED_SHELL=\"bash -c\".",
+                    shell.label()
+                )
+            } else {
+                format!("cannot run with `{}`: {e}", shell.label())
+            }
+        })?;
         // Drain without unbounded allocation. Never join forever if an
         // intentionally daemonized process escaped with an output pipe open.
         let take = |reader: Option<Box<dyn std::io::Read + Send>>| {
@@ -1300,6 +1352,33 @@ mod tests {
             rx,
             Arc::new(AtomicBool::new(false)),
         )
+    }
+
+    #[test]
+    fn commands_run_through_the_detected_shell() {
+        let mut w = worker(&std::env::temp_dir());
+        w.always_allow_commands = true;
+        let out = w.run_tool(
+            "run",
+            "run_command",
+            &json!({"command":"echo termed-runs-here"}),
+        );
+        assert!(out.contains("exit code 0"), "{out}");
+        assert!(out.contains("termed-runs-here"), "{out}");
+    }
+
+    #[test]
+    fn never_ask_answers_every_later_request_without_a_prompt() {
+        let mut w = worker(&std::env::temp_dir());
+        w.options.commands = CommandPolicy::Ask;
+        assert!(w.resolve_permission("never"));
+        assert_eq!(w.options.commands, CommandPolicy::Allow);
+        // No card is sent, so permission() cannot block on a reply.
+        assert!(w.permission("tool", "run `echo hi`"));
+        assert!(w.always_allow_commands);
+        assert!(!w.resolve_permission("no"));
+        assert!(w.resolve_permission("once"));
+        assert!(w.resolve_permission("always"));
     }
 
     #[test]

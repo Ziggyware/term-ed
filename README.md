@@ -16,7 +16,7 @@ Press `Ctrl+K A`, click **✦ Agent** in the title bar, or tap **✦** on a phon
 - **Settings follow you.** Menu changes save to your user configuration directory, so the same built-in AI, model and preferences are used when you open another folder. Legacy workspace settings are imported only if no user settings exist; read the [migration and safety notes](docs/agent-configuration.md#user-settings-and-migration).
 - **Free models are busy sometimes.** Availability, rate limits and tool support depend on the router and its upstreams. The agent reports provider failures; model requests have a 120-second transport bound. Overwatch enforces a 150-second idle limit and a five-minute root deadline by default. Waiting for children or approval is not an idle stall. Tap the model name to choose another supported model.
 - **Privacy.** Your prompt, the open file and the files the agent reads are sent to the free model's provider. Free models may log or train on what they receive, so don't use them with secrets or confidential code.
-- **You stay in control.** The agent's edits appear in your open files as normal edits with change bars, and one Ctrl+Z (↶) reverts an edit. Diffs show inline in the chat, and tapping a change opens the file at that spot. If the agent asks permission to run a tool, you tap Allow or Reject (or press 1–3).
+- **You stay in control.** The agent's edits appear in your open files as normal edits with change bars, and one Ctrl+Z (↶) reverts an edit. Diffs show inline in the chat, and tapping a change opens the file at that spot. If the agent asks permission to run a command, you tap Allow, Always allow, Reject or Never ask (or press 1–4). **Never ask** stops the prompts for the rest of the session and saves `allow` to your agent settings so later sessions do not ask either; commands the risk policy marks as destructive are still blocked. You can also set it directly with *Settings → AI agent configuration → Command permissions*.
 - **Context is automatic.** The open file, and your selection if there is one, are attached to every message (shown as `@ file.py:12-20` above the prompt). Unsaved files are saved first so the agent sees your latest code.
 - **Esc or ■ stops the agent and its task tree.** Partial edits remain for review; Stop resets the provider session, so restate essential context before continuing. + New starts a fresh chat.
 - **Other agents work too.** Installed Gemini CLI (`gemini --acp`), Claude Code (`claude-agent-acp`) and Codex (`codex-acp`) can be selected with *Agent: Choose Agent*; they are not chosen automatically over the built-in agent and may require their own sign-in. Other ACP agents can be configured as a custom command. `TERMED_AGENT="command args"` supplies an explicit command when settings have not already selected a backend/provider.
@@ -140,6 +140,8 @@ termed --mobile src/main.rs # force the phone layout
 
 On Android, install [Termux](https://termux.dev), run `pkg install rust git clang`, then `cargo install --path .`. The built-in AI agent also works there after router key setup.
 
+Commands the AI runs use the machine's own shell: `/bin/sh` on Linux, macOS, the BSDs and Android/Termux, and on Windows `sh` when Git for Windows, MSYS2, Cygwin or WSL provides it, otherwise `cmd.exe`. Set `TERMED_SHELL` to choose another one, for example `TERMED_SHELL="bash -c"` or `TERMED_SHELL="wsl bash -c"`.
+
 You need a terminal with truecolor support to get the full look (Windows Terminal, iTerm2, WezTerm, kitty, Alacritty, GNOME Terminal and others). termed detects `COLORTERM=truecolor` and falls back to 256 colors when it isn't set; set `TERMED_TRUECOLOR=1` to force truecolor. Pass `--nerd-font` (or set `TERMED_NERD_FONT=1`) to use Nerd Font file icons.
 
 ## Keybindings
@@ -211,6 +213,7 @@ src/
   theme.rs        Visual Studio Dark / Termed Studio / Termed Neon + bundled palettes
   agent.rs        Agent Client Protocol client: launches the agent, JSON-RPC, chat model, free-model failover
   builtin_agent.rs  built-in agent: free models over an OpenAI-compatible API, file/search/command tools
+  shell.rs        picks the host shell (sh on POSIX, Git Bash or cmd.exe on Windows) for AI commands
   search.rs       find/replace in files: roots, glob filters, walk, replacements
   plugin.rs       plugin host: manifests, JSON-RPC subprocesses, discovery, manager
   config.rs       validated user preferences, legacy migration and inherited agent restrictions

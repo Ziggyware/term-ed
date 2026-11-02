@@ -33,7 +33,7 @@ The agent configuration menu exposes:
 | Instructions | Role, conventions and additional instructions; use JSON for multiple lines |
 | Step budget | 1–100 built-in model/tool rounds per turn (default 30) |
 | Read-only | Built-in agent cannot edit/write files, run commands or execute plugins |
-| Command permissions | `ask` (default), `deny`, or `risk_assessed` |
+| Command permissions | `ask` (default), `deny`, `risk_assessed`, or `allow` (never ask) |
 | AI plugin tools | Whether plugin discovery and execution tools are exposed |
 | Plugin allowlist | Comma-separated names; empty allows all enabled plugins except explicit plugin-menu denials |
 | Attached skills | Comma-separated enabled skill IDs to include on each prompt |
@@ -50,7 +50,9 @@ The agent configuration menu exposes:
 
 Explicit settings take precedence over environment defaults. Custom provider requests use `Authorization: Bearer <value of api_key_env>`; missing credentials are reported without exposing their value. Custom endpoints use the explicitly chosen model rather than discovering/failing over to unrelated free models.
 
-With `ask`, each shell command asks permission unless you explicitly select the session's Always Allow option. `deny` blocks shell commands. `risk_assessed` allows the existing risk policy to auto-allow low-risk commands. High-risk commands remain blocked in all modes. Plugin approval is separate and **always per invocation**.
+With `ask`, each shell command asks permission unless you select **Always allow** for the rest of the session or **Never ask**, which also saves `allow` here so later sessions do not ask. `deny` blocks shell commands. `risk_assessed` lets the risk policy auto-allow low-risk commands without asking. `allow` never asks at all. Commands the risk policy marks as destructive remain blocked in every mode. Plugin approval is separate and **always per invocation**.
+
+Commands run through the machine's own shell rather than a hardcoded `sh`: `/bin/sh` on Linux, macOS, the BSDs and Android/Termux; on Windows `sh` when Git for Windows, MSYS2, Cygwin or WSL provides it, otherwise `cmd.exe` (and PowerShell as a last resort). Set `TERMED_SHELL` to the program and its leading arguments to use something else, for example `TERMED_SHELL="bash -c"`. If no shell can be found the tool reports that instead of failing silently.
 
 External ACP agents receive configured instructions, selected skills, model selection and an MCP server definition. Provider URLs, built-in step budgets and built-in tool restrictions do not reconfigure or sandbox an external process. An external agent must support ACP MCP servers to use the live editor tools. Use the built-in agent for host-enforced read-only and command restrictions; external agents and plugins remain trusted local programs with your account's filesystem access.
 
