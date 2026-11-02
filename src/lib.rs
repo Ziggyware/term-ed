@@ -33,6 +33,7 @@ pub mod skills;
 pub mod supervision;
 pub mod theme;
 pub mod tool_bridge;
+pub mod toolkit;
 pub mod ui;
 
 #[cfg(test)]

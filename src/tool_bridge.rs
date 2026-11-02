@@ -69,6 +69,9 @@ pub fn tools(options: &AgentConfig) -> Vec<McpTool> {
             McpTool{name:"call_function".into(),description:"Call a previously defined pure function. Also available under its fn_ name to the built-in agent; MCP agents can always use this wrapper.".into(),input_schema:json!({"type":"object","properties":{"name":{"type":"string"},"arguments":{"type":"object"}},"required":["name","arguments"]})},
         ]);
     }
+    // Extended toolkit: workspace, text, buffer, edit, filesystem, search, git,
+    // UI, code and session tools. Capability gating happens in `toolkit`.
+    tools.extend(crate::toolkit::tools(options));
     tools
 }
 
