@@ -98,11 +98,11 @@ inventing a tool call.
 | Setting | Default | Allowed values / enforcement |
 | --- | --- | --- |
 | `max_agent_depth` | 2 | 1–3; root=0, child=1, grandchild=2; every ancestor may lower the cap |
-| `max_delegations` | 4 | 1–32 tasks for the whole root turn, including descendants; specialist branch caps may be smaller |
-| `max_concurrent_tasks` | 4 | 1–8 live specialists, including waiting coordinators; excess requests fail immediately, not queue indefinitely |
+| `max_delegations` | 16 | 1–64 tasks for the whole root turn, including descendants and queued requests; specialist branch caps may be smaller |
+| `max_concurrent_tasks` | 8 | 1–32 live model sessions; a coordinator blocked on its own children holds no slot. Excess requests queue FIFO (status `queued`), bounded by the delegation budget and their deadline, and are rejected if their caller ends. All `delegate_task` calls in one model response are dispatched before any is awaited, so siblings run in parallel |
 | `task_timeout_secs` | 300 | 10–1800; root turn deadline, with each child deadline no later than its parent's |
 | `stall_timeout_secs` | 150 | 15–600 without agent activity; child/approval/plugin waits are exempt from idle detection, not absolute deadlines |
-| `max_steps` | 2000 | 1–10000 model rounds; default reviewer/tester=12, coordinator=18; inherited minimum |
+| `max_steps` | 2000 | 1–10000 model rounds; default reviewer/tester=12, coordinator=18; inherited minimum. On exhaustion one tool-free round forces a final answer from gathered evidence |
 | `max_output_tokens` | 4096 | 256–16384 completion tokens; inherited minimum |
 | `generated_tools` | true | Pure interpreted transformations only; inherited capability intersection |
 | `toolkit` | true | The 100 extra host tools; inherited capability intersection, and write tools stay hidden when a worker is read-only |
@@ -126,8 +126,8 @@ root→coordinator→reviewer tree; it contains **no secret**:
     "instructions": "Prefer small changes. Cite evidence. Never claim checks not actually run.",
     "sub_agents": true,
     "max_agent_depth": 2,
-    "max_delegations": 4,
-    "max_concurrent_tasks": 4,
+    "max_delegations": 16,
+    "max_concurrent_tasks": 8,
     "task_timeout_secs": 300,
     "stall_timeout_secs": 150,
     "max_output_tokens": 4096,

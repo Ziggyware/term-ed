@@ -842,7 +842,8 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
             .filter(|r| {
                 matches!(
                     r.status,
-                    crate::supervision::Status::WaitingChild
+                    crate::supervision::Status::Queued
+                        | crate::supervision::Status::WaitingChild
                         | crate::supervision::Status::WaitingPermission
                 )
             })

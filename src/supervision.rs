@@ -66,6 +66,7 @@ impl Brief {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
+    Queued,
     Running,
     WaitingChild,
     WaitingPermission,
@@ -80,7 +81,7 @@ impl Status {
     pub fn terminal(self) -> bool {
         !matches!(
             self,
-            Self::Running | Self::WaitingChild | Self::WaitingPermission
+            Self::Queued | Self::Running | Self::WaitingChild | Self::WaitingPermission
         )
     }
 }

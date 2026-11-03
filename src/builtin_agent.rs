@@ -9,7 +9,7 @@
 //! Agent Client Protocol messages as an external agent, only over in-process
 //! channels, so the agent panel treats it like any other ACP agent.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -295,6 +295,8 @@ struct Worker {
     model_selector: ModelSelector,
     decisions: Arc<dyn DecisionEngine>,
     agui: AGUIHub,
+    /// Host replies that arrived while a different request was being awaited.
+    stashed: HashMap<u64, Value>,
 }
 
 enum Step {
@@ -342,6 +344,7 @@ impl Worker {
             model_selector,
             decisions,
             agui,
+            stashed: HashMap::new(),
         }
     }
 
@@ -505,19 +508,37 @@ impl Worker {
         self.history
             .push(json!({"role":"user","content":user_content.trim()}));
         let mut tried_models = vec![self.model.clone()];
-        for _ in 0..self.options.max_steps {
+        let (mut steps, mut resets) = (0, 0u32);
+        loop {
             if self.cancel.load(Ordering::SeqCst) {
                 return "cancelled";
             }
-            match self.step() {
+            // Out of budget: one tool-free round turns the gathered evidence
+            // into an answer instead of returning nothing to the caller.
+            let finalize = steps >= self.options.max_steps;
+            if finalize && resets == 0 && tried_models.len() == 1 {
+                self.notice("Step budget reached; requesting a final answer from the evidence gathered.", false);
+            }
+            match self.step(finalize) {
                 Ok(true) => {
+                    steps += 1;
+                    resets = 0;
                     // Failover budget covers one outage, not every blip in a long turn.
                     tried_models = vec![self.model.clone()];
                     continue;
                 }
                 Ok(false) => return "end_turn",
                 Err(Step::Cancelled) => return "cancelled",
+                // A reset before any response is transport noise, not a busy
+                // model: retry the same model on a fresh connection first.
+                Err(Step::Failed(_, None)) if resets < 2 => {
+                    resets += 1;
+                    if !self.backoff(Duration::from_millis(400 << resets)) {
+                        return "cancelled";
+                    }
+                }
                 Err(Step::Failed(msg, status)) => {
+                    resets = 0;
                     // Busy or failing free model: move on to another free model.
                     let busy = matches!(status, Some(429) | Some(500..=599)) || status.is_none();
                     let busy_set: HashSet<String> = tried_models.iter().cloned().collect();
@@ -581,12 +602,26 @@ impl Worker {
                 }
             }
         }
-        self.notice("Stopped after many steps. Ask again to continue.", false);
-        "max_turn_requests"
     }
 
-    /// One model call. Ok(true) = tools ran, call the model again.
-    fn step(&mut self) -> Result<bool, Step> {
+    /// Sleep for `delay` unless cancelled first; false means cancelled.
+    fn backoff(&self, delay: Duration) -> bool {
+        let until = Instant::now() + delay;
+        while Instant::now() < until {
+            if self.cancel.load(Ordering::SeqCst) {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        true
+    }
+
+    /// One model call. Ok(true) = tools ran, call the model again. `finalize`
+    /// withholds tools and demands an answer; it never returns Ok(true).
+    fn step(&mut self, finalize: bool) -> Result<bool, Step> {
+        if finalize && self.history.last().is_none_or(|m| m["role"] != "user") {
+            self.history.push(json!({"role":"user","content":"Your step budget is exhausted and tools are now unavailable. Using only the evidence already gathered above, give your final answer now. State explicitly what you could not inspect or verify."}));
+        }
         let system = self.system_prompt();
         compact_history(&mut self.history, system.len());
         let mut messages = vec![json!({"role":"system","content":system})];
@@ -598,8 +633,13 @@ impl Worker {
         if self.options.generated_tools {
             schemas.extend(self.dynamic_tools.clone());
         }
-        let body = json!({"model":self.model,"messages":messages,"tools":schemas,
-            "max_tokens":self.options.max_output_tokens,"stream":true,"stream_options":{"include_usage":true}}).to_string();
+        let mut body = json!({"model":self.model,"messages":messages,
+            "max_tokens":self.options.max_output_tokens,"stream":true,"stream_options":{"include_usage":true}});
+        // Some providers reject an empty tools array, so omit the key instead.
+        if !finalize {
+            body["tools"] = json!(schemas);
+        }
+        let body = body.to_string();
         if body.len() > 480 * 1024 {
             return Err(Step::Failed("Context exceeds the safe request budget. Split this task or shorten instructions/attached skills; no instructions or current objective were silently removed.".into(), Some(413)));
         }
@@ -726,6 +766,12 @@ impl Worker {
         let (content, mut calls) = response
             .finish()
             .map_err(|e| Step::Failed(clean(&e.message), Some(e.status)))?;
+        if finalize {
+            if content.trim().is_empty() {
+                return Err(Step::Failed("Model kept calling tools after its step budget".into(), Some(502)));
+            }
+            calls.clear();
+        }
         crate::model_response::assign_tool_call_ids(
             &mut calls,
             &mut self.used_tool_ids,
@@ -739,18 +785,36 @@ impl Worker {
         if calls.is_empty() {
             return Ok(false);
         }
-        for (id, name, arguments) in calls {
+        // delegate_task blocks until its worker finishes, so every delegation in
+        // this response is dispatched before any is awaited: siblings run concurrently.
+        let concurrent = crate::tool_bridge::tools(&self.options)
+            .iter()
+            .any(|t| t.name == "delegate_task");
+        let mut results: Vec<Option<String>> = vec![None; calls.len()];
+        let mut pending = HashMap::new();
+        for (i, (id, name, arguments)) in calls.iter().enumerate() {
             if self.cancel.load(Ordering::SeqCst) {
                 return Err(Step::Cancelled);
             }
-            let result = match serde_json::from_str::<Value>(&arguments) {
-                Ok(args) if args.is_object() => self.run_tool(&id, &name, &args),
+            results[i] = Some(match serde_json::from_str::<Value>(arguments) {
+                Ok(args) if args.is_object() => {
+                    if concurrent && name == "delegate_task" {
+                        pending.insert(self.host_send(id, name, &args), (i, id.clone(), name.clone()));
+                        continue;
+                    }
+                    self.run_tool(id, name, &args)
+                }
                 _ => format!(
                     "Error: {name} requires valid JSON object arguments; nothing was executed. Check the parameter schema for {name} and retry."
                 ),
-            };
+            });
+        }
+        for (i, id, outcome) in self.host_await(pending) {
+            results[i] = Some(self.tool_outcome(&id, outcome));
+        }
+        for ((id, _, _), result) in calls.iter().zip(results) {
             self.history
-                .push(json!({"role":"tool","tool_call_id":id,"content":result}));
+                .push(json!({"role":"tool","tool_call_id":id,"content":result.unwrap_or_default()}));
         }
         Ok(true)
     }
@@ -868,6 +932,10 @@ impl Worker {
                 Err(format!("unknown tool {other}"))
             }
         };
+        self.tool_outcome(id, r)
+    }
+
+    fn tool_outcome(&self, id: &str, r: Result<String, String>) -> String {
         match r {
             Ok(out) => out,
             Err(e) => {
@@ -878,6 +946,15 @@ impl Worker {
     }
 
     fn host_tool(&mut self, id: &str, name: &str, arguments: &Value) -> Result<String, String> {
+        let rid = self.host_send(id, name, arguments);
+        let pending = HashMap::from([(rid, ((), id.to_string(), name.to_string()))]);
+        self.host_await(pending)
+            .pop()
+            .map_or_else(|| Err("Editor tool reply missing".into()), |(_, _, r)| r)
+    }
+
+    /// Issue a host tool request without waiting for its reply.
+    fn host_send(&mut self, id: &str, name: &str, arguments: &Value) -> u64 {
         self.tool_start(
             id,
             &format!(
@@ -898,44 +975,84 @@ impl Worker {
             json!({"jsonrpc":"2.0","id":rid,"method":"termed/tools/call",
             "params":{"name":name,"arguments":arguments}}),
         );
+        rid
+    }
+
+    /// Await every request in `pending` (rid → (tag, tool id, name)), in
+    /// arrival order. Replies for other requests are stashed, never dropped.
+    fn host_await<T>(
+        &mut self,
+        mut pending: HashMap<u64, (T, String, String)>,
+    ) -> Vec<(T, String, Result<String, String>)> {
+        let mut done = Vec::with_capacity(pending.len());
+        let limit = Duration::from_secs(self.options.task_timeout_secs + 30);
         let started = Instant::now();
-        loop {
-            if self.cancel.load(Ordering::SeqCst) {
-                return Err("Cancelled".into());
+        while !pending.is_empty() {
+            let ready: Vec<u64> = pending
+                .keys()
+                .copied()
+                .filter(|rid| self.stashed.contains_key(rid))
+                .collect();
+            for rid in ready {
+                let reply = self.stashed.remove(&rid).unwrap_or_default();
+                let (tag, id, name) = pending.remove(&rid).expect("pending rid");
+                let outcome = self.host_reply(&id, &name, &reply);
+                done.push((tag, id, outcome));
             }
-            if started.elapsed() > Duration::from_secs(self.options.task_timeout_secs + 30) {
-                return Err("Editor tool timed out".into());
+            if pending.is_empty() {
+                break;
             }
-            match self.replies.recv_timeout(Duration::from_millis(100)) {
-                Ok(v) if v.get("id").and_then(Value::as_u64) == Some(rid) => {
-                    if let Some(error) = v.pointer("/error/message").and_then(Value::as_str) {
-                        return Err(error.into());
+            let failure = if self.cancel.load(Ordering::SeqCst) {
+                Some("Cancelled")
+            } else if started.elapsed() > limit {
+                Some("Editor tool timed out")
+            } else {
+                match self.replies.recv_timeout(Duration::from_millis(100)) {
+                    Ok(v) => {
+                        self.stash(v);
+                        None
                     }
-                    let value = v.get("result").cloned().unwrap_or(Value::Null);
-                    if name == "define_function" && self.options.generated_tools {
-                        if let Some(schema) = value.get("dynamic_function") {
-                            if self.dynamic_tools.len() < 16 {
-                                self.dynamic_tools.push(schema.clone());
-                            }
-                        }
-                    }
-                    if name == "list_functions" && self.options.generated_tools {
-                        if let Some(schemas) = value.as_array() {
-                            self.dynamic_tools = schemas.iter().take(16).cloned().collect();
-                        }
-                    }
-                    let text = value
-                        .as_str()
-                        .map(String::from)
-                        .unwrap_or_else(|| value.to_string());
-                    let shown: String = text.chars().take(6000).collect();
-                    self.tool_end(id, true, vec![Self::text_block(&shown)]);
-                    return Ok(text);
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(_) => Some("Editor disconnected"),
                 }
-                Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(_) => return Err("Editor disconnected".into()),
+            };
+            if let Some(e) = failure {
+                done.extend(pending.drain().map(|(_, (tag, id, _))| (tag, id, Err(e.into()))));
             }
         }
+        done
+    }
+
+    fn stash(&mut self, reply: Value) {
+        if let Some(rid) = reply.get("id").and_then(Value::as_u64) {
+            self.stashed.insert(rid, reply);
+        }
+    }
+
+    fn host_reply(&mut self, id: &str, name: &str, v: &Value) -> Result<String, String> {
+        if let Some(error) = v.pointer("/error/message").and_then(Value::as_str) {
+            return Err(error.into());
+        }
+        let value = v.get("result").cloned().unwrap_or(Value::Null);
+        if name == "define_function" && self.options.generated_tools {
+            if let Some(schema) = value.get("dynamic_function") {
+                if self.dynamic_tools.len() < 16 {
+                    self.dynamic_tools.push(schema.clone());
+                }
+            }
+        }
+        if name == "list_functions" && self.options.generated_tools {
+            if let Some(schemas) = value.as_array() {
+                self.dynamic_tools = schemas.iter().take(16).cloned().collect();
+            }
+        }
+        let text = value
+            .as_str()
+            .map(String::from)
+            .unwrap_or_else(|| value.to_string());
+        let shown: String = text.chars().take(6000).collect();
+        self.tool_end(id, true, vec![Self::text_block(&shown)]);
+        Ok(text)
     }
 
     fn list_files(&self, id: &str, path: &str) -> Result<String, String> {
@@ -1179,7 +1296,7 @@ impl Worker {
                     }
                     return matches!(choice, "once" | "always");
                 }
-                Ok(_) => {}
+                Ok(v) => self.stash(v),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(_) => return false,
             }

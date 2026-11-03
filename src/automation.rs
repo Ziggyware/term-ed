@@ -61,12 +61,25 @@ struct Task {
     permissions: HashSet<usize>,
 }
 
+/// A prepared delegation waiting for a concurrency slot.
+struct Queued {
+    source: Source,
+    reply: Reply,
+    profile: crate::config::SubAgentConfig,
+    config: AgentConfig,
+    brief: Brief,
+    deadline: Instant,
+    /// The caller's effective limits, re-read when a slot opens.
+    options: AgentConfig,
+}
+
 #[derive(Default)]
 pub struct Automation {
     pub bridge: Option<Bridge>,
     permissions: HashMap<String, PermissionAction>,
     pub(crate) plugins: HashMap<u64, PluginCall>,
     tasks: Vec<Task>,
+    queued: std::collections::VecDeque<Queued>,
     next_id: u64,
     pub delegations: usize,
     pub overwatch: Overwatch,
@@ -77,10 +90,13 @@ pub struct Automation {
 
 impl Automation {
     pub fn busy(&self) -> bool {
-        !self.tasks.is_empty() || !self.plugins.is_empty() || !self.permissions.is_empty()
+        !self.tasks.is_empty()
+            || !self.queued.is_empty()
+            || !self.plugins.is_empty()
+            || !self.permissions.is_empty()
     }
     pub fn task_count(&self) -> usize {
-        self.tasks.len()
+        self.tasks.len() + self.queued.len()
     }
 }
 
@@ -316,13 +332,119 @@ impl App {
         args: &Value,
         options: &AgentConfig,
     ) {
-        let result = self.prepare_delegation(source, args, options);
-        let (profile, mut config, brief, deadline) = match result {
+        let (profile, config, brief, deadline) = match self.prepare_delegation(source, args, options) {
             Ok(v) => v,
             Err(e) => {
                 self.reply_tool(reply, Err(e));
                 return;
             }
+        };
+        self.automation.overwatch.add(&brief, &profile.name, deadline);
+        let job = Queued { source, reply, profile, config, brief, deadline, options: options.clone() };
+        if self.has_capacity(source, options) {
+            self.start_task(job);
+            return;
+        }
+        // Over capacity: wait for a slot instead of failing the caller. The
+        // budget, deadline and ancestry still bound how long and how many.
+        self.automation
+            .overwatch
+            .update(job.brief.task_id, TaskStatus::Queued, Some("Waiting for a concurrency slot"));
+        self.agent.entries.push(Entry::Notice {
+            text: format!(
+                "Overwatch · #{} {} queued · {} ahead.",
+                job.brief.task_id,
+                job.profile.name,
+                self.automation.queued.len()
+            ),
+            error: false,
+        });
+        self.automation.queued.push_back(job);
+    }
+
+    /// Live model sessions under the stricter of the root and caller limits.
+    /// A task blocked on its own children (running or queued) holds no slot,
+    /// nor does the caller, which blocks on this very request.
+    fn has_capacity(&self, source: Source, options: &AgentConfig) -> bool {
+        let limit = self
+            .agent
+            .options
+            .max_concurrent_tasks
+            .min(options.max_concurrent_tasks);
+        let active = self
+            .automation
+            .tasks
+            .iter()
+            .filter(|t| Source::Sub(t.id) != source && !self.waiting_on_children(t.id))
+            .count();
+        active < limit
+    }
+
+    fn waiting_on_children(&self, id: u64) -> bool {
+        self.automation.tasks.iter().any(|c| c.brief.parent_id == Some(id))
+            || self.automation.queued.iter().any(|q| q.source == Source::Sub(id))
+    }
+
+    /// Start queued work in FIFO order while slots are free; drop entries
+    /// whose deadline passed or whose caller is gone.
+    fn start_queued(&mut self) -> bool {
+        let now = Instant::now();
+        let mut changed = false;
+        let mut i = 0;
+        while i < self.automation.queued.len() {
+            let q = &self.automation.queued[i];
+            let gone = matches!(q.source, Source::Sub(id) if !self.automation.tasks.iter().any(|t| t.id == id));
+            if gone || now >= q.deadline {
+                let q = self.automation.queued.remove(i).expect("index in bounds");
+                let (status, reason) = if gone {
+                    (TaskStatus::Orphaned, "Caller ended before a concurrency slot opened")
+                } else {
+                    (TaskStatus::TimedOut, "Deadline expired while queued for a concurrency slot")
+                };
+                self.reject_queued(q, status, reason);
+                changed = true;
+            } else {
+                i += 1;
+            }
+        }
+        while let Some(q) = self.automation.queued.front() {
+            if !self.has_capacity(q.source, &q.options) {
+                break;
+            }
+            let q = self.automation.queued.pop_front().expect("front exists");
+            self.start_task(q);
+            changed = true;
+        }
+        changed
+    }
+
+    fn reject_queued(&mut self, q: Queued, status: TaskStatus, reason: &str) {
+        let id = q.brief.task_id;
+        self.automation.overwatch.update(id, status, Some(reason));
+        self.reply_tool(q.reply, Err(format!("Task #{id} {:?}: {reason}", status)));
+        self.agent.entries.push(Entry::Notice {
+            text: format!("Overwatch · #{id} {} {:?}: {reason}", q.profile.name, status),
+            error: true,
+        });
+    }
+
+    /// Reject queued requests whose caller is `root` or one of its descendants.
+    fn reject_queued_under(&mut self, root: u64, status: TaskStatus, reason: &str) {
+        let (dropped, kept) = std::mem::take(&mut self.automation.queued)
+            .into_iter()
+            .partition(|q| matches!(q.source, Source::Sub(s) if self.automation.overwatch.descendant_of(s, root)));
+        self.automation.queued = kept;
+        for q in dropped {
+            self.reject_queued(q, status, reason);
+        }
+    }
+
+    fn start_task(&mut self, job: Queued) {
+        let Queued { source, reply, profile, mut config, brief, deadline, options } = job;
+        let id = brief.task_id;
+        let fail = |app: &mut Self, reply: Reply, e: String| {
+            app.automation.overwatch.update(id, TaskStatus::Failed, Some(&e));
+            app.reply_tool(reply, Err(e));
         };
         // A leaf's advertised tools agree with the actual depth boundary. The
         // dispatcher repeats all checks for invented calls and MCP clients.
@@ -345,20 +467,15 @@ impl App {
             .collect();
         let extra = match crate::skills::required_context(&self.skills, &extra) {
             Ok(v) => v,
-            Err(e) => {
-                self.reply_tool(reply, Err(e.to_string()));
-                return;
-            }
+            Err(e) => return fail(self, reply, e.to_string()),
         };
         let skills = format!("{parent_context}{extra}");
         if skills.len() > 96 * 1024 {
-            self.reply_tool(reply,Err("Required inherited/role skills exceed 96 KiB; narrow attached skills instead of silently omitting instructions".into()));
-            return;
+            return fail(self, reply, "Required inherited/role skills exceed 96 KiB; narrow attached skills instead of silently omitting instructions".into());
         }
         let mut agent = Agent::new(self.explorer.root.clone());
         if let Err(e) = agent.configure(config, skills) {
-            self.reply_tool(reply, Err(e));
-            return;
+            return fail(self, reply, e);
         }
         agent.prompt(&brief.prompt(), Vec::new());
         let functions = self
@@ -367,30 +484,26 @@ impl App {
             .get(&source)
             .cloned()
             .unwrap_or_default();
-        self.automation
-            .functions
-            .insert(Source::Sub(brief.task_id), functions);
+        self.automation.functions.insert(Source::Sub(id), functions);
         self.automation.delegations += 1;
-        self.automation
-            .overwatch
-            .add(&brief, &profile.name, deadline);
+        self.automation.overwatch.update(id, TaskStatus::Running, Some("Started with inherited instructions and a scoped task brief"));
         self.agent.entries.push(Entry::Notice {
             text: format!(
                 "Overwatch · #{} {} started at depth {}{} · {}s remaining · {} steps.",
-                brief.task_id,
+                id,
                 profile.name,
                 brief.depth,
                 brief
                     .parent_id
                     .map(|p| format!(" under #{p}"))
                     .unwrap_or_default(),
-                brief.remaining_seconds,
+                deadline.saturating_duration_since(Instant::now()).as_secs(),
                 agent.options.max_steps
             ),
             error: false,
         });
         self.automation.tasks.push(Task {
-            id: brief.task_id,
+            id,
             name: profile.name,
             agent,
             reply,
@@ -466,19 +579,16 @@ impl App {
                 })
                 .count(),
         };
-        if self.automation.delegations >= self.agent.options.max_delegations
+        // Queued requests already hold budget; sub-agent branches see them as records.
+        let reserved = self.automation.delegations + self.automation.queued.len();
+        let branch_delegations = match source {
+            Source::Main => reserved,
+            Source::Sub(_) => branch_delegations,
+        };
+        if reserved >= self.agent.options.max_delegations
             || branch_delegations >= options.max_delegations
         {
             return Err("Global delegation budget reached for this root turn (descendants share the budget)".into());
-        }
-        if self.automation.tasks.len()
-            >= self
-                .agent
-                .options
-                .max_concurrent_tasks
-                .min(options.max_concurrent_tasks)
-        {
-            return Err("Concurrent task limit reached, including waiting coordinators; no task was queued. Finish current work or handle it directly.".into());
         }
         let profile = self
             .preferences
@@ -682,6 +792,7 @@ impl App {
     /// Cancel deepest descendants first, return an error to every live caller,
     /// close approvals, and record a terminal outcome exactly once.
     fn finish_task_tree(&mut self, id: u64, status: TaskStatus, reason: &str) {
+        self.reject_queued_under(id, TaskStatus::Cancelled, reason);
         let mut ids: Vec<_> = self
             .automation
             .tasks
@@ -1056,6 +1167,7 @@ impl App {
             let ended = !self.agent.is_working();
             let root_waiting = self.agent.pending_permission().is_some()
                 || !self.automation.tasks.is_empty()
+                || !self.automation.queued.is_empty()
                 || !self.automation.plugins.is_empty()
                 || !self.automation.permissions.is_empty();
             let stalled = self.agent.is_working()
@@ -1104,11 +1216,7 @@ impl App {
             .tasks
             .iter()
             .map(|t| {
-                let waiting_child = self
-                    .automation
-                    .tasks
-                    .iter()
-                    .any(|child| child.brief.parent_id == Some(t.id));
+                let waiting_child = self.waiting_on_children(t.id);
                 let waiting_permission = t.agent.pending_permission().is_some()
                     || self.automation.permissions.values().any(
                         |p| matches!(p,PermissionAction::Plugin(p) if p.source==Source::Sub(t.id)),
@@ -1174,7 +1282,13 @@ impl App {
                 .filter(|t| t.brief.parent_id == Some(id))
                 .map(|t| t.id)
                 .collect();
-            let abandoned = !children.is_empty();
+            let abandoned = !children.is_empty()
+                || self.automation.queued.iter().any(|q| q.source == Source::Sub(id));
+            self.reject_queued_under(
+                id,
+                TaskStatus::Orphaned,
+                "Parent finished before collecting this worker's result",
+            );
             for child in children {
                 self.finish_task_tree(
                     child,
@@ -1248,6 +1362,7 @@ impl App {
             });
             changed = true;
         }
+        changed |= self.start_queued();
         let expired: Vec<_> = self
             .automation
             .plugins
@@ -1343,6 +1458,9 @@ impl App {
                 TaskStatus::Cancelled,
                 "Turn cancelled or session replaced",
             );
+        }
+        for q in std::mem::take(&mut self.automation.queued) {
+            self.reject_queued(q, TaskStatus::Cancelled, "Turn cancelled or session replaced");
         }
         self.automation.overwatch.owned_turn = false;
         self.automation.overwatch.root_deadline = None;
@@ -2013,31 +2131,43 @@ mod supervision_tests {
         );
     }
     #[test]
-    fn concurrency_limits_fail_fast_and_empty_input_cannot_reset_budgets() {
+    fn over_capacity_delegations_queue_reserve_budget_and_cancel_cleanly() {
         if crate::test_support::isolate_unit(
             module_path!(),
-            "concurrency_limits_fail_fast_and_empty_input_cannot_reset_budgets",
+            "over_capacity_delegations_queue_reserve_budget_and_cancel_cleanly",
         ) {
             return;
         }
         let mut a = app();
         a.agent.options.max_concurrent_tasks = 1;
-        let (_id, _rx) = inject(&mut a, Source::Main, "coordinator");
+        a.agent.options.max_delegations = 3;
+        let (coordinator, _rx) = inject(&mut a, Source::Main, "coordinator");
         let options = a.agent.options.clone();
-        assert!(
-            a.prepare_delegation(
-                Source::Main,
-                &json!({"agent":"tester","task":"No capacity"}),
-                &options
-            )
-            .unwrap_err()
-            .contains("Concurrent")
-        );
-        a.agent.input = "".into();
-        a.agent_send();
-        assert_eq!(a.automation.delegations, 1);
-        assert_eq!(a.automation.tasks.len(), 1);
+        let delegate = |a: &mut App, agent: &str| {
+            let (tx, rx) = mpsc::channel();
+            a.delegate_supervised(Source::Main, Reply::Mcp(tx), &json!({"agent":agent,"task":"Wait for a slot"}), &options);
+            rx
+        };
+        let first = delegate(&mut a, "tester");
+        assert!(first.try_recv().is_err(), "over capacity must queue, not fail");
+        let queued = a.automation.queued[0].brief.task_id;
+        let status = |a: &App, id| a.automation.overwatch.records.iter().find(|r| r.task_id == id).unwrap().status;
+        assert_eq!(status(&a, queued), TaskStatus::Queued);
+        // One running + two queued exhaust a budget of three.
+        let second = delegate(&mut a, "reviewer");
+        assert_eq!(a.automation.queued.len(), 2);
+        assert!(delegate(&mut a, "reviewer").try_recv().unwrap().unwrap_err().contains("budget"));
+        assert!(!a.has_capacity(Source::Main, &options));
+        // A coordinator blocked on its own queued child holds no slot.
+        a.automation.queued[0].source = Source::Sub(coordinator);
+        assert!(a.has_capacity(Source::Main, &options));
+        a.automation.queued[0].source = Source::Main;
         a.cancel_automation();
+        for rx in [first, second] {
+            assert!(rx.try_recv().unwrap().unwrap_err().contains("Cancelled"));
+        }
+        assert!(a.automation.queued.is_empty());
+        assert_eq!(status(&a, queued), TaskStatus::Cancelled);
         let before = a.automation.delegations;
         a.agent.input = "  ".into();
         a.agent_send();

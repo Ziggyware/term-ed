@@ -968,7 +968,7 @@ fn set_field(a: &mut AgentConfig, field: Field, input: &str) -> Result<()> {
         Field::Concurrency => {
             a.max_concurrent_tasks = input
                 .parse()
-                .map_err(|_| anyhow::anyhow!("Enter a concurrency limit from 1 to 8"))?
+                .map_err(|_| anyhow::anyhow!("Enter a concurrency limit from 1 to 32"))?
         }
         Field::StallTimeout => {
             a.stall_timeout_secs = input
@@ -1019,7 +1019,7 @@ fn set_field(a: &mut AgentConfig, field: Field, input: &str) -> Result<()> {
         Field::MaxDelegations => {
             a.max_delegations = input
                 .parse()
-                .map_err(|_| anyhow::anyhow!("Enter a delegation budget from 1 to 32"))?
+                .map_err(|_| anyhow::anyhow!("Enter a delegation budget from 1 to 64"))?
         }
         Field::Timeout => {
             a.task_timeout_secs = input

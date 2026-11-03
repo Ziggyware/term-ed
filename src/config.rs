@@ -103,10 +103,10 @@ impl Default for AgentConfig {
             denied_plugins: Vec::new(),
             skills: Vec::new(),
             sub_agents: true,
-            max_delegations: 4,
+            max_delegations: 16,
             task_timeout_secs: 300,
             max_agent_depth: 2,
-            max_concurrent_tasks: 4,
+            max_concurrent_tasks: 8,
             stall_timeout_secs: 150,
             generated_tools: true,
             toolkit: true,
@@ -166,8 +166,8 @@ impl AgentConfig {
         if !(1..=3).contains(&self.max_agent_depth) {
             bail!("Agent depth must be 1–3 (root is depth 0)");
         }
-        if !(1..=8).contains(&self.max_concurrent_tasks) {
-            bail!("Concurrent task limit must be 1–8");
+        if !(1..=32).contains(&self.max_concurrent_tasks) {
+            bail!("Concurrent task limit must be 1–32");
         }
         if !(15..=600).contains(&self.stall_timeout_secs) {
             bail!("Stall timeout must be 15–600 seconds");
@@ -197,8 +197,8 @@ impl AgentConfig {
         if !(1..=10_000).contains(&self.max_steps) {
             bail!("Max steps must be between 1 and 10000");
         }
-        if !(1..=32).contains(&self.max_delegations) {
-            bail!("Delegation limit must be between 1 and 32");
+        if !(1..=64).contains(&self.max_delegations) {
+            bail!("Delegation limit must be between 1 and 64");
         }
         if !(10..=1800).contains(&self.task_timeout_secs) {
             bail!("Task timeout must be 10–1800 seconds");
