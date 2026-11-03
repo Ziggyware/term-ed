@@ -27,6 +27,9 @@ use crate::management::Management;
 use crate::plugin::{self, Host as PluginHost};
 use crate::search;
 use crate::skills::Skill;
+use crate::dock::{Dock, DockEdge};
+use crate::neon::{CreatureKind, Mood, Neon};
+use crate::terminal::Terminal;
 use crate::theme::{self, ThemeEntry};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +41,8 @@ pub enum Focus {
     Search,
     /// Typing into the AI agent panel.
     Agent,
+    /// Typing into a focused terminal window.
+    Terminal,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -480,6 +485,17 @@ pub struct App {
     drag: Option<Drag>,
     last_click: Option<(Instant, u16, u16, u8)>,
     project_files: Option<Vec<String>>,
+    /// Neon lighting animation state.
+    pub neon: Neon,
+    /// Guardian creature living in the title bar.
+    pub neon_guardian: crate::neon::Creature,
+    /// Dockable window manager.
+    pub dock: Dock,
+    /// Open terminal windows.
+    pub terminals: Vec<Terminal>,
+    next_terminal_id: u64,
+    /// Whether a terminal currently owns keyboard input.
+    pub terminal_focused: bool,
 }
 
 impl App {
@@ -552,6 +568,12 @@ impl App {
             drag: None,
             last_click: None,
             project_files: None,
+            neon: Neon::new(),
+            neon_guardian: crate::neon::Creature::new(crate::neon::CreatureKind::Guardian),
+            dock: Dock::new(),
+            terminals: Vec::new(),
+            next_terminal_id: 1,
+            terminal_focused: false,
         };
         if let Err(e) = app.agent.configure(
             app.preferences.agent.clone(),
@@ -626,6 +648,55 @@ impl App {
         self.compact = compact;
     }
 
+    /// Create a new terminal window and open it docked at the bottom.
+    pub fn new_terminal(&mut self) {
+        let id = self.next_terminal_id;
+        self.next_terminal_id += 1;
+        let mut terminal = Terminal::new(id, Rect::default());
+        terminal.rect = Rect::new(0, 0, 200, 12); // clamped to screen by apply_docking
+        terminal.docked = true;
+        terminal.focused = true;
+        terminal.prompt();
+        // Unfocus all other terminals.
+        for t in &mut self.terminals {
+            t.focused = false;
+        }
+        self.terminals.push(terminal);
+        self.dock.add_terminal(self.terminals.last().unwrap());
+        self.terminal_focused = true;
+        self.focus = Focus::Terminal;
+        self.toast("New terminal opened", ToastKind::Info);
+    }
+
+    /// Close the currently focused terminal window.
+    pub fn close_focused_terminal(&mut self) {
+        let id = self.dock.focused.and_then(|id| {
+            self.terminals.iter().find(|t| t.id == id).map(|t| t.id)
+        });
+        if let Some(id) = id {
+            self.terminals.retain(|t| t.id != id);
+        }
+        self.dock.windows.retain(|w| match w.kind {
+            crate::dock::WindowKind::Terminal(tid) => tid != id,
+            _ => true,
+        });
+        if self.terminals.is_empty() {
+            self.terminal_focused = false;
+            self.dock.focused = None;
+            if !self.editors.is_empty() {
+                self.focus = Focus::Editor;
+            }
+        } else {
+            // Re-focus the last remaining terminal.
+            let last = self.terminals.last().unwrap().id;
+            for t in &mut self.terminals {
+                t.focused = t.id == last;
+            }
+            self.dock.focused = Some(last);
+            self.focus = Focus::Terminal;
+        }
+    }
+
     /// Background work (highlighting) wants another frame.
     pub fn busy(&self) -> bool {
         self.editor().is_some_and(|e| e.hl_pending)
@@ -639,7 +710,31 @@ impl App {
         let before = self.toasts.len();
         self.toasts
             .retain(|t| t.at.elapsed() < Duration::from_millis(3500));
-        before != self.toasts.len() || search_changed
+
+        // Animate neon creatures and poll terminal output.
+        let now = self.neon.t();
+        let mut changed = false;
+        self.neon_guardian.tick(now, false, self.focus == Focus::Editor || self.focus == Focus::Terminal);
+        if self.neon_guardian.mood != Mood::Idle {
+            changed = true;
+        }
+        let active = self.terminals.iter().any(|t| !t.input.is_empty());
+        for t in &mut self.terminals {
+            t.poll_output();
+            let focused = t.focused;
+            t.creature.tick(now, active || !t.lines.is_empty(), focused);
+            if t.creature.mood != Mood::Idle {
+                changed = true;
+            }
+        }
+        self.dock.sync_focus_from_terminals(&self.terminals);
+
+        // Keep redrawing while terminals exist so the neon aurora and
+        // creatures stay alive even when nothing else is happening.
+        before != self.toasts.len()
+            || search_changed
+            || changed
+            || !self.terminals.is_empty()
     }
 
     pub fn open_file(&mut self, path: &Path) {
@@ -874,6 +969,32 @@ impl App {
             return;
         }
 
+        // Route input to a focused terminal window.
+        if self.terminal_focused && self.focus == Focus::Terminal {
+            if let Some(term) = self.terminals.iter_mut().find(|t| t.focused) {
+                match code {
+                    KeyCode::Enter => term.submit_input(),
+                    KeyCode::Backspace => term.backspace(),
+                    KeyCode::Delete => term.delete_forward(),
+                    KeyCode::Left => term.move_left(),
+                    KeyCode::Right => term.move_right(),
+                    KeyCode::Char(c) if !ctrl && !alt => term.type_char(c),
+                    KeyCode::Esc => {
+                        self.terminal_focused = false;
+                        self.focus = Focus::Editor;
+                        if !self.editors.is_empty() {
+                            for t in &mut self.terminals {
+                                t.focused = false;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                self.dock.sync_focus_from_terminals(&self.terminals);
+                return;
+            }
+        }
+
         // Global bindings.
         let global = match (code, ctrl, shift, alt) {
             (KeyCode::Char('p'), true, true, _) | (KeyCode::F(1), ..) => {
@@ -908,6 +1029,7 @@ impl App {
             (KeyCode::F(3), _, true, _) => Some(Command::FindPrev),
             (KeyCode::F(3), ..) => Some(Command::FindNext),
             (KeyCode::F(8), ..) => Some(Command::NextTheme),
+            (KeyCode::Char('`'), true, ..) => Some(Command::NewTerminal),
             _ => None,
         };
         if let Some(c) = global {
@@ -950,6 +1072,8 @@ impl App {
                 }
             }
             Focus::Editor => self.editor_key(code, ctrl, shift, alt),
+            // Terminal input is routed to the focused terminal above.
+            Focus::Terminal => {}
         }
     }
 
@@ -1319,6 +1443,25 @@ impl App {
                 if !self.editors.is_empty() {
                     self.focus = Focus::Editor;
                 }
+            }
+            NewTerminal => self.new_terminal(),
+            FocusNextTerminal => {
+                self.dock.focus_next();
+                self.terminal_focused = true;
+                self.focus = Focus::Terminal;
+            }
+            FocusPrevTerminal => {
+                self.dock.focus_prev();
+                self.terminal_focused = true;
+                self.focus = Focus::Terminal;
+            }
+            ToggleTerminalDock => {
+                self.dock.dock_focused(DockEdge::Bottom);
+                self.terminal_focused = true;
+                self.focus = Focus::Terminal;
+            }
+            CloseTerminal => {
+                self.close_focused_terminal();
             }
             ToggleWhitespace => self.settings.whitespace = !self.settings.whitespace,
             ToggleIndentGuides => self.settings.indent_guides = !self.settings.indent_guides,
@@ -3468,6 +3611,22 @@ impl App {
 
     fn mouse_down(&mut self, pos: Position, mods: KeyModifiers) {
         let l = self.layout.clone();
+        // Click on a dockable terminal window focuses it (topmost wins).
+        if let Some(idx) = (0..self.dock.windows.len())
+            .rev()
+            .find(|&i| self.dock.windows[i].rect.contains(pos))
+        {
+            if let crate::dock::WindowKind::Terminal(tid) = self.dock.windows[idx].kind {
+                for t in &mut self.terminals {
+                    t.focused = t.id == tid;
+                }
+                self.dock.focused = Some(tid);
+                self.terminal_focused = true;
+                self.focus = Focus::Terminal;
+                self.dock.raise_focused();
+                return;
+            }
+        }
         // The touch toolbar works on top of everything (it is how you press
         // Esc or arrows in a dialog or palette on a phone).
         if let Some((_, tool)) = l.toolbar.iter().find(|(r, _)| r.contains(pos)) {
