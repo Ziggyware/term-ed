@@ -111,6 +111,9 @@ fn http() -> ureq::Agent {
         .max_redirects(0)
         .timeout_connect(Some(Duration::from_secs(20)))
         .timeout_global(Some(Duration::from_secs(120)))
+        // Model rounds are seconds apart; a pooled socket the router has since
+        // dropped fails the next POST with a reset (os error 10054).
+        .max_idle_connections(0)
         .user_agent(concat!("termed/", env!("CARGO_PKG_VERSION")));
     // Bundled Mozilla roots work everywhere (incl. Android). If the system
     // points at its own bundle (corporate/MITM proxies), trust that instead.
@@ -507,7 +510,11 @@ impl Worker {
                 return "cancelled";
             }
             match self.step() {
-                Ok(true) => continue,
+                Ok(true) => {
+                    // Failover budget covers one outage, not every blip in a long turn.
+                    tried_models = vec![self.model.clone()];
+                    continue;
+                }
                 Ok(false) => return "end_turn",
                 Err(Step::Cancelled) => return "cancelled",
                 Err(Step::Failed(msg, status)) => {
@@ -974,7 +981,11 @@ impl Worker {
     fn read_file(&self, id: &str, path: &str, a: &Value) -> Result<String, String> {
         let p = self.resolve(path)?;
         self.tool_start(id, &format!("Read {}", self.rel(&p)), "read", Some(&p));
-        if std::fs::metadata(&p).map_err(|e| e.to_string())?.len() > 2 * 1024 * 1024 {
+        let meta = std::fs::metadata(&p).map_err(|e| format!("cannot read {path}: {e}"))?;
+        if meta.is_dir() {
+            return Err(format!("{path} is a directory; use list_files"));
+        }
+        if meta.len() > 2 * 1024 * 1024 {
             return Err(
                 "Text tool read exceeds 2 MiB; use a smaller file or editor excerpt".into(),
             );
