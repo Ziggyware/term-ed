@@ -30,7 +30,7 @@ class Handler(BaseHTTPRequestHandler):
                 assert "COORDINATOR-RULE-MARKER" in system
                 assert not ({"write_file", "edit_file", "run_command", "run_plugin", "delegate_task"} & tools)
                 assert request["max_tokens"] == 1024
-                brief = json.loads(user.split("TASK BRIEF (JSON):\n", 1)[1])
+                brief = json.loads(user.split("<task_brief>\n", 1)[1].rsplit("\n</task_brief>", 1)[0])
                 assert brief["root_goal"].startswith("ROOT-GOAL-MARKER")
                 assert brief["depth"] == 2 and brief["parent_id"]
                 assert brief["lineage"] == ["coordinator", "reviewer"]
@@ -48,7 +48,7 @@ class Handler(BaseHTTPRequestHandler):
             elif "COORDINATOR-RULE-MARKER" in system:
                 assert "delegate_task" in tools and "run_command" not in tools
                 assert request["max_tokens"] == 1024
-                brief = json.loads(user.split("TASK BRIEF (JSON):\n", 1)[1])
+                brief = json.loads(user.split("<task_brief>\n", 1)[1].rsplit("\n</task_brief>", 1)[0])
                 assert brief["depth"] == 1 and brief["parent_id"] is None
                 assert brief["root_goal"].startswith("ROOT-GOAL-MARKER")
                 assert "evidence-marker" in json.dumps(brief["context"])

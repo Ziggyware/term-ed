@@ -1001,7 +1001,7 @@ fn set_field(a: &mut AgentConfig, field: Field, input: &str) -> Result<()> {
         Field::MaxSteps => {
             a.max_steps = input
                 .parse()
-                .map_err(|_| anyhow::anyhow!("Enter a step budget from 1 to 100"))?
+                .map_err(|_| anyhow::anyhow!("Enter a step budget from 1 to 10000"))?
         }
         Field::ToolkitGroups => {
             for group in csv(input) {

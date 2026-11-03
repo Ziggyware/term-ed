@@ -194,8 +194,8 @@ impl AgentConfig {
                 );
             }
         }
-        if !(1..=100).contains(&self.max_steps) {
-            bail!("Max steps must be between 1 and 100");
+        if !(1..=10_000).contains(&self.max_steps) {
+            bail!("Max steps must be between 1 and 10000");
         }
         if !(1..=32).contains(&self.max_delegations) {
             bail!("Delegation limit must be between 1 and 32");

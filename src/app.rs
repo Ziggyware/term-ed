@@ -28,7 +28,7 @@ use crate::plugin::{self, Host as PluginHost};
 use crate::search;
 use crate::skills::Skill;
 use crate::dock::{Dock, DockEdge, WindowKind};
-use crate::neon::{CreatureKind, Mood, Neon};
+use crate::neon::{Mood, Neon};
 use crate::terminal::Terminal;
 use crate::theme::{self, ThemeEntry};
 
