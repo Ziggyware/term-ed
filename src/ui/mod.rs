@@ -15,7 +15,9 @@ use ratatui::style::Modifier;
 
 use crate::app::{App, Focus, Latch, Layout, TOOLBAR_PAGES, Tool};
 use crate::commands::Command;
+use crate::dock::{render_terminal_content, render_window_frame};
 use crate::icons;
+use crate::neon::{render_aurora, render_creature};
 use crate::theme::mix;
 use util::{bold, ellipsize, fg, fgbg, fill, put, put_char, width};
 
@@ -27,6 +29,15 @@ pub fn draw(frame: &mut Frame, app: &mut App, truecolor: bool) {
     let pal = app.theme.palette.clone();
     app.set_compact(area.width < 80);
     fill(buf, area, pal.bg);
+    // Slow-moving neon aurora behind everything.
+    render_aurora(buf, area, &app.neon);
+    // Living guardian creature in the title bar.
+    render_creature(
+        buf,
+        Rect::new(area.x, area.y, area.width, 1),
+        &app.neon_guardian,
+        &app.neon,
+    );
     if area.height < 4 || area.width < 20 {
         put(
             buf,
@@ -156,6 +167,33 @@ pub fn draw(frame: &mut Frame, app: &mut App, truecolor: bool) {
         render_toolbar(buf, toolbar, app);
     }
     render_status(buf, status, app);
+
+    // Dockable windows (terminals float on top of everything).
+    app.dock.apply_docking(area);
+    // Sync terminal rects to their windows.
+    for w in &app.dock.windows {
+        if let crate::dock::WindowKind::Terminal(tid) = w.kind {
+            if let Some(t) = app.terminals.iter_mut().find(|t| t.id == tid) {
+                t.rect = w.rect;
+                t.focused = w.focused;
+                t.z = w.z;
+            }
+        }
+    }
+    for w in &app.dock.windows {
+        render_window_frame(buf, w, &app.neon, pal.bg);
+    }
+    for t in &app.terminals {
+        if let Some(w) = app
+            .dock
+            .windows
+            .iter()
+            .find(|w| matches!(w.kind, crate::dock::WindowKind::Terminal(tid) if tid == t.id))
+        {
+            render_terminal_content(buf, t, w.content_rect(), &app.neon);
+        }
+    }
+
     // On a phone with the agent sheet open, toasts go to the top so they
     // never cover the prompt box.
     let toasts_top = app.show_agent && !docked;

@@ -155,4 +155,9 @@ cmds! {
     AgentStop, "Agent: Stop", "Esc";
     AgentModel, "Agent: Choose Model", "";
     AgentPick, "Agent: Choose Agent", "";
+    NewTerminal, "Terminal: New Terminal", "Ctrl+Shift+`";
+    FocusNextTerminal, "Terminal: Focus Next", "F6";
+    FocusPrevTerminal, "Terminal: Focus Previous", "Shift+F6";
+    ToggleTerminalDock, "Terminal: Toggle Dock", "";
+    CloseTerminal, "Terminal: Close", "Ctrl+W";
 }
