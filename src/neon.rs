@@ -16,7 +16,7 @@ use crate::theme::{mix, rgb};
 
 /// Slow-moving neon lighting state. The hue rotates and a glow drifts across
 /// the screen, casting a soft aurora over everything.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Neon {
     started: Instant,
 }
@@ -105,7 +105,7 @@ pub fn tint_cell(cell: &mut ratatui::buffer::Cell, strength: f32, neon: Color, b
     let blend = |n: u8, b: u8| (n as f32 * strength + b as f32 * (1.0 - strength)).round() as u8;
     cell.set_bg(Color::Rgb(blend(nr, br), blend(ng, bg_), blend(nb, bb)));
     cell.set_fg(neon);
-    cell.add_modifier(Modifier::BOLD);
+    cell.modifier.insert(Modifier::BOLD);
 }
 
 /// The mood of a creature, driven by focus and activity.
@@ -177,7 +177,7 @@ impl Creature {
         };
         self.pulse = (now * speed).sin() * 0.5 + 0.5;
         // Slow wandering drift so creatures feel alive even when idle.
-        self.wander = (now * 0.7 + self.kind as f32 * 2.0).sin() * 0.08;
+        self.wander = (now * 0.7 + self.kind as u8 as f32 * 2.0).sin() * 0.08;
     }
 
     /// Glyph representing the creature in its current mood.
@@ -245,7 +245,7 @@ pub fn render_aurora(buf: &mut Buffer, area: Rect, neon: &Neon) {
                 cell.set_bg(Color::Rgb(blend(nr, br), blend(ng, bg_), blend(nb, bb)));
                 if strength > 0.5 {
                     cell.set_fg(band_color);
-                    cell.add_modifier(Modifier::BOLD);
+                    cell.modifier.insert(Modifier::BOLD);
                 }
                 cell.set_symbol("▓");
             }
@@ -265,14 +265,14 @@ pub fn render_aurora(buf: &mut Buffer, area: Rect, neon: &Neon) {
         for dy in 0..4u16 {
             for dx in 0..6u16 {
                 let x = if cx < 0.5 {
-                    area.left().saturating_add(dx)
+                    sx.saturating_add(dx)
                 } else {
-                    area.right().saturating_sub(dx + 1)
+                    sx.saturating_sub(dx + 1)
                 };
                 let y = if cy < 0.5 {
-                    area.top().saturating_add(dy)
+                    sy.saturating_add(dy)
                 } else {
-                    area.bottom().saturating_sub(dy + 1)
+                    sy.saturating_sub(dy + 1)
                 };
                 if x >= area.right() || y >= area.bottom() || x < area.left() || y < area.top() {
                     continue;
@@ -317,7 +317,7 @@ pub fn render_creature(
         let s = c.encode_utf8(&mut encoded);
         cell.set_symbol(s);
         cell.set_fg(creature.color(neon));
-        cell.add_modifier(Modifier::BOLD);
+        cell.modifier.insert(Modifier::BOLD);
         // A faint halo around active creatures.
         if creature.mood != Mood::Idle {
             cell.set_bg(mix(Color::Black, creature.color(neon), creature.pulse * 0.25));

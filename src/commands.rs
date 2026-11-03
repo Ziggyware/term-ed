@@ -71,6 +71,11 @@ pub enum Command {
     AgentStop,
     AgentModel,
     AgentPick,
+    NewTerminal,
+    FocusNextTerminal,
+    FocusPrevTerminal,
+    ToggleTerminalDock,
+    CloseTerminal,
 }
 
 pub struct CommandInfo {

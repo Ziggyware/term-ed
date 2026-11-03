@@ -170,28 +170,15 @@ pub fn draw(frame: &mut Frame, app: &mut App, truecolor: bool) {
 
     // Dockable windows (terminals float on top of everything).
     app.dock.apply_docking(area);
-    // Sync terminal rects to their windows.
+    // Windows are z-ascending: draw each frame with its content so upper windows occlude lower ones.
     for w in &app.dock.windows {
-        if let crate::dock::WindowKind::Terminal(tid) = w.kind {
-            if let Some(t) = app.terminals.iter_mut().find(|t| t.id == tid) {
-                t.rect = w.rect;
-                t.focused = w.focused;
-                t.z = w.z;
-            }
-        }
-    }
-    for w in &app.dock.windows {
+        let crate::dock::WindowKind::Terminal(tid) = w.kind;
+        let Some(t) = app.terminals.iter_mut().find(|t| t.id == tid) else { continue };
+        t.rect = w.rect;
+        t.focused = w.focused;
+        t.z = w.z;
         render_window_frame(buf, w, &app.neon, pal.bg);
-    }
-    for t in &app.terminals {
-        if let Some(w) = app
-            .dock
-            .windows
-            .iter()
-            .find(|w| matches!(w.kind, crate::dock::WindowKind::Terminal(tid) if tid == t.id))
-        {
-            render_terminal_content(buf, t, w.content_rect(), &app.neon);
-        }
+        render_terminal_content(buf, t, &app.neon);
     }
 
     // On a phone with the agent sheet open, toasts go to the top so they

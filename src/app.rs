@@ -27,7 +27,7 @@ use crate::management::Management;
 use crate::plugin::{self, Host as PluginHost};
 use crate::search;
 use crate::skills::Skill;
-use crate::dock::{Dock, DockEdge};
+use crate::dock::{Dock, DockEdge, WindowKind};
 use crate::neon::{CreatureKind, Mood, Neon};
 use crate::terminal::Terminal;
 use crate::theme::{self, ThemeEntry};
@@ -655,45 +655,38 @@ impl App {
         let mut terminal = Terminal::new(id, Rect::default());
         terminal.rect = Rect::new(0, 0, 200, 12); // clamped to screen by apply_docking
         terminal.docked = true;
-        terminal.focused = true;
         terminal.prompt();
-        // Unfocus all other terminals.
-        for t in &mut self.terminals {
-            t.focused = false;
-        }
+        self.dock.add_terminal(&terminal);
         self.terminals.push(terminal);
-        self.dock.add_terminal(self.terminals.last().unwrap());
+        self.focus_terminal(id);
+        self.toast("New terminal opened", ToastKind::Info);
+    }
+
+    /// Give keyboard focus to terminal `id` and raise its window.
+    fn focus_terminal(&mut self, id: u64) {
+        for t in &mut self.terminals {
+            t.focused = t.id == id;
+        }
+        self.dock.sync_focus_from_terminals(&self.terminals);
+        self.dock.raise_focused();
         self.terminal_focused = true;
         self.focus = Focus::Terminal;
-        self.toast("New terminal opened", ToastKind::Info);
     }
 
     /// Close the currently focused terminal window.
     pub fn close_focused_terminal(&mut self) {
-        let id = self.dock.focused.and_then(|id| {
-            self.terminals.iter().find(|t| t.id == id).map(|t| t.id)
-        });
-        if let Some(id) = id {
-            self.terminals.retain(|t| t.id != id);
-        }
-        self.dock.windows.retain(|w| match w.kind {
-            crate::dock::WindowKind::Terminal(tid) => tid != id,
-            _ => true,
-        });
-        if self.terminals.is_empty() {
+        let Some(id) = self.dock.focused else { return };
+        self.terminals.retain(|t| t.id != id);
+        self.dock.windows.retain(|w| w.kind != WindowKind::Terminal(id));
+        // Topmost remaining window inherits focus.
+        if let Some(top) = self.dock.windows.last().map(|w| w.id) {
+            self.focus_terminal(top);
+        } else {
             self.terminal_focused = false;
             self.dock.focused = None;
             if !self.editors.is_empty() {
                 self.focus = Focus::Editor;
             }
-        } else {
-            // Re-focus the last remaining terminal.
-            let last = self.terminals.last().unwrap().id;
-            for t in &mut self.terminals {
-                t.focused = t.id == last;
-            }
-            self.dock.focused = Some(last);
-            self.focus = Focus::Terminal;
         }
     }
 
@@ -971,6 +964,17 @@ impl App {
 
         // Route input to a focused terminal window.
         if self.terminal_focused && self.focus == Focus::Terminal {
+            // Window-management keys must reach the dock while a terminal owns input.
+            let window_cmd = match code {
+                KeyCode::F(6) if shift => Some(Command::FocusPrevTerminal),
+                KeyCode::F(6) => Some(Command::FocusNextTerminal),
+                KeyCode::Char('w') if ctrl => Some(Command::CloseTerminal),
+                _ => None,
+            };
+            if let Some(c) = window_cmd {
+                self.run(c);
+                return;
+            }
             if let Some(term) = self.terminals.iter_mut().find(|t| t.focused) {
                 match code {
                     KeyCode::Enter => term.submit_input(),
@@ -1029,6 +1033,8 @@ impl App {
             (KeyCode::F(3), _, true, _) => Some(Command::FindPrev),
             (KeyCode::F(3), ..) => Some(Command::FindNext),
             (KeyCode::F(8), ..) => Some(Command::NextTheme),
+            (KeyCode::F(6), _, true, _) => Some(Command::FocusPrevTerminal),
+            (KeyCode::F(6), ..) => Some(Command::FocusNextTerminal),
             (KeyCode::Char('`'), true, ..) => Some(Command::NewTerminal),
             _ => None,
         };
@@ -1445,24 +1451,23 @@ impl App {
                 }
             }
             NewTerminal => self.new_terminal(),
-            FocusNextTerminal => {
-                self.dock.focus_next();
-                self.terminal_focused = true;
-                self.focus = Focus::Terminal;
-            }
-            FocusPrevTerminal => {
-                self.dock.focus_prev();
-                self.terminal_focused = true;
-                self.focus = Focus::Terminal;
+            FocusNextTerminal | FocusPrevTerminal => {
+                if cmd == FocusNextTerminal {
+                    self.dock.focus_next();
+                } else {
+                    self.dock.focus_prev();
+                }
+                if let Some(id) = self.dock.focused {
+                    self.focus_terminal(id);
+                }
             }
             ToggleTerminalDock => {
                 self.dock.dock_focused(DockEdge::Bottom);
-                self.terminal_focused = true;
-                self.focus = Focus::Terminal;
+                if let Some(id) = self.dock.focused {
+                    self.focus_terminal(id);
+                }
             }
-            CloseTerminal => {
-                self.close_focused_terminal();
-            }
+            CloseTerminal => self.close_focused_terminal(),
             ToggleWhitespace => self.settings.whitespace = !self.settings.whitespace,
             ToggleIndentGuides => self.settings.indent_guides = !self.settings.indent_guides,
             ToggleLineNumbers => self.settings.line_numbers = !self.settings.line_numbers,
@@ -3612,20 +3617,9 @@ impl App {
     fn mouse_down(&mut self, pos: Position, mods: KeyModifiers) {
         let l = self.layout.clone();
         // Click on a dockable terminal window focuses it (topmost wins).
-        if let Some(idx) = (0..self.dock.windows.len())
-            .rev()
-            .find(|&i| self.dock.windows[i].rect.contains(pos))
-        {
-            if let crate::dock::WindowKind::Terminal(tid) = self.dock.windows[idx].kind {
-                for t in &mut self.terminals {
-                    t.focused = t.id == tid;
-                }
-                self.dock.focused = Some(tid);
-                self.terminal_focused = true;
-                self.focus = Focus::Terminal;
-                self.dock.raise_focused();
-                return;
-            }
+        if let Some(id) = self.dock.windows.iter().rev().find(|w| w.rect.contains(pos)).map(|w| w.id) {
+            self.focus_terminal(id);
+            return;
         }
         // The touch toolbar works on top of everything (it is how you press
         // Esc or arrows in a dialog or palette on a phone).

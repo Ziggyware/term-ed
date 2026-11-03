@@ -10,10 +10,10 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 
-use crate::neon::{render_creature, CreatureKind, Mood, Neon};
+use crate::neon::{render_creature, Neon};
 use crate::terminal::Terminal;
 use crate::theme::{mix, rgb};
-use crate::ui::util::{fill, put, width};
+use crate::ui::util::{ellipsize, fill, put, width};
 
 /// A dockable window.
 #[derive(Clone, Debug)]
@@ -64,9 +64,9 @@ impl Default for Window {
 }
 
 impl Window {
-    pub fn terminal(id: u64, terminal: &Terminal) -> Self {
+    pub fn terminal(terminal: &Terminal) -> Self {
         Self {
-            id,
+            id: terminal.id,
             kind: WindowKind::Terminal(terminal.id),
             title: terminal.title.clone(),
             rect: terminal.rect,
@@ -80,27 +80,12 @@ impl Window {
             z: terminal.z,
         }
     }
-
-    /// Height of the window's title bar (always 1 row).
-    pub const TITLE_H: u16 = 1;
-
-    /// Inner content rect (below the title bar).
-    pub fn content_rect(&self) -> Rect {
-        let r = self.rect;
-        Rect::new(
-            r.x,
-            r.y.saturating_add(Self::TITLE_H),
-            r.width,
-            r.height.saturating_sub(Self::TITLE_H),
-        )
-    }
 }
 
 /// Manages the set of dockable windows.
 #[derive(Clone, Debug, Default)]
 pub struct Dock {
     pub windows: Vec<Window>,
-    pub next_id: u64,
     pub focused: Option<u64>,
 }
 
@@ -109,12 +94,9 @@ impl Dock {
         Self::default()
     }
 
-    pub fn add_terminal(&mut self, terminal: &Terminal) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
-        self.windows.push(Window::terminal(id, terminal));
-        self.focused = Some(id);
-        id
+    pub fn add_terminal(&mut self, terminal: &Terminal) {
+        self.windows.push(Window::terminal(terminal));
+        self.focused = Some(terminal.id);
     }
 
     pub fn focused_window(&self) -> Option<&Window> {
@@ -161,7 +143,7 @@ impl Dock {
             if let Some(w) = self.windows.iter_mut().find(|w| w.id == id) {
                 w.z = max_z + 1;
             }
-            self.windows.sort_by_key(|w| std::cmp::Reverse(w.z));
+            self.windows.sort_by_key(|w| w.z);
         }
     }
 
@@ -211,11 +193,10 @@ impl Dock {
     /// Sync window focus flags from the terminal list (terminals own focus).
     pub fn sync_focus_from_terminals(&mut self, terminals: &[Terminal]) {
         for w in &mut self.windows {
-            if let WindowKind::Terminal(tid) = w.kind {
-                w.focused = terminals.iter().any(|t| t.id == tid && t.focused);
-                if w.focused {
-                    self.focused = Some(w.id);
-                }
+            let WindowKind::Terminal(tid) = w.kind;
+            w.focused = terminals.iter().any(|t| t.id == tid && t.focused);
+            if w.focused {
+                self.focused = Some(w.id);
             }
         }
     }
@@ -334,7 +315,7 @@ pub fn render_window_frame(buf: &mut Buffer, window: &Window, neon: &Neon, theme
                     if x < r.right() && y < r.bottom() && x >= r.left() && y >= r.top() {
                         if let Some(c) = buf.cell_mut((x, y)) {
                             c.set_fg(glow);
-                            c.add_modifier(Modifier::BOLD);
+                            c.modifier.insert(Modifier::BOLD);
                         }
                     }
                 }
@@ -347,7 +328,6 @@ pub fn render_window_frame(buf: &mut Buffer, window: &Window, neon: &Neon, theme
 pub fn render_terminal_content(
     buf: &mut Buffer,
     terminal: &Terminal,
-    area: Rect,
     neon: &Neon,
 ) {
     let inner = terminal.inner_rect();
@@ -385,21 +365,15 @@ pub fn render_terminal_content(
         }
     }
 
-    // Visible lines (oldest first).
-    let rows = content.height as usize;
-    let lines = terminal.visible_lines();
-    let start = lines.len().saturating_sub(rows);
-    for (row, line) in lines.iter().enumerate().skip(start) {
+    // Visible lines (oldest first); visible_lines already fits content.height.
+    for (row, line) in terminal.visible_lines().into_iter().enumerate() {
         let y = content.top() + row as u16;
-        if y >= content.bottom() {
-            break;
-        }
-        let line = ellipsize_width(line, content.width as usize);
+        let line = ellipsize(line, content.width as usize);
         put(
             buf,
             content.left(),
             y,
-            line,
+            &line,
             fgbg(Color::Rgb(0xc8, 0xf7, 0xdc), tbg),
             content.right(),
         );
@@ -408,8 +382,7 @@ pub fn render_terminal_content(
     // Input line at the bottom of the window.
     let input_y = inner.bottom().saturating_sub(1);
     if input_y > inner.top() {
-        let prompt = "> ";
-        let line = format!("{}{}", prompt, terminal.input);
+        let line = format!("> {}", terminal.input);
         put(
             buf,
             content.left(),
@@ -419,13 +392,13 @@ pub fn render_terminal_content(
             content.right(),
         );
         if terminal.focused {
-            let cursor_x = content.left() + width(&line) as u16;
+            let cursor_x = content.left() + width("> ") + width(&terminal.input[..terminal.input_cursor]);
             if cursor_x < content.right() {
                 if let Some(c) = buf.cell_mut((cursor_x, input_y)) {
                     c.set_symbol(" ");
                     c.set_bg(Color::White);
                     c.set_fg(tbg);
-                    c.add_modifier(Modifier::BOLD);
+                    c.modifier.insert(Modifier::BOLD);
                 }
             }
         }
@@ -438,26 +411,6 @@ fn fgbg(f: Color, b: Color) -> Style {
     Style::default().fg(f).bg(b)
 }
 
-fn ellipsize_width(s: &str, width: usize) -> String {
-    use unicode_width::UnicodeWidthStr;
-    let w = UnicodeWidthStr::width(s);
-    if w <= width {
-        return s.to_string();
-    }
-    let mut out = String::new();
-    let mut used = 0usize;
-    for g in s.graphemes(true) {
-        let gw = UnicodeWidthStr::width(g);
-        if used + gw + 1 > width {
-            break;
-        }
-        out.push_str(g);
-        used += gw;
-    }
-    out.push('…');
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,7 +419,7 @@ mod tests {
     fn focus_next_cycles() {
         let mut dock = Dock::new();
         dock.windows.push(Window::default());
-        dock.windows.push(Window::default());
+        dock.windows.push(Window { id: 1, ..Default::default() });
         dock.focused = Some(0);
         dock.focus_next();
         assert_eq!(dock.focused, Some(1));

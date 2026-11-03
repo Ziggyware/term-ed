@@ -4,7 +4,7 @@
 //! `std::process::Command`), captures its output, and renders it in a
 //! bordered, focusable box. Terminals are the primary dockable windows.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -71,9 +71,9 @@ impl Terminal {
     /// Append output text, splitting into lines.
     pub fn write(&mut self, text: &str) {
         self.last_activity = Instant::now();
-        for line in text.split('\n') {
-            // Hard-wrap long lines to the terminal's inner width.
-            let inner_w = self.rect.width.saturating_sub(2) as usize;
+        // A trailing newline terminates the last line rather than opening an empty one.
+        let inner_w = self.inner_rect().width as usize;
+        for line in text.strip_suffix('\n').unwrap_or(text).split('\n') {
             let wrapped = if inner_w > 0 && line.chars().count() > inner_w {
                 wrap(line, inner_w)
             } else {
@@ -85,10 +85,6 @@ impl Terminal {
                     self.lines.remove(0);
                 }
             }
-        }
-        // Auto-scroll to bottom on new output when not scrolled up.
-        if self.scroll == 0 {
-            self.scroll = 0;
         }
     }
 
@@ -136,12 +132,12 @@ impl Terminal {
     pub fn type_char(&mut self, c: char) {
         self.last_activity = Instant::now();
         self.input.insert(self.input_cursor, c);
-        self.input_cursor += 1;
+        self.input_cursor += c.len_utf8();
     }
 
     pub fn backspace(&mut self) {
-        if self.input_cursor > 0 {
-            self.input_cursor -= 1;
+        if let Some(c) = self.input[..self.input_cursor].chars().next_back() {
+            self.input_cursor -= c.len_utf8();
             self.input.remove(self.input_cursor);
             self.last_activity = Instant::now();
         }
@@ -155,14 +151,14 @@ impl Terminal {
     }
 
     pub fn move_left(&mut self) {
-        if self.input_cursor > 0 {
-            self.input_cursor -= 1;
+        if let Some(c) = self.input[..self.input_cursor].chars().next_back() {
+            self.input_cursor -= c.len_utf8();
         }
     }
 
     pub fn move_right(&mut self) {
-        if self.input_cursor < self.input.len() {
-            self.input_cursor += 1;
+        if let Some(c) = self.input[self.input_cursor..].chars().next() {
+            self.input_cursor += c.len_utf8();
         }
     }
 
@@ -189,21 +185,21 @@ impl Terminal {
 
     /// Poll the shell session for newly captured output lines.
     pub fn poll_output(&mut self) {
-        if let Some(shell) = &mut self.shell {
-            while let Ok(line) = shell.output_rx.try_recv() {
-                self.write(&line);
-            }
+        let Some(shell) = &self.shell else { return };
+        let pending: Vec<String> = shell.output_rx.try_iter().collect();
+        for line in pending {
+            self.write(&line);
         }
     }
 
-    /// Inner content area (inside the border).
+    /// Inner content area: below the title bar and its separator, inside the side and bottom borders.
     pub fn inner_rect(&self) -> Rect {
         let r = self.rect;
         Rect::new(
             r.x.saturating_add(1),
-            r.y.saturating_add(1),
+            r.y.saturating_add(2),
             r.width.saturating_sub(2),
-            r.height.saturating_sub(2),
+            r.height.saturating_sub(3),
         )
     }
 
@@ -214,24 +210,11 @@ impl Terminal {
 
     /// The slice of lines currently visible, oldest-first.
     pub fn visible_lines(&self) -> Vec<&str> {
-        let rows = self.content_rows() as usize;
-        let total = self.lines.len();
-        if total == 0 {
-            return vec![];
-        }
         // scroll = how far above the bottom we are.
-        let start = if scroll_clamp(self.scroll, total) >= total {
-            0
-        } else {
-            total.saturating_sub(rows).saturating_add(scroll_clamp(self.scroll, total))
-        };
-        let end = total.min(start + rows);
+        let end = self.lines.len().saturating_sub(self.scroll);
+        let start = end.saturating_sub(self.content_rows() as usize);
         self.lines[start..end].iter().map(String::as_str).collect()
     }
-}
-
-fn scroll_clamp(scroll: usize, total: usize) -> usize {
-    scroll.min(total.saturating_sub(1))
 }
 
 impl Default for Terminal {
@@ -245,12 +228,14 @@ fn wrap(line: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut out = Vec::new();
     let mut cur = String::new();
+    let mut n = 0;
     for ch in line.chars() {
-        if cur.len() >= width {
-            out.push(cur);
-            cur = String::new();
+        if n == width {
+            out.push(std::mem::take(&mut cur));
+            n = 0;
         }
         cur.push(ch);
+        n += 1;
     }
     if !cur.is_empty() {
         out.push(cur);
@@ -263,6 +248,7 @@ fn wrap(line: &str, width: usize) -> Vec<String> {
 /// The session thread owns the `Child` process. Output lines flow from the
 /// session to the terminal via `output_rx`; input lines flow from the
 /// terminal to the session via `input_tx`.
+#[derive(Debug)]
 pub struct ShellSession {
     /// Join handle for the session thread (kept alive for the session's life).
     _thread: Option<thread::JoinHandle<()>>,
@@ -302,23 +288,18 @@ impl ShellSession {
                 }
             };
 
-            let stdout = match child.stdout.take() {
-                Some(s) => s,
-                None => return,
-            };
-            let mut stdin = match child.stdin.take() {
-                Some(s) => s,
-                None => return,
+            let (Some(stdout), Some(stderr), Some(mut stdin)) =
+                (child.stdout.take(), child.stderr.take(), child.stdin.take())
+            else {
+                return;
             };
 
-            // Reader thread: forward shell output to the terminal.
-            let out_tx = output_tx.clone();
+            // Both pipes must be drained or a chatty stderr fills its buffer and stalls the shell.
+            let err_tx = output_tx.clone();
+            thread::spawn(move || forward_lines(stderr, &err_tx));
             thread::spawn(move || {
-                let reader = BufReader::new(stdout);
-                for line in reader.lines().flatten() {
-                    let _ = out_tx.send(format!("{line}\n"));
-                }
-                let _ = out_tx.send("[session ended]\n".to_string());
+                forward_lines(stdout, &output_tx);
+                let _ = output_tx.send("[session ended]\n".to_string());
             });
 
             // Writer loop: send typed input to the shell's stdin.
@@ -328,7 +309,8 @@ impl ShellSession {
                 }
                 let _ = stdin.flush();
             }
-            // Reap the child when the writer loop exits.
+            // Closing stdin lets the shell exit; waiting on it with stdin open would hang.
+            drop(stdin);
             let _ = child.wait();
         });
 
@@ -346,6 +328,16 @@ impl ShellSession {
     }
 }
 
+/// Forward `src` line by line; lossy decoding keeps non-UTF-8 console code pages readable.
+fn forward_lines(src: impl Read, tx: &mpsc::Sender<String>) {
+    for line in BufReader::new(src).split(b'\n').map_while(Result::ok) {
+        let line = String::from_utf8_lossy(&line);
+        if tx.send(format!("{}\n", line.trim_end_matches('\r'))).is_err() {
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,6 +348,19 @@ mod tests {
         t.write("hello world this is a long line\n");
         assert!(!t.lines.is_empty());
         assert!(t.lines.iter().all(|l| l.len() <= 8));
+    }
+
+    #[test]
+    fn multibyte_input_and_newline_framing() {
+        let mut t = Terminal::new(3, Rect::new(0, 0, 20, 6));
+        "aé界".chars().for_each(|c| t.type_char(c));
+        t.move_left();
+        t.backspace();
+        t.move_right();
+        t.type_char('!');
+        assert_eq!(t.input, "a界!");
+        t.write("x\ny\n");
+        assert_eq!(t.visible_lines(), ["x", "y"]);
     }
 
     #[test]
