@@ -115,18 +115,74 @@ impl ModelResponse {
             ));
         }
         let calls: Vec<_> = self.calls.into_iter().flatten().collect();
+        let (content, calls) = match textual_tool_calls(&self.content) {
+            Some(parsed) if calls.is_empty() => parsed,
+            _ => (self.content, calls),
+        };
         if calls.iter().any(|call| call.1.is_empty()) {
             return Err(ResponseError::bad_gateway(
                 "Model returned a tool call without a function name; no tool calls were executed",
             ));
         }
-        if calls.is_empty() && self.content.trim().is_empty() {
+        if calls.is_empty() && content.trim().is_empty() {
             return Err(ResponseError::bad_gateway(
                 "Model returned neither an answer nor tool calls",
             ));
         }
-        Ok((self.content, calls))
+        Ok((content, calls))
     }
+}
+
+/// Some upstreams leak their native tool-call markup into `content` instead of
+/// `tool_calls`: JSON bodies (Hermes/Qwen) or key/value tags (GLM `arg_*`,
+/// `param_*`). Returns the prose before the first call and the parsed calls.
+fn textual_tool_calls(content: &str) -> Option<(String, Vec<ToolCall>)> {
+    let (head, rest) = content.split_once("<tool_call>")?;
+    let mut calls = Vec::new();
+    for segment in rest.split("<tool_call>") {
+        // An unclosed segment is a call the model abandoned and restarted.
+        let Some((body, _)) = segment.split_once("</tool_call>") else {
+            continue;
+        };
+        calls.push(textual_call(body.trim())?);
+    }
+    if calls.is_empty() || calls.len() > 16 {
+        return None;
+    }
+    let head = head.rsplit("</think>").next().unwrap_or(head);
+    Some((head.replace("<think>", "").trim().to_string(), calls))
+}
+
+fn textual_call(body: &str) -> Option<ToolCall> {
+    let (name, args) = if body.starts_with('{') {
+        let v: Value = serde_json::from_str(body).ok()?;
+        let args = v.get("arguments").or_else(|| v.get("parameters"))?;
+        let args = match args {
+            Value::String(s) => serde_json::from_str(s).ok()?,
+            other => other.clone(),
+        };
+        (v.get("name")?.as_str()?.to_string(), args)
+    } else {
+        let end = body.find('<').unwrap_or(body.len());
+        let mut args = serde_json::Map::new();
+        let mut rest = &body[end..];
+        while let Some(i) = rest.find("_key>") {
+            let tag = &rest[rest[..i].rfind('<')? + 1..i];
+            let (key, after) = rest[i + 5..].split_once(&format!("</{tag}_key>"))?;
+            let after = after.trim_start().strip_prefix(&format!("<{tag}_value>"))?;
+            let (raw, after) = after.split_once(&format!("</{tag}_value>"))?;
+            let raw = raw.trim();
+            // GLM encodes non-string values as JSON; anything else is a string.
+            let value = serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.into()));
+            args.insert(key.trim().into(), value);
+            rest = after;
+        }
+        (body[..end].trim().to_string(), Value::Object(args))
+    };
+    let valid = !name.is_empty()
+        && name.len() <= 128
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || "_-.".contains(c));
+    (valid && args.is_object()).then(|| (String::new(), name, args.to_string()))
 }
 
 fn merge_tool_calls(calls: &mut Vec<Option<ToolCall>>, delta: &Value) -> Result<(), String> {
@@ -241,6 +297,22 @@ pub(crate) fn assign_tool_call_ids(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn textual_tool_call_markup_becomes_calls() {
+        let mut r = ModelResponse::default();
+        r.push(&json!({"choices":[{"delta":{"content":"Listing.\n<tool_call>list_files\n</think><tool_call>list_files<param_key>path</param_key><param_value>.</param_value></tool_call>"},"finish_reason":"stop"}]})).unwrap();
+        let (content, calls) = r.finish().unwrap();
+        assert_eq!(content, "Listing.");
+        assert_eq!(calls, vec![(String::new(), "list_files".into(), json!({"path":"."}).to_string())]);
+
+        let (_, calls) = textual_tool_calls("<tool_call>{\"name\":\"read_file\",\"arguments\":{\"path\":\"a\",\"end_line\":5}}</tool_call>\n<tool_call>search\n<arg_key>pattern</arg_key>\n<arg_value>x</arg_value>\n</tool_call>").unwrap();
+        assert_eq!(calls[0].1, "read_file");
+        assert_eq!(serde_json::from_str::<Value>(&calls[0].2).unwrap(), json!({"path":"a","end_line":5}));
+        assert_eq!(serde_json::from_str::<Value>(&calls[1].2).unwrap(), json!({"pattern":"x"}));
+        assert!(textual_tool_calls("<tool_call>rm -rf /</tool_call>").is_none());
+        assert!(textual_tool_calls("plain answer").is_none());
+    }
 
     #[test]
     fn router_complete_calls_and_indexed_fragments_are_kept_separate() {
