@@ -110,7 +110,9 @@ fn http() -> ureq::Agent {
         .http_status_as_error(false)
         .max_redirects(0)
         .timeout_connect(Some(Duration::from_secs(20)))
-        .timeout_global(Some(Duration::from_secs(120)))
+        // Idle bound per read, not a total: a total cut every reply still
+        // streaming at the deadline. Chat calls override it from config.
+        .timeout_per_read(Some(Duration::from_secs(60)))
         // Model rounds are seconds apart; a pooled socket the router has since
         // dropped fails the next POST with a reset (os error 10054).
         .max_idle_connections(0)
@@ -647,10 +649,15 @@ impl Worker {
         let key = crate::provider::authorization(&self.options, &endpoint)
             .map_err(|e| Step::Failed(e, Some(401)))?;
         let clean = |s: &str| crate::provider::sanitize(s, key.as_ref());
+        let stall = self.options.stall_timeout_secs;
         let mut request = self
             .http
             .post(format!("{endpoint}/chat/completions"))
             .config()
+            // Streams (and the router's routing heartbeats) keep each read short;
+            // only a silent upstream trips the idle bound. The task budget caps the call.
+            .timeout_per_read((stall > 0).then(|| Duration::from_secs(stall)))
+            .timeout_per_call(Some(Duration::from_secs(self.options.task_timeout_secs)))
             .max_redirects(
                 if key.is_none() && !self.options.uses_router() && self.options.endpoint.is_empty()
                 {
@@ -1414,7 +1421,7 @@ impl Worker {
             if let Ok(Some(status)) = child.try_wait() {
                 break Some(status);
             }
-            if self.cancel.load(Ordering::SeqCst) || started.elapsed() > Duration::from_secs(120) {
+            if self.cancel.load(Ordering::SeqCst) || started.elapsed() > Duration::from_secs(self.options.task_timeout_secs) {
                 crate::process_guard::terminate(&mut child);
                 break None;
             }
@@ -1644,6 +1651,47 @@ mod router_stream_tests {
         assert!(history[0]["content"].as_str().unwrap().contains("omitted"));
         assert_eq!(history[1]["tool_calls"][0]["id"], "new");
         assert_eq!(history[2]["tool_call_id"], "new");
+    }
+    /// Serves one SSE response: a line every `gap`, `lines` times.
+    fn sse_server(gap: Duration, lines: usize) -> String {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = std::io::Read::read(&mut s, &mut buf);
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n");
+            for i in 0..lines {
+                std::thread::sleep(gap);
+                if s.write_all(format!("data: {i}\n\n").as_bytes()).is_err() {
+                    return;
+                }
+            }
+        });
+        format!("http://{addr}/chat/completions")
+    }
+    fn read_stream(url: &str, idle: Duration) -> std::io::Result<String> {
+        let resp = http()
+            .post(url)
+            .config()
+            .timeout_per_read(Some(idle))
+            .timeout_per_call(Some(Duration::from_secs(30)))
+            .build()
+            .send("{}")
+            .map_err(std::io::Error::other)?;
+        let mut out = String::new();
+        resp.into_body().into_reader().read_to_string(&mut out)?;
+        Ok(out)
+    }
+    #[test]
+    fn idle_bound_lets_long_streams_finish_and_cuts_silent_ones() {
+        // 6 × 400 ms = 2.4 s total, well past the 1 s idle bound, never idle that long.
+        let long = read_stream(&sse_server(Duration::from_millis(400), 6), Duration::from_secs(1)).unwrap();
+        assert_eq!(long.matches("data:").count(), 6);
+        // A 2.5 s silence before the first byte must trip the same 1 s bound.
+        let silent = read_stream(&sse_server(Duration::from_millis(2500), 1), Duration::from_secs(1));
+        assert!(silent.is_err());
     }
     #[test]
     fn provider_errors_redact_the_resolved_key() {

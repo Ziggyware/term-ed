@@ -203,8 +203,9 @@ batch; agents may still independently choose to retry, so verify their work.
 On Unix, managed commands, plugins and ACP agents get private process groups;
 termination also stops ordinary descendants. Shell output capture is bounded.
 A deliberately daemonizing program can escape, and non-Unix cleanup is
-best-effort direct-child termination. A blocked model HTTP request may take up
-to its 120-second transport bound to release its worker thread after Stop; the
+best-effort direct-child termination. A model HTTP request blocked on a silent
+upstream releases its worker thread after Stop within the stall timeout (each
+read is idle-bounded; a streaming reply checks Stop on every line); the
 cancellation flag prevents subsequent managed tool execution and late replies
 are detached from a replacement session. The supervisor runs on the editor event
 loop, not a hard-real-time independent watchdog.
