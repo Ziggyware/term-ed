@@ -711,3 +711,40 @@ fn replace_refuses_a_truncated_result_list() {
     key(&mut app, KeyCode::Enter, KeyModifiers::CONTROL);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "needle\n".repeat(10));
 }
+
+#[test]
+fn bracketed_paste_saves_exact_whitespace_and_undoes_in_one_step() {
+    if common::isolate("bracketed_paste_saves_exact_whitespace_and_undoes_in_one_step") {
+        return;
+    }
+    let root = project("editor-paste");
+    let file = root.join("paste.txt");
+    std::fs::write(&file, "old\r\ntext").unwrap();
+    let mut app = App::new(root, vec![file.clone()], "Visual Studio Dark", false);
+    app.run(Command::SelectAll);
+    app.handle_event(Event::Paste("    α  \r\n\t(beta)\r\n\0".into()));
+    app.run(Command::Save);
+    assert_eq!(std::fs::read_to_string(file).unwrap(), "    α  \r\n\t(beta)\r\n");
+    app.run(Command::Undo);
+    assert_eq!(app.editor().unwrap().doc.rope.to_string(), "old\ntext");
+}
+
+#[test]
+fn command_menu_alt_letters_work_without_consuming_search_letters() {
+    if common::isolate("command_menu_alt_letters_work_without_consuming_search_letters") {
+        return;
+    }
+    let root = project("menu-keys");
+    let mut app = App::new(root, Vec::new(), "Visual Studio Dark", false);
+    let press = |code, mods| Event::Key(KeyEvent::new(code, mods));
+    app.handle_event(press(KeyCode::F(1), KeyModifiers::NONE));
+    app.handle_event(press(KeyCode::Char('n'), KeyModifiers::NONE));
+    assert_eq!(app.palette.as_ref().unwrap().input, "n");
+    app.handle_event(Event::Paste("ew file".into()));
+    let mut term = Terminal::new(TestBackend::new(100, 34)).unwrap();
+    term.draw(|f| termed::ui::draw(f, &mut app, true)).unwrap();
+    assert!(screen(&term).contains("Alt+N File: New File"));
+    app.handle_event(press(KeyCode::Char('N'), KeyModifiers::ALT | KeyModifiers::SHIFT));
+    assert!(app.palette.is_none());
+    assert!(app.editor().is_some());
+}

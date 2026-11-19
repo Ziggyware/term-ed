@@ -157,10 +157,10 @@ fn hint(field: Field) -> &'static str {
             "Quoted argv is supported, e.g. python3 '/path/my agent.py'; set this before choosing custom"
         }
         Field::Model => {
-            "Empty = provider/environment default. Built-in: any tool-capable model supported by your API"
+            "Empty uses the provider default or discovers a custom server model. Set an exact ID to override."
         }
         Field::Endpoint => {
-            "Built-in only: OpenAI-compatible base URL (include /v1 if needed); empty uses the selected provider"
+            "Built-in only. Try https://kono-router.onrender.com or http://127.0.0.1:8080; include /v1 for other servers if needed."
         }
         Field::ApiKeyEnv => {
             "Environment variable NAME only (e.g. OPENAI_API_KEY). Never paste a secret here"
@@ -983,15 +983,23 @@ fn set_field(a: &mut AgentConfig, field: Field, input: &str) -> Result<()> {
         Field::Command => a.command = input.into(),
         Field::Model => a.model = input.into(),
         Field::Endpoint => {
-            let endpoint = input.trim_end_matches('/');
-            if a.provider == "router"
-                && !endpoint.is_empty()
-                && !crate::provider::pinned_router(endpoint)
-            {
-                // Switching to another endpoint must never forward the router key.
-                a.provider = "custom".into();
-                if a.api_key_env == crate::credentials::ROUTER_ENV {
-                    a.api_key_env.clear();
+            let endpoint = input.trim().trim_end_matches('/');
+            if !endpoint.is_empty() && !crate::provider::pinned_router(endpoint) {
+                if a.uses_router() {
+                    // Do not carry the NoKey credential or its default model
+                    // across when changing to a different server.
+                    if a.api_key_env == crate::credentials::ROUTER_ENV {
+                        a.api_key_env.clear();
+                    }
+                    if a.model == crate::provider::ROUTER_MODEL {
+                        a.model.clear();
+                    }
+                    a.provider = "custom".into();
+                } else if a.provider == "kilo" && endpoint != crate::builtin_agent::GATEWAY {
+                    a.provider = "custom".into();
+                    if a.model == crate::builtin_agent::DEFAULT_MODEL {
+                        a.model.clear();
+                    }
                 }
             }
             a.endpoint = endpoint.into();

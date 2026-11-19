@@ -19,6 +19,19 @@ Use **Open User Settings JSON** for multi-line instructions or bulk edits, then 
 
 Editor preferences include theme, minimap, whitespace, indent guides, line numbers, word wrap and the touch toolbar. Wrap and toolbar each cycle through automatic/on/off. Editor display commands also persist their changes.
 
+## Connecting Kono Router or local llama.cpp
+
+Open **F1 → Agent: Configure AI Agent** (or **F1, Alt+A**). Use the **builtin** backend, then set **API base URL**:
+
+| Server | API base URL | Model |
+| --- | --- | --- |
+| Kono Router | `https://kono-router.onrender.com` | Leave empty for `free:auto`, or enter a model ID advertised by Kono |
+| llama.cpp | `http://127.0.0.1:8080` | Leave empty to discover the loaded model via `/v1/models`, or use the model's exact ID or `--alias` |
+
+`/v1` is added automatically to these root URLs. For another server, include its API prefix if required. Leave **API key environment variable** empty for an unauthenticated server; if your deployment requires a key, enter the name of the environment variable holding it. For Kono, use a separate variable such as `KONO_API_KEY` for the Kono credential. The saved NoKey Router credential and the reserved `ROUTER_API_KEY` variable are not forwarded to either server.
+
+Run `llama-server` on the same machine as Termed and wait for the model to load before opening the agent. Use a tool-capable instruct model with a compatible chat template; llama.cpp may need `--jinja` for tool calls. With an 8,192-token context, start with a smaller **Model output token budget** (e.g. 1,024) to leave room for instructions, tools, and history. If the server is still starting or Kono is waking from sleep, retry once it is ready.
+
 ## Configuring the primary agent
 
 The agent configuration menu exposes:
@@ -27,7 +40,7 @@ The agent configuration menu exposes:
 | --- | --- |
 | Backend | `builtin` (default), `custom`, or the exact display name of an installed ACP agent; legacy `auto` selects the built-in agent |
 | Custom ACP command | An argv string with single/double-quoted arguments; no shell expansion. Set it before choosing `custom` |
-| Model | Explicit provider model ID; empty preserves the environment/provider default |
+| Model | Explicit provider model ID; empty uses the provider default or discovers the first model advertised by a custom server |
 | API base URL | Built-in agent's OpenAI-compatible base URL, including `/v1` when required; empty uses the selected provider. The default router uses `https://nokey-router.ziggyware.deno.net/v1` |
 | API key environment variable | **The name of an environment variable**, never the API key itself |
 | Instructions | Role, conventions and additional instructions; use JSON for multiple lines |
