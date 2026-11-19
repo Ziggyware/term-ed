@@ -166,3 +166,27 @@ cmds! {
     ToggleTerminalDock, "Terminal: Toggle Dock", "";
     CloseTerminal, "Terminal: Close", "Ctrl+W";
 }
+
+/// Stable access keys in the command menu, independent of the search results.
+const MENU_KEYS: &[(char, Command)] = &[
+    ('o', Command::QuickOpen),
+    ('n', Command::NewFile),
+    ('s', Command::Save),
+    ('w', Command::CloseTab),
+    ('v', Command::Paste),
+    ('f', Command::Find),
+    ('r', Command::Replace),
+    ('g', Command::GotoLine),
+    ('a', Command::AgentSettings),
+    ('t', Command::NewTerminal),
+    ('q', Command::Quit),
+];
+
+pub(crate) fn menu_command(letter: char) -> Option<Command> {
+    MENU_KEYS.iter().find(|(key, _)| *key == letter).map(|&(_, cmd)| cmd)
+}
+
+pub(crate) fn menu_letter(index: usize) -> Option<char> {
+    let cmd = COMMANDS.get(index)?.cmd;
+    MENU_KEYS.iter().find(|(_, action)| *action == cmd).map(|&(key, _)| key)
+}

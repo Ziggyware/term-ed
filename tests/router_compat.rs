@@ -33,9 +33,8 @@ fn router_compatible_provider_handles_json_and_streamed_tool_calls() {
         prefs.agent = AgentConfig {
             backend: "builtin".into(),
             provider: "custom".into(),
-            endpoint: format!("http://127.0.0.1:{port}/v1"),
+            endpoint: format!("http://127.0.0.1:{port}"),
             api_key_env: "TERMED_COMPAT_TEST_KEY".into(),
-            model: "free:code".into(),
             ..Default::default()
         };
         prefs.save(&root).unwrap();

@@ -157,7 +157,7 @@ pub fn render_palette(buf: &mut Buffer, screen: Rect, app: &mut App) -> Option<P
 
     // Input row.
     let (prompt, placeholder) = match p.mode {
-        PaletteMode::Commands => ("›", "Type a command"),
+        PaletteMode::Commands => ("›", "Type a command · Alt+letter to run"),
         PaletteMode::Files => ("⌕", "Search files by name (fuzzy)"),
         PaletteMode::GotoLine => (":", "line[:column]"),
         PaletteMode::Themes => ("◐", "Select a color theme (↑↓ to preview)"),
@@ -306,6 +306,14 @@ pub fn render_palette(buf: &mut Buffer, screen: Rect, app: &mut App) -> Option<P
         let label = &p.items[item.index];
         let hint = p.hints.get(item.index).cloned().unwrap_or_default();
         let mut x = list.x + 2;
+        if p.mode == PaletteMode::Commands
+            && let Some(letter) = crate::commands::menu_letter(item.index)
+        {
+            let end = list.right();
+            x = put(buf, x, y, "Alt+", fgbg(pal.popup_dim, bg), end);
+            x = put_char(buf, x, y, letter.to_ascii_uppercase(), bold(fgbg(pal.match_fg, bg)), end);
+            x = x.saturating_add(1);
+        }
         let display = if p.mode == PaletteMode::Files {
             let name = label.rsplit('/').next().unwrap_or(label);
             let icon = icons::file_icon(name, nerd);

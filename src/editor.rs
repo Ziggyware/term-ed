@@ -724,6 +724,9 @@ impl Editor {
             return;
         }
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if text.is_empty() {
+            return;
+        }
         self.begin(EditKind::Other);
         self.delete_selection();
         let at = self.sel.head;
@@ -1491,13 +1494,17 @@ impl Editor {
         }
         let Some(b) = self.block else { return };
         let (top, bottom) = b.lines();
-        let text = text.strip_suffix('\n').unwrap_or(text);
-        let pieces: Vec<&str> = text.split('\n').collect();
+        let text = crate::clipboard::paste_text(text);
+        if text.is_empty() {
+            return;
+        }
+        let rows = text.strip_suffix('\n').unwrap_or(&text);
+        let pieces: Vec<&str> = rows.split('\n').collect();
         if pieces.len() == bottom - top + 1 || pieces.len() == 1 {
             self.box_replace(&pieces);
         } else {
             self.block = None;
-            self.insert_text(text);
+            self.insert_text(&text);
         }
     }
 
@@ -1835,7 +1842,7 @@ mod tests {
         assert_eq!(e.box_text(), "bc\nfg");
         e.box_delete();
         assert_eq!(text(&e), "ad\neh\nijkl");
-        e.box_paste("12\n34\n");
+        e.box_paste("12\r\n34\r\n\0");
         assert_eq!(text(&e), "a12d\ne34h\nijkl");
         assert!(e.block.unwrap().is_carets());
         e.box_delete();

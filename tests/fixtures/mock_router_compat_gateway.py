@@ -13,6 +13,17 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    def do_GET(self):
+        if self.path != "/v1/models" or self.headers.get("Authorization") != "Bearer test-only-key+plus":
+            self.send_error(404)
+            return
+        data = json.dumps({"object": "list", "data": [{"id": "free:code"}]}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_POST(self):
         try:
             assert self.path == "/v1/chat/completions"

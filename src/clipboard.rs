@@ -2,6 +2,7 @@
 //! native tools (wl-copy / xclip / xsel / pbcopy) and the OSC 52 escape
 //! sequence, which works over SSH and inside tmux.
 
+use std::borrow::Cow;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -33,6 +34,38 @@ fn graphical_session() -> bool {
         || std::env::var_os("DISPLAY").is_some()
 }
 
+/// Preserve horizontal whitespace and final newlines, while dropping clipboard
+/// control bytes (e.g. a Windows NUL terminator) and normalizing line endings.
+pub(crate) fn paste_text(text: &str) -> Cow<'_, str> {
+    let unwanted = |c: char| c.is_control() && !matches!(c, '\t' | '\r' | '\n');
+    if !text.contains('\r') && !text.contains(unwanted) {
+        return Cow::Borrowed(text);
+    }
+    let mut text = text.replace("\r\n", "\n").replace('\r', "\n");
+    text.retain(|c| !unwanted(c));
+    Cow::Owned(text)
+}
+
+// PowerShell's default stdout formatting adds a newline and may use a lossy
+// code page. Exchange base64-encoded UTF-8 via raw stdin/stdout instead.
+#[cfg(windows)]
+fn powershell(script: &str) -> Command {
+    let mut cmd = Command::new("powershell.exe");
+    cmd.args(["-NoProfile", "-NonInteractive", "-STA", "-Command", script]);
+    cmd.stderr(Stdio::null());
+    cmd
+}
+
+#[cfg(windows)]
+fn windows_get() -> Option<String> {
+    let out = powershell("$ErrorActionPreference='Stop'; $s=Get-Clipboard -Raw; [Console]::Write([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$s)))")
+        .output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(base64::engine::general_purpose::STANDARD.decode(out.stdout).ok()?).ok()
+}
+
 impl Clipboard {
     pub fn set(&mut self, text: String, whole_line: bool) {
         self.whole_line = whole_line;
@@ -41,6 +74,15 @@ impl Clipboard {
         let mut out = std::io::stdout();
         let _ = write!(out, "\x1b]52;c;{b64}\x07");
         let _ = out.flush();
+        #[cfg(windows)]
+        if let Ok(mut child) = powershell("$ErrorActionPreference='Stop'; $s=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd())); Set-Clipboard -Value $s")
+            .stdin(Stdio::piped()).stdout(Stdio::null()).spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(b64.as_bytes());
+            }
+            let _ = child.wait();
+        }
         if graphical_session() {
             for (cmd, args) in COPY_TOOLS {
                 if let Ok(mut child) = Command::new(cmd)
@@ -53,8 +95,9 @@ impl Clipboard {
                     if let Some(mut stdin) = child.stdin.take() {
                         let _ = stdin.write_all(text.as_bytes());
                     }
-                    let _ = child.wait();
-                    break;
+                    if child.wait().is_ok_and(|status| status.success()) {
+                        break;
+                    }
                 }
             }
         }
@@ -64,23 +107,48 @@ impl Clipboard {
     /// Returns the clipboard text, preferring the system clipboard when it
     /// holds something different from what we last copied.
     pub fn get(&mut self) -> String {
+        #[cfg(windows)]
+        if let Some(sys) = windows_get() {
+            self.update_from_system(&sys);
+            return self.text.clone();
+        }
         if graphical_session() {
             for (cmd, args) in PASTE_TOOLS {
                 if let Ok(out) = Command::new(cmd).args(*args).stderr(Stdio::null()).output()
                     && out.status.success()
                 {
-                    let sys = String::from_utf8_lossy(&out.stdout).into_owned();
-                    if !sys.is_empty()
-                        && sys != self.text
-                        && sys.trim_end_matches('\n') != self.text.trim_end_matches('\n')
-                    {
-                        self.text = sys;
-                        self.whole_line = false;
-                    }
+                    self.update_from_system(&String::from_utf8_lossy(&out.stdout));
                     break;
                 }
             }
         }
         self.text.clone()
+    }
+    fn update_from_system(&mut self, text: &str) {
+        let text = paste_text(text);
+        if text != paste_text(&self.text) {
+            self.text = text.into_owned();
+            self.whole_line = false;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paste_preserves_whitespace_and_unicode_but_not_control_bytes() {
+        assert_eq!(paste_text("  α  \r\n\tβ\r\n\0"), "  α  \n\tβ\n");
+    }
+
+    #[test]
+    fn changing_only_final_newlines_invalidates_whole_line_metadata() {
+        let mut c = Clipboard { text: "a\n".into(), whole_line: true };
+        c.update_from_system("a\r\n");
+        assert!(c.whole_line);
+        c.update_from_system("a");
+        assert!(!c.whole_line);
+        assert_eq!(c.text, "a");
     }
 }

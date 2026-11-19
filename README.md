@@ -167,7 +167,7 @@ You need a terminal with truecolor support to get the full look (Windows Termina
 | Go to line (`line:col`) | `Ctrl+G` |
 | Go to matching bracket | `Ctrl+\` |
 | Undo / redo | `Ctrl+Z` / `Ctrl+Y`, `Ctrl+Shift+Z` |
-| Cut / copy / paste | `Ctrl+X` / `Ctrl+C` / `Ctrl+V` |
+| Cut / copy / paste | `Ctrl+X` / `Ctrl+C` / `Ctrl+V`, `Shift+Insert`, or `Alt+V` |
 | Select all / line / next occurrence | `Ctrl+A` / `Ctrl+L` / `Ctrl+D` |
 | Toggle comment | `Ctrl+/` |
 | Move line(s) up / down | `Alt+Up` / `Alt+Down` |
@@ -182,6 +182,8 @@ You need a terminal with truecolor support to get the full look (Windows Termina
 | Toggle minimap / whitespace / indent guides / line numbers | `Ctrl+K M` / `W` / `I` / `L` |
 | Toggle word wrap | `Alt+Z` |
 | AI agent panel | `Ctrl+K A` |
+
+In the command menu (`F1`), press `Alt` plus a highlighted letter to run its action. For example, `Alt+O` opens Go to File, `Alt+S` saves, and `Alt+A` opens AI settings. Typing the letter alone still searches the menu. For multiline paste, use `Alt+V` if your terminal intercepts `Ctrl+V` and sends pasted text as individual keystrokes instead of a bracketed paste.
 
 Some combinations (Ctrl+Shift+…, Ctrl+Enter, Ctrl+[) can only be told apart in terminals that support the kitty keyboard protocol, which termed turns on when it is available. In other terminals, Ctrl+Backspace arrives as Ctrl+H (Replace), so use Alt+Backspace to delete a word. Every command can also be run from the command palette.
 

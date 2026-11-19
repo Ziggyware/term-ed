@@ -13,6 +13,37 @@ pub fn pinned_router(endpoint: &str) -> bool {
     )
 }
 
+pub const KONO_ORIGIN: &str = "https://kono-router.onrender.com";
+pub const KONO_ENDPOINT: &str = "https://kono-router.onrender.com/v1";
+pub const KONO_MODEL: &str = "free:auto";
+
+/// Accept the root URLs users see in the Kono and llama.cpp launch output.
+/// Other custom URLs may have a deliberately unversioned API or a proxy path.
+pub fn custom_endpoint(input: &str) -> String {
+    let base = input.trim().trim_end_matches('/');
+    let base = base.strip_suffix("/chat/completions").unwrap_or(base);
+    if base == KONO_ORIGIN {
+        return KONO_ENDPOINT.into();
+    }
+    if let Some(authority) = base
+        .strip_prefix("http://")
+        .or_else(|| base.strip_prefix("https://"))
+    {
+        let (host, port) = if let Some(rest) = authority.strip_prefix("[::1]") {
+            ("[::1]", rest)
+        } else {
+            let host = authority.split(':').next().unwrap_or("");
+            (host, &authority[host.len()..])
+        };
+        if matches!(host, "localhost" | "127.0.0.1" | "[::1]")
+            && (port.is_empty() || port.strip_prefix(':').is_some_and(|p| p.parse::<u16>().is_ok()))
+        {
+            return format!("{base}/v1");
+        }
+    }
+    base.into()
+}
+
 pub fn endpoint(options: &AgentConfig) -> String {
     if options.uses_router() {
         ROUTER_ENDPOINT.into()
@@ -20,7 +51,7 @@ pub fn endpoint(options: &AgentConfig) -> String {
         std::env::var("TERMED_FREE_GATEWAY")
             .unwrap_or_else(|_| crate::builtin_agent::GATEWAY.into())
     } else {
-        options.endpoint.trim_end_matches('/').into()
+        custom_endpoint(&options.endpoint)
     }
 }
 
@@ -70,6 +101,21 @@ pub fn router_models() -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn accepts_kono_and_llama_cpp_urls_without_relaxing_router_auth() {
+        for (input, expected) in [
+            (KONO_ORIGIN, KONO_ENDPOINT),
+            ("http://127.0.0.1:8080/", "http://127.0.0.1:8080/v1"),
+            ("http://[::1]:8080", "http://[::1]:8080/v1"),
+            ("http://localhost:8080/v1/chat/completions", "http://localhost:8080/v1"),
+            ("https://example.com/proxy", "https://example.com/proxy"),
+        ] {
+            assert_eq!(custom_endpoint(input), expected);
+        }
+        let options = AgentConfig { api_key_env: ROUTER_ENV.into(), ..Default::default() };
+        assert!(authorization(&options, KONO_ENDPOINT).is_err());
+    }
+
     #[test]
     fn router_auth_is_strictly_origin_bound() {
         for url in [

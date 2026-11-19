@@ -802,7 +802,32 @@ impl App {
         }
     }
 
+    fn paste_targets_input(&self) -> bool {
+        self.palette.is_some()
+            || matches!(self.focus, Focus::Agent | Focus::Find | Focus::Search | Focus::Terminal)
+    }
+
     fn on_paste(&mut self, text: &str) {
+        if self.dialog.is_some() {
+            return;
+        }
+        let text = crate::clipboard::paste_text(text);
+        let text = text.as_ref();
+        if text.is_empty() {
+            return;
+        }
+        if self.focus == Focus::Terminal && self.palette.is_none() {
+            // The embedded shell has a single-line command field. Pasted text
+            // must not submit commands or fall through to the active editor.
+            let line = text.trim_end_matches('\n');
+            if line.contains('\n') {
+                self.toast("Paste one command at a time into the terminal", ToastKind::Info);
+            } else if let Some(term) = self.terminals.iter_mut().find(|t| t.focused) {
+                term.input.insert_str(term.input_cursor, line);
+                term.input_cursor += line.len();
+            }
+            return;
+        }
         if self.focus == Focus::Agent && self.palette.is_none() {
             let a = &mut self.agent;
             a.input.insert_str(byte_at(&a.input, a.cursor), text);
@@ -828,6 +853,10 @@ impl App {
             let (field, cur) = self.find_field();
             field.insert_str(byte_at(field, *cur), &t);
             *cur += t.chars().count();
+            if !self.find.on_replace {
+                self.update_find();
+                self.find_jump(true, true);
+            }
         } else if self.focus == Focus::Search {
             if self.search.query_selected && self.search.field == SearchField::Query {
                 self.search.query.clear();
@@ -839,8 +868,23 @@ impl App {
             field.insert_str(byte_at(field, *cur), &t);
             *cur += t.chars().count();
             self.update_search();
-        } else if let Some(e) = self.editor_mut() {
-            e.insert_text(text);
+        } else if self.focus == Focus::Editor {
+            self.paste_into_editor(text, false);
+        }
+    }
+
+    fn paste_into_editor(&mut self, text: &str, whole_line: bool) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(e) = self.editor_mut() {
+            if e.block.is_some() {
+                e.box_paste(text);
+            } else if whole_line && e.sel.is_empty() {
+                e.insert_lines_above(text);
+            } else {
+                e.insert_text(text);
+            }
             e.scroll_into_view();
         }
     }
@@ -931,7 +975,27 @@ impl App {
             self.dialog_key(code);
             return;
         }
+        let alt_paste = alt && !ctrl && !shift && code == KeyCode::Char('v');
+        if (ctrl && code == KeyCode::Char('v') && !alt
+            || shift && code == KeyCode::Insert
+            || alt_paste && self.palette.is_none())
+            && self.paste_targets_input()
+        {
+            let text = self.clipboard.get();
+            self.on_paste(&text);
+            return;
+        }
         if self.palette.is_some() {
+            if alt && !ctrl {
+                if let KeyCode::Char(letter) = code
+                    && self.palette.as_ref().is_some_and(|p| p.mode == PaletteMode::Commands)
+                    && let Some(cmd) = crate::commands::menu_command(letter)
+                {
+                    self.palette = None;
+                    self.run(cmd);
+                }
+                return;
+            }
             self.palette_key(code, ctrl);
             return;
         }
@@ -966,6 +1030,8 @@ impl App {
         if self.terminal_focused && self.focus == Focus::Terminal {
             // Window-management keys must reach the dock while a terminal owns input.
             let window_cmd = match code {
+                KeyCode::F(1) => Some(Command::CommandPalette),
+                KeyCode::Char('p') if ctrl && shift => Some(Command::CommandPalette),
                 KeyCode::F(6) if shift => Some(Command::FocusPrevTerminal),
                 KeyCode::F(6) => Some(Command::FocusNextTerminal),
                 KeyCode::Char('w') if ctrl => Some(Command::CloseTerminal),
@@ -1108,6 +1174,7 @@ impl App {
             (KeyCode::Char('x'), true, ..) => Some(Command::Cut),
             (KeyCode::Char('c'), true, ..) | (KeyCode::Insert, true, ..) => Some(Command::Copy),
             (KeyCode::Char('v'), true, ..) | (KeyCode::Insert, _, true, _) => Some(Command::Paste),
+            _ if alt_paste => Some(Command::Paste),
             (KeyCode::Char('a'), true, ..) => Some(Command::SelectAll),
             (KeyCode::Char('l'), true, ..) => Some(Command::SelectLine),
             (KeyCode::Char('d'), true, true, _) => Some(Command::DuplicateLineDown),
@@ -1539,6 +1606,10 @@ impl App {
                     e.scroll_into_view();
                 }
             }
+            Paste if self.paste_targets_input() => {
+                let text = self.clipboard.get();
+                self.on_paste(&text);
+            }
             Undo | Redo | Cut | Copy | Paste | SelectAll | SelectLine | SelectNextOccurrence
             | ToggleComment | Indent | Outdent | MoveLineUp | MoveLineDown | DuplicateLineDown
             | DuplicateLineUp | DeleteLine | InsertLineBelow | InsertLineAbove => {
@@ -1564,6 +1635,12 @@ impl App {
         if self.editors.is_empty() {
             return;
         }
+        if cmd == Paste {
+            let text = self.clipboard.get();
+            let text = crate::clipboard::paste_text(&text);
+            self.paste_into_editor(&text, self.clipboard.whole_line);
+            return;
+        }
         // Clipboard on a box selection works per line.
         if self.editors[self.active].block.is_some() {
             match cmd {
@@ -1576,30 +1653,9 @@ impl App {
                     self.clipboard.set(text, false);
                     return;
                 }
-                Paste => {
-                    let text = self.clipboard.get();
-                    let e = &mut self.editors[self.active];
-                    e.box_paste(&text);
-                    e.scroll_into_view();
-                    return;
-                }
                 Undo | Redo => {}
                 _ => self.editors[self.active].box_clear(),
             }
-        }
-        if cmd == Paste {
-            let whole = self.clipboard.whole_line;
-            let text = self.clipboard.get();
-            let whole = whole && self.clipboard.whole_line;
-            if let Some(e) = self.editor_mut() {
-                if whole && e.sel.is_empty() {
-                    e.insert_lines_above(&text);
-                } else {
-                    e.insert_text(&text);
-                }
-                e.scroll_into_view();
-            }
-            return;
         }
         let e = &mut self.editors[self.active];
         let mut clip = None;

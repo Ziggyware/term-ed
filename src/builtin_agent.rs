@@ -95,6 +95,12 @@ pub fn spawn_configured_with_agui(
             w.model = options.model.clone();
         } else if options.uses_router() {
             w.model = crate::provider::ROUTER_MODEL.into();
+        } else if !options.endpoint.is_empty() {
+            w.model = if crate::provider::endpoint(&options) == crate::provider::KONO_ENDPOINT {
+                crate::provider::KONO_MODEL.into()
+            } else {
+                String::new()
+            };
         }
         w.options = options;
         w.skill_context = skill_context;
@@ -137,6 +143,55 @@ fn http() -> ureq::Agent {
         }
     }
     cfg.build().new_agent()
+}
+
+/// Discover a model on a custom server without sending credentials on redirects.
+fn custom_models(http: &ureq::Agent, options: &AgentConfig) -> Result<Vec<(String, String)>, Step> {
+    let endpoint = crate::provider::endpoint(options);
+    let key = crate::provider::authorization(options, &endpoint)
+        .map_err(|e| Step::Failed(e, Some(401)))?;
+    let mut request = http
+        .get(format!("{endpoint}/models"))
+        .config()
+        .timeout_per_call(Some(Duration::from_secs(15)))
+        .build();
+    if let Some(key) = &key {
+        request = request.header("Authorization", format!("Bearer {}", key.expose()));
+    }
+    let fail = |detail: &str, status| Step::Failed(
+        format!("Could not discover a model from /models ({detail}). Check the API base URL and server, or set Model explicitly."),
+        status,
+    );
+    let response = request.call().map_err(|_| fail("connection failed", None))?;
+    let status = response.status().as_u16();
+    if status != 200 {
+        return Err(fail(&format!("HTTP {status}"), Some(status)));
+    }
+    let mut data = Vec::new();
+    response
+        .into_body()
+        .into_reader()
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut data)
+        .map_err(|_| fail("could not read response", None))?;
+    if data.len() > 1024 * 1024 {
+        return Err(fail("model list exceeds 1 MiB", None));
+    }
+    let list: Value = serde_json::from_slice(&data).map_err(|_| fail("invalid model list", None))?;
+    let models: Vec<_> = list
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|model| model.get("id").and_then(Value::as_str))
+        .filter(|id| !id.trim().is_empty())
+        .take(256)
+        .map(|id| (id.to_owned(), id.to_owned()))
+        .collect();
+    if models.is_empty() {
+        return Err(fail("no models advertised", None));
+    }
+    Ok(models)
 }
 
 /// Free, tool-capable models from the gateway (falls back to the router).
@@ -398,11 +453,16 @@ impl Worker {
                         crate::provider::router_models()
                     } else if self.options.endpoint.is_empty() {
                         free_models(&self.http)
+                    } else if self.model.is_empty() {
+                        custom_models(&self.http, &self.options).unwrap_or_default()
                     } else {
                         vec![(self.model.clone(), self.model.clone())]
                     };
                 }
-                if !self.models.iter().any(|(v, _)| *v == self.model) {
+                if self.model.is_empty() && let Some((id, _)) = self.models.first() {
+                    self.model = id.clone();
+                }
+                if !self.model.is_empty() && !self.models.iter().any(|(v, _)| *v == self.model) {
                     self.models.insert(0, (self.model.clone(), self.model.clone()));
                 }
                 self.respond(&id, json!({"sessionId":"builtin","configOptions":self.config_options()}));
@@ -621,6 +681,10 @@ impl Worker {
     /// One model call. Ok(true) = tools ran, call the model again. `finalize`
     /// withholds tools and demands an answer; it never returns Ok(true).
     fn step(&mut self, finalize: bool) -> Result<bool, Step> {
+        if self.model.is_empty() {
+            self.models = custom_models(&self.http, &self.options)?;
+            self.model = self.models[0].0.clone();
+        }
         if finalize && self.history.last().is_none_or(|m| m["role"] != "user") {
             self.history.push(json!({"role":"user","content":"Your step budget is exhausted and tools are now unavailable. Using only the evidence already gathered above, give your final answer now. State explicitly what you could not inspect or verify."}));
         }
@@ -638,7 +702,7 @@ impl Worker {
         let mut body = json!({"model":self.model,"messages":messages,
             "max_tokens":self.options.max_output_tokens,"stream":true,"stream_options":{"include_usage":true}});
         // Some providers reject an empty tools array, so omit the key instead.
-        if !finalize {
+        if !finalize && !schemas.is_empty() {
             body["tools"] = json!(schemas);
         }
         let body = body.to_string();
