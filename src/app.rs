@@ -454,6 +454,7 @@ pub struct App {
     pub active: usize,
     pub explorer: Explorer,
     pub show_sidebar: bool,
+    pub alt_paste: bool,
     pub sidebar_width: u16,
     pub focus: Focus,
     pub theme: ThemeEntry,
@@ -520,6 +521,7 @@ impl App {
             active: 0,
             explorer: Explorer::new(root.clone()),
             show_sidebar: true,
+            alt_paste: false,
             sidebar_width: 30,
             focus: Focus::Editor,
             theme,
@@ -975,10 +977,10 @@ impl App {
             self.dialog_key(code);
             return;
         }
-        let alt_paste = alt && !ctrl && !shift && code == KeyCode::Char('v');
+        self.alt_paste = alt && !ctrl && !shift && code == KeyCode::Char('v');
         if (ctrl && code == KeyCode::Char('v') && !alt
             || shift && code == KeyCode::Insert
-            || alt_paste && self.palette.is_none())
+            || self.alt_paste && self.palette.is_none())
             && self.paste_targets_input()
         {
             let text = self.clipboard.get();
@@ -1174,7 +1176,7 @@ impl App {
             (KeyCode::Char('x'), true, ..) => Some(Command::Cut),
             (KeyCode::Char('c'), true, ..) | (KeyCode::Insert, true, ..) => Some(Command::Copy),
             (KeyCode::Char('v'), true, ..) | (KeyCode::Insert, _, true, _) => Some(Command::Paste),
-            _ if alt_paste => Some(Command::Paste),
+            _ if self.alt_paste => Some(Command::Paste),
             (KeyCode::Char('a'), true, ..) => Some(Command::SelectAll),
             (KeyCode::Char('l'), true, ..) => Some(Command::SelectLine),
             (KeyCode::Char('d'), true, true, _) => Some(Command::DuplicateLineDown),
