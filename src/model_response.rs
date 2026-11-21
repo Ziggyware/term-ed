@@ -39,6 +39,13 @@ pub(crate) struct ModelResponse {
     // fragment, so a malformed call cannot disappear at the end of a stream.
     calls: Vec<Option<ToolCall>>,
     finished: bool,
+    allow_truncation: bool,
+    /// The stream stopped because the output budget ran out. Only local
+    /// inference allows that to pass: a partial answer plus a note is better
+    /// than failing the turn, and slow on-device models rarely reach a stop
+    /// token. Providers keep failing loudly so a truncated tool call is
+    /// never executed.
+    truncated: bool,
 }
 
 impl ModelResponse {
@@ -70,6 +77,11 @@ impl ModelResponse {
         // A valid finish event need not include a delta at all.
         if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
             if reason == "length" || reason == "content_filter" {
+                if self.allow_truncation && reason == "length" && self.calls.is_empty() {
+                    self.truncated = true;
+                    self.finished = true;
+                    return Ok(update);
+                }
                 return Err(ResponseError {
                     message: format!(
                         "Model stopped with {reason}; partial tool calls were not executed. Adjust the output budget or task."
@@ -106,6 +118,16 @@ impl ModelResponse {
 
     pub fn done(&mut self) {
         self.finished = true;
+    }
+
+    /// Accept a `length` finish with no tool calls as a (shorter) answer.
+    pub fn allow_truncation(&mut self, allow: bool) {
+        self.allow_truncation = allow;
+    }
+
+    /// Whether the answer was cut short by the output budget.
+    pub fn was_truncated(&self) -> bool {
+        self.truncated
     }
 
     pub fn finish(self) -> Result<(String, Vec<ToolCall>), ResponseError> {
@@ -484,5 +506,46 @@ mod tests {
             .push(&json!({"choices":[{"finish_reason":"length"}]}))
             .unwrap_err();
         assert_eq!(error.status, 413);
+    }
+
+    #[test]
+    fn local_inference_can_finish_on_its_output_budget() {
+        // Providers must fail loudly on `length`, but a slow on-device model
+        // that simply ran out of room keeps its partial answer.
+        let mut response = ModelResponse::default();
+        response.allow_truncation(true);
+        response
+            .push(&json!({"choices":[{"delta":{"content":"partial answer"}}]}))
+            .unwrap();
+        response
+            .push(&json!({"choices":[{"finish_reason":"length"}]}))
+            .unwrap();
+        assert!(response.was_truncated());
+        assert_eq!(response.finish().unwrap().0, "partial answer");
+
+        // A truncated tool call is still refused: it must never execute.
+        let mut response = ModelResponse::default();
+        response.allow_truncation(true);
+        response
+            .push(&json!({"choices":[{"delta":{"tool_calls":[{"id":"x","function":{"name":"read_file","arguments":"{"}}]}}]}))
+            .unwrap();
+        assert_eq!(
+            response
+                .push(&json!({"choices":[{"finish_reason":"length"}]}))
+                .unwrap_err()
+                .status,
+            413
+        );
+
+        // Content filtering stays an error even for local inference.
+        let mut response = ModelResponse::default();
+        response.allow_truncation(true);
+        assert_eq!(
+            response
+                .push(&json!({"choices":[{"finish_reason":"content_filter"}]}))
+                .unwrap_err()
+                .status,
+            413
+        );
     }
 }

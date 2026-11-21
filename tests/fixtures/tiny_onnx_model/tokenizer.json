@@ -1,0 +1,276 @@
+{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [
+    {
+      "id": 0,
+      "content": "[UNK]",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 1,
+      "content": "<|im_start|>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 2,
+      "content": "<|im_end|>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    },
+    {
+      "id": 3,
+      "content": "<|endoftext|>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
+    }
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {
+    "type": "ByteLevel",
+    "add_prefix_space": false,
+    "trim_offsets": true,
+    "use_regex": true
+  },
+  "post_processor": null,
+  "decoder": {
+    "type": "ByteLevel",
+    "add_prefix_space": true,
+    "trim_offsets": true,
+    "use_regex": true
+  },
+  "model": {
+    "type": "BPE",
+    "dropout": null,
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": null,
+    "end_of_word_suffix": null,
+    "fuse_unk": false,
+    "byte_fallback": false,
+    "ignore_merges": false,
+    "vocab": {
+      "[UNK]": 0,
+      "<|im_start|>": 1,
+      "<|im_end|>": 2,
+      "<|endoftext|>": 3,
+      "<": 4,
+      ">": 5,
+      "_": 6,
+      "a": 7,
+      "c": 8,
+      "d": 9,
+      "e": 10,
+      "h": 11,
+      "i": 12,
+      "l": 13,
+      "m": 14,
+      "n": 15,
+      "o": 16,
+      "r": 17,
+      "s": 18,
+      "t": 19,
+      "u": 20,
+      "w": 21,
+      "|": 22,
+      "Ċ": 23,
+      "Ġ": 24,
+      "el": 25,
+      "lo": 26,
+      "<|": 27,
+      "hel": 28,
+      "im": 29,
+      "|>": 30,
+      "hello": 31,
+      "st": 32,
+      "sta": 33,
+      "al": 34,
+      "cal": 35,
+      "del": 36,
+      "en": 37,
+      "ld": 38,
+      "mo": 39,
+      "or": 40,
+      "rt": 41,
+      "wor": 42,
+      "Ġlo": 43,
+      "Ġmo": 44,
+      "Ġwor": 45,
+      "start": 46,
+      "end": 47,
+      "Ġlocal": 48,
+      "Ġmodel": 49,
+      "Ġworld": 50,
+      "as": 51,
+      "er": 52,
+      "ista": 53,
+      "nt": 54,
+      "ser": 55,
+      "sista": 56,
+      "user": 57,
+      "Ġhello": 58,
+      "assista": 59,
+      "assistant": 60
+    },
+    "merges": [
+      [
+        "e",
+        "l"
+      ],
+      [
+        "l",
+        "o"
+      ],
+      [
+        "<",
+        "|"
+      ],
+      [
+        "h",
+        "el"
+      ],
+      [
+        "i",
+        "m"
+      ],
+      [
+        "|",
+        ">"
+      ],
+      [
+        "hel",
+        "lo"
+      ],
+      [
+        "s",
+        "t"
+      ],
+      [
+        "st",
+        "a"
+      ],
+      [
+        "a",
+        "l"
+      ],
+      [
+        "c",
+        "al"
+      ],
+      [
+        "d",
+        "el"
+      ],
+      [
+        "e",
+        "n"
+      ],
+      [
+        "l",
+        "d"
+      ],
+      [
+        "m",
+        "o"
+      ],
+      [
+        "o",
+        "r"
+      ],
+      [
+        "r",
+        "t"
+      ],
+      [
+        "w",
+        "or"
+      ],
+      [
+        "Ġ",
+        "lo"
+      ],
+      [
+        "Ġ",
+        "mo"
+      ],
+      [
+        "Ġ",
+        "wor"
+      ],
+      [
+        "sta",
+        "rt"
+      ],
+      [
+        "en",
+        "d"
+      ],
+      [
+        "Ġlo",
+        "cal"
+      ],
+      [
+        "Ġmo",
+        "del"
+      ],
+      [
+        "Ġwor",
+        "ld"
+      ],
+      [
+        "a",
+        "s"
+      ],
+      [
+        "e",
+        "r"
+      ],
+      [
+        "i",
+        "sta"
+      ],
+      [
+        "n",
+        "t"
+      ],
+      [
+        "s",
+        "er"
+      ],
+      [
+        "s",
+        "ista"
+      ],
+      [
+        "u",
+        "ser"
+      ],
+      [
+        "Ġ",
+        "hello"
+      ],
+      [
+        "as",
+        "sista"
+      ],
+      [
+        "assista",
+        "nt"
+      ]
+    ]
+  }
+}

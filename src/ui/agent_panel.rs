@@ -420,7 +420,9 @@ fn build_rows(app: &App, w: usize, panel_bg: Color) -> Vec<Row> {
         }
         if a.spec.as_ref().is_some_and(|s| s.builtin) {
             rows.push(Row::blank());
-            let privacy = if a.options.uses_router() {
+            let privacy = if a.options.uses_local() {
+                "On-device ONNX inference: prompts and project content stay on this machine; no key and no network."
+            } else if a.options.uses_router() {
                 "NoKey Router uses your configured router key. Prompts and project content are sent to the model provider; avoid sharing secrets."
             } else {
                 "Prompts and project content are sent to the configured model provider; avoid sharing secrets."
