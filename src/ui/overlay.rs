@@ -355,7 +355,7 @@ pub fn render_palette(buf: &mut Buffer, screen: Rect, app: &mut App) -> Option<P
         // still win, so search stays legible.
         let area_len = display
             .find(": ")
-            .filter(|&i| p.mode == PaletteMode::Commands || managed)
+            .filter(|_| p.mode == PaletteMode::Commands || managed)
             .map(|i| i + 2)
             .unwrap_or(0);
         for (ci, ch) in display.chars().enumerate() {

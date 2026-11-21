@@ -192,13 +192,14 @@ pub fn embed(texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
         .header("content-type", "application/json")
         .send_json(body)
         .map_err(|e| match e {
-            ureq::Error::Status(404, _) => unavailable_reason(
+            ureq::Error::StatusCode(404) => unavailable_reason(
                 "the local server in use predates the embeddings route",
             ),
             other => unavailable_reason(&other.to_string()),
         })?;
     let value: Value = response
-        .into_json()
+        .into_body()
+        .read_json()
         .map_err(|e| unavailable_reason(&format!("invalid response: {e}")))?;
     let data = value
         .get("data")
