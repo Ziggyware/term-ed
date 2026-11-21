@@ -13,6 +13,11 @@ it by hand.
 pip install -r local_inference/requirements.txt
 ```
 
+If Hugging Face is unreachable, set `HF_ENDPOINT` to a mirror or pre-download
+into the cache with `huggingface-cli`; the server also retries dropped
+connections instead of failing the fallback. See
+[docs/local-inference.md](../docs/local-inference.md#when-hugging-face-is-unreachable).
+
 The first run downloads the default model
 (`onnx-community/SmolLM2-135M-Instruct`, ~150 MB) from Hugging Face into
 `~/.config/termed/onnx-models/`. After that it runs fully offline.
@@ -46,6 +51,9 @@ pip install -r local_inference/requirements-dev.txt   # adds `onnx`
 python3 -m unittest discover -s local_inference/tests -v
 ```
 
-There are 18 tests: the API surface, streaming, cancellation mid-stream, the
-loading/failed states, and model-path validation, all against a tiny
-deterministic ONNX model built in the test (no network, no download).
+There are 24 tests: the API surface, streaming, cancellation mid-stream, the
+loading/failed states, model-path validation, shutdown with and without a
+request body, and Hub download retry (a dropped connection is retried, while a
+persistent one explains the mirror and offline options). All of it runs against
+a tiny deterministic ONNX model built inside the test — no network, no
+download.

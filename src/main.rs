@@ -44,6 +44,9 @@ struct Args {
     /// Run the local ONNX server in the foreground and exit on Ctrl-C.
     #[arg(long)]
     local_serve: bool,
+    /// Download the local ONNX model and exit (no ONNX Runtime needed).
+    #[arg(long)]
+    local_prefetch: bool,
     /// Model for the local ONNX server: a Hugging Face repo id or a directory.
     #[arg(long)]
     local_model: Option<String>,
@@ -86,6 +89,14 @@ fn main() -> Result<()> {
     let args = Args::parse();
     if let Some(address) = &args.mcp_bridge {
         return termed::tool_bridge::run_stdio(address);
+    }
+    if args.local_prefetch {
+        return termed::local_server::prefetch(
+            args.local_model
+                .as_deref()
+                .unwrap_or(termed::local_server::DEFAULT_MODEL),
+        )
+        .map_err(anyhow::Error::msg);
     }
     if args.local_serve {
         // Reuse a configured endpoint when one is given; otherwise serve the

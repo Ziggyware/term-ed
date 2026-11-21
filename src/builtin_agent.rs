@@ -474,11 +474,12 @@ impl Worker {
                         let cancel = self.cancel.clone();
                         let out = self.out.clone();
                         let waiting = move |elapsed: Duration| {
+                            let title = format!(
+                                "Waiting for the local ONNX server ({}s); the first run downloads the model.",
+                                elapsed.as_secs()
+                            );
                             out(json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"builtin",
-                                "update":{"sessionUpdate":"notice","severity":"info","title":format!(
-                                    "Waiting for the local ONNX server ({}s); the first run downloads the model.",
-                                    elapsed.as_secs()
-                                )}}}));
+                                "update":{"sessionUpdate":"notice","severity":"info","title":title}}}));
                         };
                         match crate::local_server::ensure_running(
                             &self.http,
@@ -488,13 +489,13 @@ impl Worker {
                             waiting,
                         ) {
                             Ok(model) => {
-                                self.local =
-                                    Some(crate::config::LocalInference { endpoint, model });
-                                self.model = self
-                                    .local
-                                    .as_ref()
-                                    .map(|l| l.model.clone())
-                                    .unwrap_or_default();
+                                // Clone the endpoint for the struct: it is
+                                // still needed for model discovery below.
+                                self.local = Some(crate::config::LocalInference {
+                                    endpoint: endpoint.clone(),
+                                    model: model.clone(),
+                                });
+                                self.model = model;
                                 // The local endpoint is outside `options.endpoint`,
                                 // so the list comes from the server itself.
                                 let local = crate::config::AgentConfig {

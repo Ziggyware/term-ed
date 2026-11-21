@@ -44,10 +44,21 @@ DEFAULT_MODEL = "onnx-community/SmolLM2-135M-Instruct"
 MAX_BODY_BYTES = 2 * 1024 * 1024
 MAX_OUTPUT_TOKENS = 8192
 USER_AGENT = f"termed-onnx-server/{__version__}"
+# Hub base URL. Override with HF_ENDPOINT (e.g. https://hf-mirror.com) when
+# huggingface.co is blocked or resets connections on a corporate network.
+HUB = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
+# (connect+read) timeouts per attempt; network resets are common enough that a
+# single attempt is not good enough to decide a model cannot be fetched.
+LIST_TIMEOUT = 30
+DOWNLOAD_TIMEOUT = 120
 
 
 class ClientGone(Exception):
     """The client closed the connection mid-stream (for example a cancelled turn)."""
+
+
+class HubError(RuntimeError):
+    """The model could not be fetched from the Hub after several attempts."""
 
 
 def log(msg: str) -> None:
@@ -64,12 +75,44 @@ def default_cache_dir() -> str:
 # Model resolution / download
 # --------------------------------------------------------------------------
 
+def _open(req: urllib.request.Request, *, timeout: int, label: str,
+          attempts: int = 4):
+    """urlopen with exponential backoff.
+
+    A dropped TLS connection (WinError 10054 / ECONNRESET, proxy, VPN, or a
+    briefly unavailable Hub) used to abort the whole local fallback. These
+    are transient: retry before giving up.
+    """
+    last: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return urllib.request.urlopen(req, timeout=timeout)
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            last = exc
+            if attempt + 1 == attempts:
+                break
+            delay = 2 ** attempt
+            log(f"{label} failed ({exc}); retrying in {delay}s "
+                f"[{attempt + 1}/{attempts}]")
+            time.sleep(delay)
+    assert last is not None
+    if isinstance(last, ValueError):
+        raise last
+    raise HubError(
+        f"{label} failed after {attempts} attempts ({last}). "
+        f"Set HF_ENDPOINT to a reachable mirror, pass --model with a local "
+        f"directory, or pre-download with huggingface-cli "
+        f"(see docs/local-inference.md)."
+    ) from last
+
+
 def _download(url: str, dest: str) -> None:
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     tmp = dest + ".part"
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     log(f"downloading {url}")
-    with urllib.request.urlopen(req, timeout=120) as resp, open(tmp, "wb") as out:
+    with _open(req, timeout=DOWNLOAD_TIMEOUT, label=f"downloading {url}",
+               attempts=3) as resp, open(tmp, "wb") as out:
         while True:
             chunk = resp.read(1024 * 256)
             if not chunk:
@@ -79,9 +122,10 @@ def _download(url: str, dest: str) -> None:
 
 
 def _hf_wanted_files(repo: str) -> list[str]:
-    api = f"https://huggingface.co/api/models/{repo}"
+    api = f"{HUB}/api/models/{repo}"
     req = urllib.request.Request(api, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with _open(req, timeout=LIST_TIMEOUT,
+               label=f"listing files for {repo}") as resp:
         data = json.loads(resp.read().decode("utf-8"))
     names = [s.get("rfilename", "") for s in data.get("siblings", [])]
     keep = {
@@ -139,13 +183,7 @@ def resolve_model_dir(model: str, cache_dir: str) -> str:
     if find_onnx_file(cache) and os.path.isfile(os.path.join(cache, "tokenizer.json")):
         return cache
     log(f"fetching model {model} into {cache}")
-    try:
-        wanted = _hf_wanted_files(model)
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        raise RuntimeError(
-            f"could not list files for Hugging Face model {model!r} ({exc}); "
-            "check the network connection or pass --model with a local directory"
-        ) from exc
+    wanted = _hf_wanted_files(model)
     if not any(n.endswith(".onnx") for n in wanted):
         raise RuntimeError(f"model {model!r} has no .onnx files")
     if "tokenizer.json" not in [os.path.basename(n) for n in wanted]:
@@ -153,8 +191,22 @@ def resolve_model_dir(model: str, cache_dir: str) -> str:
     for name in wanted:
         dest = os.path.join(cache, name)
         if not os.path.isfile(dest):
-            _download(f"https://huggingface.co/{model}/resolve/main/{name}", dest)
+            _download(f"{HUB}/{model}/resolve/main/{name}", dest)
     return cache
+
+
+def prewarm(model: str, cache_dir: str) -> str:
+    """Download (or verify) a model without loading ONNX Runtime.
+
+    Lets a user fetch the model before an outage, on a machine that may not
+    have onnxruntime installed yet, so a later 503 fallback starts instantly.
+    """
+    model_dir = resolve_model_dir(model, cache_dir)
+    if not find_onnx_file(model_dir):
+        raise RuntimeError(f"no .onnx file in {model_dir}")
+    if not os.path.isfile(os.path.join(model_dir, "tokenizer.json")):
+        raise RuntimeError(f"no tokenizer.json in {model_dir}")
+    return model_dir
 
 
 def find_onnx_file(model_dir: str) -> str | None:
@@ -706,8 +758,18 @@ def main() -> int:
                         help="where downloaded models are cached")
     parser.add_argument("--max-tokens", type=int, default=MAX_OUTPUT_TOKENS,
                         help="server-side cap for a single completion")
+    parser.add_argument("--prewarm", action="store_true",
+                        help="download the model and exit (no ONNX Runtime needed)")
     args = parser.parse_args()
     MAX_TOKENS = max(1, min(args.max_tokens, MAX_OUTPUT_TOKENS))
+    if args.prewarm:
+        try:
+            model_dir = prewarm(args.model, args.cache_dir)
+        except RuntimeError as exc:
+            log(f"prewarm failed: {exc}")
+            return 1
+        log(f"model ready in {model_dir}")
+        return 0
     STATE = State(args.model)
     try:
         server = ThreadingHTTPServer((args.host, args.port), Handler)

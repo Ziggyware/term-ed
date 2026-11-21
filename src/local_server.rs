@@ -131,7 +131,10 @@ fn shutdown(http: &ureq::Agent, endpoint: &str) {
         .config()
         .timeout_per_call(Some(Duration::from_secs(2)))
         .build()
-        .call();
+        // Bodyless POST: `RequestBuilder<WithBody>` has `send`, not `call`
+        // (ureq 3.x). An empty JSON object keeps the request simple; the
+        // server ignores the body for this route.
+        .send("{}");
 }
 
 /// Ask the running server which model it loaded.
@@ -307,6 +310,34 @@ pub fn ensure_running<F: Fn() -> bool, P: Fn(Duration)>(
             )
         })?;
     wait_ready(http, endpoint, &model, Some(child), cancelled, progress)
+}
+
+/// Download (or verify) the model without starting the server, so a later
+/// 503 fallback does not wait on a cold download mid-outage. Needs only
+/// Python's stdlib: ONNX Runtime is not imported for this.
+pub fn prefetch(model: &str) -> Result<(), String> {
+    let script = materialize()?;
+    // The cache is shared by every endpoint, so only the model matters here.
+    eprintln!("Fetching {model} ...");
+    let status = Command::new(python())
+        .arg(&script)
+        .arg("--model")
+        .arg(model_for(model))
+        .arg("--prewarm")
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| format!("Could not run {}: {e}", python()))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Could not fetch {model}. Set HF_ENDPOINT to a mirror, or pass \
+             --local-model with a directory containing model.onnx and \
+             tokenizer.json (see docs/local-inference.md)."
+        ))
+    }
 }
 
 /// Run the embedded server in the foreground (the `--local-serve` entry

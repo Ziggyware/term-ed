@@ -16,6 +16,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -228,6 +229,27 @@ class ServerTests(unittest.TestCase):
         })
         self.assertEqual(status, 200, body)
 
+    def test_shutdown_accepts_a_body(self):
+        # ureq 3.x bodyless POSTs use send("{}"), so the route must not care
+        # whether a body is present.
+        state = onnx_server.State("shutdown-body-model")
+        onnx_server.STATE = state
+        server, port = start_server(state)
+        try:
+            result = {}
+            def call():
+                result["response"] = request(
+                    port, "POST", "/admin/shutdown", raw=b"{}"
+                )
+            worker = threading.Thread(target=call)
+            worker.start()
+            worker.join(timeout=10)
+            status, body = result["response"]
+            self.assertEqual(status, 200, body)
+            self.assertEqual(json.loads(body)["status"], "shutting_down")
+        finally:
+            onnx_server.STATE = self.state
+
     def test_tools_field_is_accepted_and_ignored(self):
         status, body = request(self.port, "POST", "/v1/chat/completions", {
             "messages": [{"role": "user", "content": "hello world"}],
@@ -271,13 +293,143 @@ class ServerTests(unittest.TestCase):
         onnx_server.STATE = state
         server, port = start_server(state)
         try:
-            status, body = request(port, "POST", "/admin/shutdown")
+            # Shut down from a thread: /admin/shutdown itself runs the server
+            # loop shutdown, which must not be awaited on its own thread.
+            body = {}
+            def call():
+                body["response"] = request(port, "POST", "/admin/shutdown")
+            worker = threading.Thread(target=call)
+            worker.start()
+            worker.join(timeout=10)
+            status, payload = body["response"]
             self.assertEqual(status, 200)
-            self.assertEqual(json.loads(body)["status"], "shutting_down")
+            self.assertEqual(json.loads(payload)["status"], "shutting_down")
         finally:
             server.shutdown()
             server.server_close()
             onnx_server.STATE = self.state
+
+
+class HubRetryTests(unittest.TestCase):
+    """A reset connection must not abort the local fallback.
+
+    Reproduces the Windows failure (`WinError 10054`, "existing connection was
+    forcibly closed") where one dropped TLS handshake made every 503 fallback
+    fail before the model was ever fetched.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cache = self.tmp.name
+        self.repo = "owner/termed-retry-test"
+        self.calls = 0
+        self.reset_attempts = 1
+        self.original_hub = onnx_server.HUB
+        self.original_sleep = onnx_server.time.sleep
+        onnx_server.time.sleep = lambda _s: None  # keep the test instant
+
+        server = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                server.calls += 1
+                if server.reset_attempts > 0:
+                    server.reset_attempts -= 1
+                    # Drop the connection without a response.
+                    self.close_connection = True
+                    self.connection.close()
+                    return
+                path = self.path
+                if path.startswith("/api/models/"):
+                    body = json.dumps({"siblings": [
+                        {"rfilename": "onnx/model.onnx"},
+                        {"rfilename": "tokenizer.json"},
+                        {"rfilename": "README.md"},
+                    ]}).encode()
+                elif path.endswith("/resolve/main/onnx/model.onnx"):
+                    body = b"fake-onnx-bytes"
+                elif path.endswith("/resolve/main/tokenizer.json"):
+                    body = b"{}"
+                else:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        port = self.server.server_address[1]
+        onnx_server.HUB = f"http://127.0.0.1:{port}"
+
+    def tearDown(self):
+        onnx_server.HUB = self.original_hub
+        onnx_server.time.sleep = self.original_sleep
+        self.server.shutdown()
+        self.server.server_close()
+        self.tmp.cleanup()
+
+    def test_a_dropped_connection_is_retried_instead_of_failing(self):
+        model_dir = onnx_server.resolve_model_dir(self.repo, self.cache)
+        # One reset, then a successful listing and downloads.
+        self.assertEqual(self.reset_attempts, 0)
+        self.assertEqual(
+            os.path.basename(model_dir), self.repo.replace("/", "--")
+        )
+        self.assertTrue(
+            os.path.isfile(os.path.join(model_dir, "onnx", "model.onnx"))
+        )
+        self.assertTrue(os.path.isfile(os.path.join(model_dir, "tokenizer.json")))
+        # Unlisted files are never fetched.
+        self.assertFalse(os.path.isfile(os.path.join(model_dir, "README.md")))
+        # No leftover partial downloads.
+        partials = [
+            name
+            for _root, _dirs, files in os.walk(model_dir)
+            for name in files
+            if name.endswith(".part")
+        ]
+        self.assertEqual(partials, [])
+
+    def test_persistent_failure_explains_the_mirror_and_offline_options(self):
+        self.reset_attempts = 99
+        with self.assertRaises(RuntimeError) as error:
+            onnx_server.resolve_model_dir(self.repo, self.cache)
+        message = str(error.exception)
+        self.assertIn("after 4 attempts", message)
+        self.assertIn("HF_ENDPOINT", message)
+        self.assertIn("--model", message)
+        # It retried rather than failing on the first reset.
+        self.assertGreaterEqual(self.calls, 4)
+
+    def test_cached_model_needs_no_network(self):
+        onnx_server.resolve_model_dir(self.repo, self.cache)
+        before = self.calls
+        onnx_server.HUB = "http://127.0.0.1:9"  # unroutable: must not be used
+        again = onnx_server.resolve_model_dir(self.repo, self.cache)
+        self.assertEqual(again, os.path.join(
+            self.cache, self.repo.replace("/", "--")))
+        self.assertEqual(self.calls, before)
+
+
+class PrewarmTests(unittest.TestCase):
+    """Prewarming fetches the model without needing ONNX Runtime."""
+
+    def test_prewarm_a_local_directory_needs_no_runtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model = build_tiny_model(os.path.join(tmp, "m"))
+            self.assertEqual(onnx_server.prewarm(model, tmp), model)
+
+    def test_prewarm_rejects_a_directory_without_a_tokenizer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            open(os.path.join(tmp, "model.onnx"), "wb").close()
+            with self.assertRaises(RuntimeError) as error:
+                onnx_server.prewarm(tmp, tmp)
+            self.assertIn("tokenizer.json", str(error.exception))
 
 
 class UnitTests(unittest.TestCase):
