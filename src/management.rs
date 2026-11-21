@@ -160,7 +160,7 @@ fn hint(field: Field) -> &'static str {
             "Empty uses the provider default or discovers a custom server model. Set an exact ID to override."
         }
         Field::Endpoint => {
-            "Built-in only. Try https://kono-router.onrender.com or http://127.0.0.1:8080; include /v1 for other servers if needed."
+            "Built-in only. Try https://kono-router.onrender.com or http://127.0.0.1:8080; a bare host gets /v1, other paths are used as written."
         }
         Field::ApiKeyEnv => {
             "Environment variable NAME only (e.g. OPENAI_API_KEY). Never paste a secret here"
@@ -984,7 +984,14 @@ fn set_field(a: &mut AgentConfig, field: Field, input: &str) -> Result<()> {
         Field::Model => a.model = input.into(),
         Field::Endpoint => {
             let endpoint = input.trim().trim_end_matches('/');
-            if !endpoint.is_empty() && !crate::provider::pinned_router(endpoint) {
+            if endpoint.is_empty() {
+                // Clearing the URL must not strand a configuration that is only
+                // custom because of that URL: `custom` without an endpoint
+                // fails validation and blocks every later menu save.
+                if a.provider == "custom" {
+                    a.use_router();
+                }
+            } else if !crate::provider::pinned_router(endpoint) {
                 if a.uses_router() {
                     // Do not carry the NoKey credential or its default model
                     // across when changing to a different server.

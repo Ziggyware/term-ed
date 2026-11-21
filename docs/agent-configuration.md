@@ -25,10 +25,10 @@ Open **F1 → Agent: Configure AI Agent** (or **F1, Alt+A**). Use the **builtin*
 
 | Server | API base URL | Model |
 | --- | --- | --- |
-| Kono Router | `https://kono-router.onrender.com` | Leave empty for `free:auto`, or enter a model ID advertised by Kono |
+| Kono Router | `https://kono-router.onrender.com` | Leave empty for `free:tools` (the tool-capable lane), or enter a model ID advertised by Kono |
 | llama.cpp | `http://127.0.0.1:8080` | Leave empty to discover the loaded model via `/v1/models`, or use the model's exact ID or `--alias` |
 
-`/v1` is added automatically to these root URLs. For another server, include its API prefix if required. Leave **API key environment variable** empty for an unauthenticated server; if your deployment requires a key, enter the name of the environment variable holding it. For Kono, use a separate variable such as `KONO_API_KEY` for the Kono credential. The saved NoKey Router credential and the reserved `ROUTER_API_KEY` variable are not forwarded to either server.
+`/v1` is added automatically to a base URL with no path (`http://192.168.1.20:8080`, `https://api.example.com`). A URL that already has a path is used verbatim, so include any other API prefix yourself. Setting an API base URL also selects the custom provider when the built-in provider is still `router`, so a settings file never silently keeps using the router. Leave **API key environment variable** empty for an unauthenticated server; if your deployment requires a key, enter the name of the environment variable holding it. For Kono, use a separate variable such as `KONO_API_KEY` for the Kono credential. The saved NoKey Router credential and the reserved `ROUTER_API_KEY` variable are not forwarded to either server.
 
 Run `llama-server` on the same machine as Termed and wait for the model to load before opening the agent. Use a tool-capable instruct model with a compatible chat template; llama.cpp may need `--jinja` for tool calls. With an 8,192-token context, start with a smaller **Model output token budget** (e.g. 1,024) to leave room for instructions, tools, and history. If the server is still starting or Kono is waking from sleep, retry once it is ready.
 

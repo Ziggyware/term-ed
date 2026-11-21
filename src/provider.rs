@@ -15,10 +15,14 @@ pub fn pinned_router(endpoint: &str) -> bool {
 
 pub const KONO_ORIGIN: &str = "https://kono-router.onrender.com";
 pub const KONO_ENDPOINT: &str = "https://kono-router.onrender.com/v1";
-pub const KONO_MODEL: &str = "free:auto";
+/// Kono routes by lane capability; `free:auto` reaches models that answer in
+/// prose without calling tools, so the agent asks for the tool-capable lane.
+pub const KONO_MODEL: &str = "free:tools";
 
-/// Accept the root URLs users see in the Kono and llama.cpp launch output.
-/// Other custom URLs may have a deliberately unversioned API or a proxy path.
+/// Accept the root URLs users see in the Kono and OpenAI-compatible launch
+/// output. A bare origin (`https://host`, `http://host:port`, loopback included)
+/// gets the conventional `/v1`; any URL with a path is used verbatim, so a
+/// deliberately unversioned API or a proxy path keeps working.
 pub fn custom_endpoint(input: &str) -> String {
     let base = input.trim().trim_end_matches('/');
     let base = base.strip_suffix("/chat/completions").unwrap_or(base);
@@ -29,13 +33,15 @@ pub fn custom_endpoint(input: &str) -> String {
         .strip_prefix("http://")
         .or_else(|| base.strip_prefix("https://"))
     {
+        let pathless = authority.split_once('/').is_none_or(|(_, path)| path.is_empty());
         let (host, port) = if let Some(rest) = authority.strip_prefix("[::1]") {
             ("[::1]", rest)
         } else {
             let host = authority.split(':').next().unwrap_or("");
             (host, &authority[host.len()..])
         };
-        if matches!(host, "localhost" | "127.0.0.1" | "[::1]")
+        if pathless
+            && !host.is_empty()
             && (port.is_empty() || port.strip_prefix(':').is_some_and(|p| p.parse::<u16>().is_ok()))
         {
             return format!("{base}/v1");
@@ -105,10 +111,16 @@ mod tests {
     fn accepts_kono_and_llama_cpp_urls_without_relaxing_router_auth() {
         for (input, expected) in [
             (KONO_ORIGIN, KONO_ENDPOINT),
+            ("https://kono-router.onrender.com/v1", KONO_ENDPOINT),
             ("http://127.0.0.1:8080/", "http://127.0.0.1:8080/v1"),
             ("http://[::1]:8080", "http://[::1]:8080/v1"),
             ("http://localhost:8080/v1/chat/completions", "http://localhost:8080/v1"),
+            // Other hosts are OpenAI-compatible roots too: a LAN llama.cpp or
+            // Ollama box and a bare HTTPS provider both need `/v1`.
+            ("http://192.168.1.20:8080", "http://192.168.1.20:8080/v1"),
+            ("https://api.example.com", "https://api.example.com/v1"),
             ("https://example.com/proxy", "https://example.com/proxy"),
+            ("http://localhost:11434/api", "http://localhost:11434/api"),
         ] {
             assert_eq!(custom_endpoint(input), expected);
         }

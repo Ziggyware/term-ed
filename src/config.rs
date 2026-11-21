@@ -118,8 +118,17 @@ impl Default for AgentConfig {
 }
 
 impl AgentConfig {
+    /// A nonempty endpoint that is not the pinned router is an explicit custom
+    /// server, even when the provider was left at its `router` default. Without
+    /// this, a settings file that only sets the API base URL silently keeps
+    /// using the NoKey Router instead of the server the user chose.
+    pub fn custom_endpoint_selected(&self) -> bool {
+        !self.endpoint.trim().is_empty() && !crate::provider::pinned_router(&self.endpoint)
+    }
+
     pub fn uses_router(&self) -> bool {
-        self.provider == "router" || crate::provider::pinned_router(&self.endpoint)
+        crate::provider::pinned_router(&self.endpoint)
+            || (self.provider == "router" && !self.custom_endpoint_selected())
     }
 
     pub fn use_router(&mut self) {
@@ -145,14 +154,6 @@ impl AgentConfig {
             && self.endpoint.trim_end_matches('/') != crate::builtin_agent::GATEWAY
         {
             bail!("Kilo uses its default gateway; choose auto/custom for another API base URL");
-        }
-        if self.provider == "router"
-            && !self.endpoint.is_empty()
-            && !crate::provider::pinned_router(&self.endpoint)
-        {
-            bail!(
-                "The router provider only accepts its pinned HTTPS endpoint; choose custom for another server"
-            );
         }
         if self.uses_router()
             && !self.api_key_env.is_empty()
@@ -720,6 +721,42 @@ mod command_policy_tests {
         assert!(text.contains("\"commands\":\"allow\""), "{text}");
         let back: AgentConfig = serde_json::from_str(&text).unwrap();
         assert_eq!(back.commands, CommandPolicy::Allow);
+    }
+
+    #[test]
+    fn explicit_endpoint_overrides_the_default_router_provider() {
+        // Setting only the API base URL (the documented Kono/llama.cpp flow)
+        // must not be ignored or rejected because `provider` kept its default.
+        let kono = AgentConfig {
+            endpoint: "https://kono-router.onrender.com".into(),
+            ..Default::default()
+        };
+        assert_eq!(kono.provider, "router");
+        assert!(!kono.uses_router());
+        assert_eq!(
+            crate::provider::endpoint(&kono),
+            crate::provider::KONO_ENDPOINT
+        );
+        kono.validate().unwrap();
+
+        let lan = AgentConfig {
+            endpoint: "http://192.168.1.20:8080".into(),
+            ..Default::default()
+        };
+        assert!(!lan.uses_router());
+        assert_eq!(
+            crate::provider::endpoint(&lan),
+            "http://192.168.1.20:8080/v1"
+        );
+        lan.validate().unwrap();
+
+        // The pinned endpoint still selects the router regardless of provider.
+        let pinned = AgentConfig {
+            provider: "custom".into(),
+            endpoint: crate::provider::ROUTER_ORIGIN.into(),
+            ..Default::default()
+        };
+        assert!(pinned.uses_router());
     }
 
     #[test]

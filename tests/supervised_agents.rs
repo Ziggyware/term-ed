@@ -245,14 +245,24 @@ fn nested_inheritance_keeps_instructions_skills_provider_and_all_restrictions() 
     .restricted_by(&root);
     assert!(!foreign.uses_router());
     assert!(foreign.api_key_env.is_empty());
+    // A foreign endpoint turns the default router provider into a custom
+    // server instead of rejecting the whole settings file; the router
+    // credential is still never attached to it.
+    let foreign_router = AgentConfig {
+        provider: "router".into(),
+        endpoint: "https://different.invalid/v1".into(),
+        ..Default::default()
+    };
+    foreign_router.validate().unwrap();
+    assert!(!foreign_router.uses_router());
+    assert_eq!(
+        termed::provider::endpoint(&foreign_router),
+        "https://different.invalid/v1"
+    );
     assert!(
-        AgentConfig {
-            provider: "router".into(),
-            endpoint: "https://different.invalid/v1".into(),
-            ..Default::default()
-        }
-        .validate()
-        .is_err()
+        termed::provider::authorization(&foreign_router, "https://different.invalid/v1")
+            .unwrap()
+            .is_none()
     );
     assert!(
         AgentConfig {

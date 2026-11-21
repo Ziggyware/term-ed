@@ -25,13 +25,13 @@
     "denied_plugins": [],
     "skills": [],
     "sub_agents": true,
-    "max_delegations": 1024,
+    "max_delegations": 64,
     "task_timeout_secs": 1800,
     "max_agent_depth": 2,
     "max_concurrent_tasks": 8,
     "stall_timeout_secs": 150,
     "generated_tools": true,
-    "max_output_tokens": 800000,
+    "max_output_tokens": 16384,
     "auto_context": true
   },
   "sub_agents": [
@@ -56,13 +56,13 @@
         "denied_plugins": [],
         "skills": [],
         "sub_agents": false,
-        "max_delegations": 1024,
+        "max_delegations": 64,
         "task_timeout_secs": 1000,
         "max_agent_depth": 2,
         "max_concurrent_tasks": 8,
-        "stall_timeout_secs": 1000,
+        "stall_timeout_secs": 600,
         "generated_tools": true,
-        "max_output_tokens": 1000000,
+        "max_output_tokens": 16384,
         "auto_context": true
       }
     },
@@ -87,13 +87,13 @@
         "denied_plugins": [],
         "skills": [],
         "sub_agents": false,
-        "max_delegations": 1024,
+        "max_delegations": 64,
         "task_timeout_secs": 1000,
         "max_agent_depth": 2,
         "max_concurrent_tasks": 8,
-        "stall_timeout_secs": 1000,
+        "stall_timeout_secs": 600,
         "generated_tools": true,
-        "max_output_tokens": 1000000,
+        "max_output_tokens": 16384,
         "auto_context": true
       }
     },
@@ -118,13 +118,13 @@
         "denied_plugins": [],
         "skills": [],
         "sub_agents": true,
-        "max_delegations": 1024,
+        "max_delegations": 64,
         "task_timeout_secs": 1000,
         "max_agent_depth": 2,
         "max_concurrent_tasks": 8,
-        "stall_timeout_secs": 1000,
+        "stall_timeout_secs": 600,
         "generated_tools": true,
-        "max_output_tokens": 1000000,
+        "max_output_tokens": 16384,
         "auto_context": true
       }
     }

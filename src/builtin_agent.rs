@@ -453,10 +453,26 @@ impl Worker {
                         crate::provider::router_models()
                     } else if self.options.endpoint.is_empty() {
                         free_models(&self.http)
-                    } else if self.model.is_empty() {
-                        custom_models(&self.http, &self.options).unwrap_or_default()
                     } else {
-                        vec![(self.model.clone(), self.model.clone())]
+                        // Custom server. Discovery is required when no model was
+                        // chosen; Kono advertises a whole lane pool, so the
+                        // picker is only useful if it is fetched there too.
+                        let kono = crate::provider::endpoint(&self.options)
+                            == crate::provider::KONO_ENDPOINT;
+                        let mut models = Vec::new();
+                        if !self.model.is_empty() {
+                            models.push((self.model.clone(), self.model.clone()));
+                        }
+                        if models.is_empty() || kono {
+                            for (id, name) in
+                                custom_models(&self.http, &self.options).unwrap_or_default()
+                            {
+                                if !models.iter().any(|(v, _)| *v == id) {
+                                    models.push((id, name));
+                                }
+                            }
+                        }
+                        models
                     };
                 }
                 if self.model.is_empty() && let Some((id, _)) = self.models.first() {
