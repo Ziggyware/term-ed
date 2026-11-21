@@ -39,6 +39,43 @@ receives the router key, and no prompt leaves the machine.
   `onnx-community/Qwen2.5-0.5B-Instruct`) or to a local directory containing
   `model.onnx` and `tokenizer.json` to use something else.
 
+### When Hugging Face is unreachable
+
+The server retries the file listing and each download with backoff (4 attempts
+for the listing, 3 per file), because drops like Windows `WinError 10054`
+("an existing connection was forcibly closed", typical of proxies, VPNs and
+filtering middleboxes) are usually transient. Downloaded files are written as
+`.part` and renamed only when complete, so a retry resumes cleanly and never
+leaves a corrupt cache.
+
+If the Hub is blocked outright, point at a mirror or pre-download:
+
+```sh
+# A reachable mirror (e.g. hf-mirror.com)
+HF_ENDPOINT=https://hf-mirror.com termed --local-serve
+
+# Or fetch into termed's cache ahead of time, so an outage never waits on it
+termed --local-prefetch          # uses the embedded server; needs no onnxruntime
+
+# The same thing with the Hugging Face client, if you prefer a progress bar
+pip install huggingface_hub
+huggingface-cli download onnx-community/SmolLM2-135M-Instruct \
+  --include "*.onnx" "*.onnx.data" "tokenizer.json" "tokenizer_config.json" \
+            "config.json" "generation_config.json" \
+  --local-dir ~/.config/termed/onnx-models/onnx-community--SmolLM2-135M-Instruct
+```
+
+On Windows the cache path is
+`%USERPROFILE%\.config\termed\onnx-models\onnx-community--SmolLM2-135M-Instruct`,
+and `huggingface-cli` is `huggingface-cli.exe`. Any directory with
+`model.onnx` and `tokenizer.json` also works directly: set **Model** to that
+path and nothing is fetched at all. Running `termed --local-serve` once
+downloads the model with visible progress, so a later 503 fallback starts in
+about a second.
+
+Model files are cached per repository; once present, no network is used at
+all, and a cached model is verified without touching the Hub.
+
 termed writes the embedded server to
 `$XDG_CONFIG_HOME/termed/onnx_server.py`, starts it on the loopback address
 of the configured endpoint, and waits for `/healthz` to report the model
@@ -67,6 +104,7 @@ or on a machine where termed cannot start it):
 termed --local-serve                          # 127.0.0.1:8080, default model
 termed --local-serve --local-model onnx-community/Qwen2.5-0.5B-Instruct
 termed --local-serve --local-port 9090
+termed --local-prefetch                       # just download/verify the model
 ```
 
 ## What to expect
@@ -102,7 +140,7 @@ router, without touching local inference.
 
 ```sh
 pip install -r local_inference/requirements-dev.txt          # adds `onnx`
-python3 -m unittest discover -s local_inference/tests -v     # 18 server tests
+python3 -m unittest discover -s local_inference/tests -v     # 24 server tests
 cargo test --test local_inference                            # 503 → local, end to end
 ```
 
