@@ -29,14 +29,21 @@ pub fn syntax_set() -> &'static SyntaxSet {
 pub fn detect_syntax(path: Option<&std::path::Path>, first_line: &str) -> &'static SyntaxReference {
     let ss = syntax_set();
     if let Some(p) = path {
+        // `find_syntax_by_extension` is case-sensitive, while project files
+        // commonly use upper-case extensions (README.MD, Main.CS, etc.).
+        // Match both the complete filename (for Dockerfile/Makefile-style
+        // grammars) and a normalized extension.
         let name = p
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        if let Some(s) = ss.find_syntax_by_extension(&name) {
+        let lower_name = name.to_ascii_lowercase();
+        if let Some(s) = ss.find_syntax_by_extension(&name)
+            .or_else(|| ss.find_syntax_by_extension(&lower_name))
+        {
             return s;
         }
-        if let Some(ext) = p.extension().map(|e| e.to_string_lossy().into_owned()) {
+        if let Some(ext) = p.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()) {
             if let Some(s) = ss.find_syntax_by_extension(&ext) {
                 return s;
             }
@@ -46,6 +53,7 @@ pub fn detect_syntax(path: Option<&std::path::Path>, first_line: &str) -> &'stat
                 "jsx" | "mjs" | "cjs" => Some("js"),
                 "h" | "hh" | "hxx" => Some("cpp"),
                 "kts" => Some("kt"),
+                "mdx" => Some("md"),
                 _ => None,
             };
             if let Some(s) = alias.and_then(|a| ss.find_syntax_by_extension(a)) {
@@ -262,23 +270,13 @@ impl HighlightCache {
             text.push('\n');
         }
         if text.len() > MAX_LINE_BYTES {
-            let fg = theme
-                .settings
-                .foreground
-                .map(|c| from_syntect(c, bg))
-                .unwrap_or(Color::Reset);
-            let end = text.chars().count();
-            return LineHighlight {
-                spans: vec![StyledSpan {
-                    start: 0,
-                    end,
-                    fg,
-                    bold: false,
-                    italic: false,
-                    underline: false,
-                }],
-                brackets: Vec::new(),
-            };
+            // Skip rendering expensive token spans for minified/data lines,
+            // but still advance both parser and highlighter state. Otherwise
+            // a long string/comment on one line leaves every following line
+            // in the wrong scope and syntax highlighting appears broken.
+            let ops = cp.parse.parse_line(text, syntax_set()).unwrap_or_default();
+            for _ in HighlightIterator::new(&mut cp.hl, &ops, text, highlighter) {}
+            return LineHighlight::default();
         }
         highlight_line(text, cp, highlighter, syntax_set(), bg)
     }
@@ -445,5 +443,26 @@ mod tests {
         let (c, _) = cache_for("public class Foo { }\n", "cs");
         let first = &c.line(0).unwrap().spans[0];
         assert_eq!(first.fg, crate::theme::hex("#569CD6"));
+    }
+
+    #[test]
+    fn uppercase_extensions_are_detected() {
+        assert_eq!(
+            detect_syntax(Some(std::path::Path::new("Main.RS")), "").name,
+            "Rust"
+        );
+    }
+
+    #[test]
+    fn long_unhighlighted_line_keeps_parser_scope_in_sync() {
+        let mut long_comment = String::from("/*");
+        long_comment.push_str(&"x".repeat(MAX_LINE_BYTES + 100));
+        long_comment.push_str("\nstill in comment\n");
+        let (long_cache, _) = cache_for(&long_comment, "rs");
+        let (short_cache, _) = cache_for("/* x\nstill in comment\n", "rs");
+        assert_eq!(
+            long_cache.line(1).unwrap().spans[0].fg,
+            short_cache.line(1).unwrap().spans[0].fg
+        );
     }
 }

@@ -107,11 +107,23 @@ impl Explorer {
     }
 
     pub fn rebuild(&mut self) {
+        // Keep selection attached to the same path when a refresh or folder
+        // toggle changes row indices; otherwise users unexpectedly jump to a
+        // different file after the tree is rebuilt.
+        let selected_path = self.selected_entry().map(|e| e.path.clone());
         let mut out = Vec::new();
         let root = self.root.clone();
         self.push_dir(&root, 0, &mut out);
         self.entries = out;
-        self.selected = self.selected.min(self.entries.len().saturating_sub(1));
+        self.selected = selected_path
+            .and_then(|path| self.entries.iter().position(|e| e.path == path))
+            .unwrap_or_else(|| self.selected.min(self.entries.len().saturating_sub(1)));
+        if self.entries.is_empty() {
+            self.selected = 0;
+            self.scroll = 0;
+        } else {
+            self.scroll = self.scroll.min(self.entries.len() - 1);
+        }
     }
 
     fn push_dir(&mut self, dir: &Path, depth: usize, out: &mut Vec<Entry>) {
@@ -201,11 +213,23 @@ impl Explorer {
     }
 
     pub fn ensure_visible(&mut self, height: usize) {
+        if self.entries.is_empty() {
+            self.selected = 0;
+            self.scroll = 0;
+            return;
+        }
+        self.selected = self.selected.min(self.entries.len() - 1);
+        if height == 0 {
+            self.scroll = 0;
+            return;
+        }
+        let max_scroll = self.entries.len().saturating_sub(height);
         if self.selected < self.scroll {
             self.scroll = self.selected;
-        } else if height > 0 && self.selected >= self.scroll + height {
+        } else if self.selected >= self.scroll.saturating_add(height) {
             self.scroll = self.selected + 1 - height;
         }
+        self.scroll = self.scroll.min(max_scroll);
     }
 }
 
@@ -225,4 +249,55 @@ pub fn project_files(root: &Path, limit: usize) -> Vec<String> {
         .collect();
     files.sort();
     files
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_project() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "termed-explorer-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join("folder")).unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(root.join(name), "").unwrap();
+        }
+        std::fs::write(root.join("folder/nested.txt"), "").unwrap();
+        root
+    }
+
+    #[test]
+    fn selection_survives_tree_refresh_and_expansion() {
+        let root = temp_project();
+        let mut ex = Explorer::new(root.clone());
+        let target = root.join("b.txt");
+        ex.reveal(&target);
+        ex.refresh();
+        assert_eq!(ex.selected_entry().unwrap().path, target);
+        let folder = ex.entries.iter().position(|e| e.name == "folder").unwrap();
+        ex.toggle(folder);
+        assert!(ex.entries.iter().any(|e| e.path == target));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ensure_visible_clamps_selection_and_scroll_for_small_viewports() {
+        let root = temp_project();
+        let mut ex = Explorer::new(root.clone());
+        ex.selected = usize::MAX;
+        ex.scroll = usize::MAX;
+        ex.ensure_visible(2);
+        assert_eq!(ex.selected, ex.entries.len() - 1);
+        assert_eq!(ex.scroll, ex.entries.len() - 2);
+        ex.ensure_visible(0);
+        assert_eq!((ex.selected, ex.scroll), (ex.entries.len() - 1, 0));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
