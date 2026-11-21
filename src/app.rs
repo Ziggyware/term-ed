@@ -375,6 +375,7 @@ pub struct Layout {
     pub tabs: Vec<(Rect, Rect, usize)>,
     pub sidebar: Rect,
     pub sidebar_list: Rect,
+    pub sidebar_scrollbar: Rect,
     pub editor: Rect,
     pub gutter: Rect,
     pub text: Rect,
@@ -430,6 +431,7 @@ enum Drag {
     Scrollbar,
     Minimap,
     SidebarResize,
+    ExplorerScrollbar,
     SearchScrollbar,
 }
 
@@ -973,9 +975,31 @@ impl App {
             c => c,
         };
 
+        self.alt_paste = false;
         if self.dialog.is_some() {
             self.dialog_key(code);
             return;
+        }
+        // Keep project search and the documented menu mnemonics global, even
+        // when a terminal or another docked panel currently owns input.
+        if ctrl && shift && code == KeyCode::Char('f') {
+            self.palette = None;
+            self.run(Command::FindInFiles);
+            return;
+        }
+        if alt && !ctrl && !shift {
+            match code {
+                KeyCode::Char('e') => {
+                    self.run(Command::CommandPalette);
+                    return;
+                }
+                KeyCode::Char('i') => {
+                    self.palette = None;
+                    self.run(Command::Find);
+                    return;
+                }
+                _ => {}
+            }
         }
         self.alt_paste = alt && !ctrl && !shift && code == KeyCode::Char('v');
         if (ctrl && code == KeyCode::Char('v') && !alt
@@ -1301,12 +1325,12 @@ impl App {
         match code {
             KeyCode::Up => self.explorer.move_selection(-1),
             KeyCode::Down => self.explorer.move_selection(1),
-            KeyCode::PageUp => self
-                .explorer
-                .move_selection(-(self.layout.sidebar_list.height as isize)),
-            KeyCode::PageDown => self
-                .explorer
-                .move_selection(self.layout.sidebar_list.height as isize),
+            KeyCode::PageUp => self.explorer.move_selection(
+                -(self.layout.sidebar_list.height.max(1) as isize),
+            ),
+            KeyCode::PageDown => self.explorer.move_selection(
+                self.layout.sidebar_list.height.max(1) as isize,
+            ),
             KeyCode::Home => self.explorer.selected = 0,
             KeyCode::End => self.explorer.selected = self.explorer.entries.len().saturating_sub(1),
             KeyCode::Right => self.explorer.expand(),
@@ -1317,6 +1341,8 @@ impl App {
             }
             _ => {}
         }
+        self.explorer
+            .ensure_visible(self.layout.sidebar_list.height as usize);
         let errors = std::mem::take(&mut self.explorer.errors);
         for error in errors {
             self.toast(error, ToastKind::Error);
@@ -1545,6 +1571,8 @@ impl App {
                 if let Some(p) = self.editor().and_then(|e| e.doc.path.clone()) {
                     self.show_sidebar = true;
                     self.explorer.reveal(&p);
+                    self.explorer
+                        .ensure_visible(self.layout.sidebar_list.height as usize);
                     self.focus = Focus::Explorer;
                 }
             }
@@ -3822,6 +3850,11 @@ impl App {
                 return;
             }
         }
+        if l.sidebar_scrollbar.contains(pos) {
+            self.drag = Some(Drag::ExplorerScrollbar);
+            self.explorer_scroll_to(pos.y);
+            return;
+        }
         if l.sidebar.width > 0
             && pos.x == l.sidebar.x + l.sidebar.width - 1
             && l.sidebar.contains(pos)
@@ -3832,13 +3865,11 @@ impl App {
         if l.sidebar_list.contains(pos) {
             self.focus = Focus::Explorer;
             let i = self.explorer.scroll + (pos.y - l.sidebar_list.y) as usize;
-            if i < self.explorer.entries.len() {
+            if let Some(clicked) = self.explorer.entries.get(i) {
+                let was_directory = clicked.is_dir;
                 self.explorer.selected = i;
                 self.activate_explorer_entry();
-                if !self.explorer.entries
-                    [self.explorer.selected.min(self.explorer.entries.len() - 1)]
-                .is_dir
-                {
+                if !was_directory {
                     self.focus = Focus::Editor;
                 }
             }
@@ -3914,9 +3945,26 @@ impl App {
                     }
                 }
             }
+            // Mouse placement and keyboard movement share the same caret
+            // model. Reset the remembered vertical column just as move_to()
+            // does, and keep the resulting caret visible immediately.
             e.preferred_col = None;
+            e.scroll_into_view();
             self.drag = Some(Drag::Text);
         }
+    }
+
+    fn explorer_scroll_to(&mut self, y: u16) {
+        let track = self.layout.sidebar_scrollbar;
+        let total = self.explorer.entries.len();
+        let page = track.height as usize;
+        let max = total.saturating_sub(page);
+        let row = y.saturating_sub(track.y) as usize;
+        self.explorer.scroll = if track.height <= 1 {
+            0
+        } else {
+            row.min(page - 1) * max / (page - 1)
+        };
     }
 
     fn search_scroll_to(&mut self, y: u16) {
@@ -3950,6 +3998,7 @@ impl App {
                     && let Some(e) = self.editor_mut()
                 {
                     e.sel = Selection::new(e.sel.anchor, idx);
+                    e.preferred_col = None;
                 }
             }
             Some(Drag::Box) => {
@@ -3981,6 +4030,7 @@ impl App {
                 }
             }
             Some(Drag::SearchScrollbar) => self.search_scroll_to(pos.y),
+            Some(Drag::ExplorerScrollbar) => self.explorer_scroll_to(pos.y),
             Some(Drag::SidebarResize) => {
                 self.sidebar_width = pos.x.saturating_sub(l.sidebar.x).clamp(16, 80);
             }

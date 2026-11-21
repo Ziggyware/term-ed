@@ -232,7 +232,7 @@ fn render_title(buf: &mut Buffer, area: Rect, app: &mut App) {
         ("File", Command::CommandPalette),
         ("Edit", Command::CommandPalette),
         ("View", Command::CommandPalette),
-        ("Search", Command::FindInFiles),
+        ("Find", Command::Find),
         ("Plugins", Command::Plugins),
         ("Settings", Command::Settings),
     ] {
@@ -504,12 +504,18 @@ fn render_sidebar(buf: &mut Buffer, area: Rect, app: &mut App) {
     let list = Rect::new(
         area.x,
         area.y + 2,
-        area.width.saturating_sub(1),
+        area.width.saturating_sub(2),
         area.height.saturating_sub(2),
+    );
+    let scrollbar = Rect::new(
+        list.right(),
+        list.y,
+        if area.width > 1 { 1 } else { 0 },
+        list.height,
     );
     app.layout.sidebar = area;
     app.layout.sidebar_list = list;
-    app.explorer.ensure_visible(list.height as usize);
+    app.layout.sidebar_scrollbar = scrollbar;
 
     let active_path = app.editor().and_then(|e| e.doc.path.clone());
     let dirty: Vec<std::path::PathBuf> = app
@@ -637,6 +643,41 @@ fn render_sidebar(buf: &mut Buffer, area: Rect, app: &mut App) {
                 "●",
                 fgbg(pal.warning, row_bg),
                 list.right(),
+            );
+        }
+    }
+    // A dedicated, draggable thumb makes the full tree reachable even when
+    // mouse-wheel events are unavailable or the project has many entries.
+    let total = ex.entries.len();
+    let page = scrollbar.height as usize;
+    if scrollbar.width > 0 && page > 0 && total > 0 {
+        let thumb = if total <= page {
+            page
+        } else {
+            (page * page / total).max(1)
+        };
+        let max_scroll = total.saturating_sub(page);
+        let thumb_top = if max_scroll == 0 {
+            0
+        } else {
+            ex.scroll.min(max_scroll) * page.saturating_sub(thumb) / max_scroll
+        };
+        for row in 0..page {
+            let glyph = if (thumb_top..thumb_top + thumb).contains(&row) {
+                "█"
+            } else {
+                "│"
+            };
+            put(
+                buf,
+                scrollbar.x,
+                scrollbar.y + row as u16,
+                glyph,
+                fgbg(
+                    if glyph == "█" { pal.accent } else { pal.sidebar_dim },
+                    pal.sidebar_bg,
+                ),
+                scrollbar.right(),
             );
         }
     }

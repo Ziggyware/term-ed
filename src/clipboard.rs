@@ -13,6 +13,9 @@ pub struct Clipboard {
     text: String,
     /// True when the text was copied as whole lines (copy with no selection).
     pub whole_line: bool,
+    /// Native clipboard programs are probed once and then reused. Without
+    /// this, every Alt+V/Ctrl+V spawns several known-missing programs first.
+    paste_tool: Option<usize>,
 }
 
 const COPY_TOOLS: &[(&str, &[&str])] = &[
@@ -113,10 +116,24 @@ impl Clipboard {
             return self.text.clone();
         }
         if graphical_session() {
-            for (cmd, args) in PASTE_TOOLS {
+            // Retry the last successful provider first. This avoids a series
+            // of process launches on every paste on machines with only one
+            // clipboard utility installed.
+            if let Some(i) = self.paste_tool {
+                let (cmd, args) = PASTE_TOOLS[i];
+                match Command::new(cmd).args(*args).stderr(Stdio::null()).output() {
+                    Ok(out) if out.status.success() => {
+                        self.update_from_system(&String::from_utf8_lossy(&out.stdout));
+                        return self.text.clone();
+                    }
+                    _ => self.paste_tool = None,
+                }
+            }
+            for (i, (cmd, args)) in PASTE_TOOLS.iter().enumerate() {
                 if let Ok(out) = Command::new(cmd).args(*args).stderr(Stdio::null()).output()
                     && out.status.success()
                 {
+                    self.paste_tool = Some(i);
                     self.update_from_system(&String::from_utf8_lossy(&out.stdout));
                     break;
                 }
@@ -144,7 +161,11 @@ mod tests {
 
     #[test]
     fn changing_only_final_newlines_invalidates_whole_line_metadata() {
-        let mut c = Clipboard { text: "a\n".into(), whole_line: true };
+        let mut c = Clipboard {
+            text: "a\n".into(),
+            whole_line: true,
+            ..Clipboard::default()
+        };
         c.update_from_system("a\r\n");
         assert!(c.whole_line);
         c.update_from_system("a");

@@ -91,13 +91,8 @@ macro_rules! cmds {
 }
 
 cmds! {
-    ImageZoomIn, "Image: Zoom In", "+";
-    ImageZoomOut, "Image: Zoom Out", "-";
-    ImageFit, "Image: Fit to View", "0";
-    ImageActualSize, "Image: Actual Size (1:1)", "1";
-    OpenArchiveFile, "Archive: Open Selected ZIP as File", "Shift+Enter (Explorer)";
     QuickOpen, "Go to File...", "Ctrl+P";
-    CommandPalette, "Show All Commands", "Ctrl+Shift+P / F1";
+    CommandPalette, "Show All Commands", "Ctrl+Shift+P / F1 / Alt+E";
     NewFile, "File: New File", "Ctrl+N";
     Save, "File: Save", "Ctrl+S";
     SaveAs, "File: Save As...", "Ctrl+Alt+S";
@@ -114,7 +109,7 @@ cmds! {
     SelectAll, "Selection: Select All", "Ctrl+A";
     SelectLine, "Selection: Expand Line Selection", "Ctrl+L";
     SelectNextOccurrence, "Selection: Add Next Occurrence", "Ctrl+D";
-    Find, "Edit: Find", "Ctrl+F";
+    Find, "Edit: Find", "Ctrl+F / Alt+I";
     Replace, "Edit: Replace", "Ctrl+H";
     FindInFiles, "Edit: Find in Files", "Ctrl+Shift+F";
     ReplaceInFiles, "Edit: Replace in Files", "Ctrl+Shift+H";
@@ -153,17 +148,12 @@ cmds! {
     RevealInExplorer, "Explorer: Reveal Active File", "";
     ShowKeybindings, "Help: Keyboard Shortcuts", "Ctrl+K Ctrl+S";
     ToggleWordWrap, "View: Toggle Word Wrap", "Alt+Z";
-    ToggleToolbar, "View: Toggle Touch Toolbar", "";
-    ToggleSelectMode, "Selection: Toggle Selection Mode (lock Shift)", "";
     AgentToggle, "Agent: Open AI Agent Panel", "Ctrl+K A";
-    AgentNewChat, "Agent: New Chat", "";
-    AgentStop, "Agent: Stop", "Esc";
     AgentModel, "Agent: Choose Model", "";
     AgentPick, "Agent: Choose Agent", "";
     NewTerminal, "Terminal: New Terminal", "Ctrl+Shift+`";
     FocusNextTerminal, "Terminal: Focus Next", "F6";
     FocusPrevTerminal, "Terminal: Focus Previous", "Shift+F6";
-    ToggleTerminalDock, "Terminal: Toggle Dock", "";
     CloseTerminal, "Terminal: Close", "Ctrl+W";
 }
 
@@ -189,4 +179,28 @@ pub(crate) fn menu_command(letter: char) -> Option<Command> {
 pub(crate) fn menu_letter(index: usize) -> Option<char> {
     let cmd = COMMANDS.get(index)?.cmd;
     MENU_KEYS.iter().find(|(_, action)| *action == cmd).map(|&(key, _)| key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contextual_actions_are_not_repeated_in_the_commands_menu() {
+        let contextual = [
+            Command::ImageZoomIn,
+            Command::ImageZoomOut,
+            Command::ImageFit,
+            Command::ImageActualSize,
+            Command::OpenArchiveFile,
+            Command::ToggleToolbar,
+            Command::ToggleSelectMode,
+            Command::AgentNewChat,
+            Command::AgentStop,
+            Command::ToggleTerminalDock,
+        ];
+        assert!(contextual
+            .iter()
+            .all(|cmd| !COMMANDS.iter().any(|entry| entry.cmd == *cmd)));
+    }
 }
