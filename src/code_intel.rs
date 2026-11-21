@@ -475,7 +475,7 @@ pub fn sort_lines(text: &str, from: usize, to: usize) -> String {
 /// Remove duplicate lines, keeping the first. Only exact duplicates that are
 /// not blank collide, so intentional spacing survives.
 pub fn dedupe_lines(text: &str, from: usize, to: usize) -> String {
-    let mut lines: Vec<&str> = text.split('\n').collect();
+    let lines: Vec<&str> = text.split('\n').collect();
     let to = to.min(lines.len().saturating_sub(1));
     if from >= to {
         return text.to_string();

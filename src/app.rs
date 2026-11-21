@@ -43,6 +43,8 @@ pub enum Focus {
     Agent,
     /// Typing into a focused terminal window.
     Terminal,
+    /// The palette owns the input (palette keys are routed earlier).
+    Palette,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1135,6 +1137,7 @@ impl App {
             (KeyCode::PageUp, true, ..) | (KeyCode::BackTab, true, ..) => Some(Command::PrevTab),
             (KeyCode::Char('i'), true, true, _) => Some(Command::FindInFiles),
             (KeyCode::Char('h'), true, true, _) => Some(Command::ReplaceInFiles),
+            (KeyCode::Char('f'), true, false, true) => Some(Command::FindRelated),
             (KeyCode::Char('f'), true, ..) => Some(Command::Find),
             (KeyCode::Char('h'), true, ..) => Some(Command::Replace),
             (KeyCode::Char('g'), true, ..) => Some(Command::GotoLine),
@@ -1148,7 +1151,6 @@ impl App {
             (KeyCode::F(2), true, _, _) => Some(Command::InspectSymbol),
             (KeyCode::F(2), ..) => Some(Command::RenameSymbol),
             (KeyCode::Char(' '), true, true, _) => Some(Command::ContextMenu),
-            (KeyCode::Char('f'), true, false, true) => Some(Command::FindRelated),
             (KeyCode::F(6), _, true, _) => Some(Command::FocusPrevTerminal),
             (KeyCode::F(6), ..) => Some(Command::FocusNextTerminal),
             (KeyCode::Char('`'), true, ..) => Some(Command::NewTerminal),
@@ -1196,6 +1198,8 @@ impl App {
             Focus::Editor => self.editor_key(code, ctrl, shift, alt),
             // Terminal input is routed to the focused terminal above.
             Focus::Terminal => {}
+            // Palette input is routed to palette_key above.
+            Focus::Palette => {}
         }
     }
 
@@ -1669,6 +1673,19 @@ impl App {
             | DuplicateLineUp | DeleteLine | InsertLineBelow | InsertLineAbove => {
                 self.edit_command(cmd)
             }
+            // Code intelligence: editor-independent flows (context menu,
+            // semantic search, project review) dispatch straight through.
+            ContextMenu => self.open_context_menu(),
+            GotoDefinition => self.goto_definition(),
+            FindReferences => self.find_references(false),
+            InspectSymbol => self.inspect_symbol(),
+            RenameSymbol => self.rename_symbol(),
+            ExtractBlock => self.extract_block(),
+            SortLines => self.transform_lines(false),
+            DedupeLines => self.transform_lines(true),
+            CopySymbolPath => self.copy_symbol_path(),
+            FindRelated => self.find_related(),
+            ReviewCode => self.review_project(),
         }
         if matches!(
             cmd,
@@ -2619,7 +2636,8 @@ impl App {
             | PaletteMode::PluginCommands
             | PaletteMode::Input
             | PaletteMode::ConfirmRemoveSkill
-            | PaletteMode::ConfirmRemoveSubAgent => self.management_items(mode),
+            | PaletteMode::ConfirmRemoveSubAgent
+            | PaletteMode::Backends => self.management_items(mode),
             PaletteMode::GotoLine | PaletteMode::SaveAs => (Vec::new(), Vec::new()),
             // These are built directly where they are opened (the context menu
             // needs the caret word, references need a project scan).

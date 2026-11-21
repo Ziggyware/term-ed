@@ -227,8 +227,8 @@ pub fn analyze_text(path: &Path, text: &str) -> Vec<Proposal> {
                 summary: format!("{marker} left in the source: {trimmed}"),
                 // Removing a marker is only right when the work is done, which
                 // cannot be inferred, so the note stands alone.
-                old: raw.clone(),
-                new: raw.clone(),
+                old: raw.to_string(),
+                new: raw.to_string(),
             });
         }
 
@@ -242,8 +242,8 @@ pub fn analyze_text(path: &Path, text: &str) -> Vec<Proposal> {
                 confidence: Confidence::Low,
                 line: n,
                 summary: format!("The comment says \"{detail}\"; confirm whether it is still true."),
-                old: raw.clone(),
-                new: raw.clone(),
+                old: raw.to_string(),
+                new: raw.to_string(),
             });
         }
 
@@ -282,8 +282,8 @@ pub fn analyze_text(path: &Path, text: &str) -> Vec<Proposal> {
                     summary: format!(
                         "This `{keyword}` block silently ignores the failure. Log it or narrow the catch."
                     ),
-                    old: raw.clone(),
-                    new: raw.clone(),
+                    old: raw.to_string(),
+                    new: raw.to_string(),
                 });
                 break;
             }

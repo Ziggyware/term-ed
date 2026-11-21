@@ -258,7 +258,7 @@ impl HighlightCache {
         i: usize,
         cp: &mut Checkpoint,
         highlighter: &Highlighter<'_>,
-        theme: &Theme,
+        _theme: &Theme,
         bg: Color,
         text: &mut String,
     ) -> LineHighlight {

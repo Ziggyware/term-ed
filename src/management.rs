@@ -792,19 +792,17 @@ impl App {
     }
 
     pub(crate) fn cancel_setting_edit(&mut self) {
-        let mode = self.management.edit.as_ref().map(|e| match e.target {
-            EditTarget::CreateSkill => PaletteMode::Skills,
-            EditTarget::CreateSub => PaletteMode::SubAgents,
-            EditTarget::Main(_) | EditTarget::RouterKey => PaletteMode::AgentSettings,
-            EditTarget::RenameSymbol { .. } => {
-                self.management.edit = None;
-                return;
+        let mode = match self.management.edit.as_ref().map(|e| e.target.clone()) {
+            Some(EditTarget::CreateSkill) => Some(PaletteMode::Skills),
+            Some(EditTarget::CreateSub) => Some(PaletteMode::SubAgents),
+            Some(EditTarget::Main(_)) | Some(EditTarget::RouterKey) => Some(PaletteMode::AgentSettings),
+            Some(EditTarget::RenameSymbol { .. }) => None,
+            Some(EditTarget::JevKey) | Some(EditTarget::JevUrl) | Some(EditTarget::EmbeddingModel) => {
+                Some(PaletteMode::Backends)
             }
-            EditTarget::JevKey | EditTarget::JevUrl | EditTarget::EmbeddingModel => {
-                PaletteMode::Backends
-            }
-            _ => PaletteMode::SubAgentSettings,
-        });
+            Some(_) => Some(PaletteMode::SubAgentSettings),
+            None => return,
+        };
         self.management.edit = None;
         if let Some(mode) = mode {
             self.open_palette(mode);
