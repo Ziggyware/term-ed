@@ -121,7 +121,7 @@ impl Clipboard {
             // clipboard utility installed.
             if let Some(i) = self.paste_tool {
                 let (cmd, args) = PASTE_TOOLS[i];
-                match Command::new(cmd).args(*args).stderr(Stdio::null()).output() {
+                match Command::new(cmd).args(args).stderr(Stdio::null()).output() {
                     Ok(out) if out.status.success() => {
                         self.update_from_system(&String::from_utf8_lossy(&out.stdout));
                         return self.text.clone();
