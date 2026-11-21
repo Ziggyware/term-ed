@@ -89,7 +89,12 @@ pub fn render_palette(buf: &mut Buffer, screen: Rect, app: &mut App) -> Option<P
     let p = app.palette.as_mut()?;
     let managed = matches!(
         p.mode,
-        PaletteMode::Settings
+        PaletteMode::ContextMenu
+            | PaletteMode::Locations
+            | PaletteMode::Inspect
+            | PaletteMode::Review
+            | PaletteMode::Backends
+            | PaletteMode::Settings
             | PaletteMode::AgentSettings
             | PaletteMode::SubAgents
             | PaletteMode::SubAgentSettings
@@ -152,6 +157,11 @@ pub fn render_palette(buf: &mut Buffer, screen: Rect, app: &mut App) -> Option<P
             .unwrap_or("Edit Setting"),
         PaletteMode::ConfirmRemoveSkill => "Delete Skill?",
         PaletteMode::ConfirmRemoveSubAgent => "Delete Sub-agent?",
+        PaletteMode::ContextMenu => "Editor Context Menu",
+        PaletteMode::Locations => "References",
+        PaletteMode::Inspect => "Symbol Inspection",
+        PaletteMode::Backends => "Backends & Services",
+        PaletteMode::Review => "Unattended Review · nothing applied",
     };
     panel(buf, r, pal.accent, pal.popup_bg, Some(title));
 
@@ -166,6 +176,13 @@ pub fn render_palette(buf: &mut Buffer, screen: Rect, app: &mut App) -> Option<P
         PaletteMode::AgentPicker => ("✦", "Choose an AI agent"),
         PaletteMode::SaveAs => ("⤓", "path/relative/to/project"),
         PaletteMode::Input => ("›", "Enter a value; empty restores the default"),
+        PaletteMode::ContextMenu => {
+            ("»", "Filter actions · Enter to run · Esc to close")
+        }
+        PaletteMode::Locations => ("≡", "Filter references · Enter to jump"),
+        PaletteMode::Inspect => ("?", "Enter to close"),
+        PaletteMode::Backends => ("⚙", "Enter to change · Esc to close"),
+        PaletteMode::Review => ("!", "Enter to open · every change needs approval"),
         _ => ("⚙", "Filter options · ↑↓ · Enter to select · Esc to close"),
     };
     let iy = r.y + 1;
@@ -333,10 +350,20 @@ pub fn render_palette(buf: &mut Buffer, screen: Rect, app: &mut App) -> Option<P
         let hint = ellipsize(&hint, (list.width / 3) as usize);
         let hint_w = if hint.is_empty() { 0 } else { width(&hint) + 3 };
         let max_x = list.right().saturating_sub(hint_w + 1);
+        // Menu labels are "Area: Action"; tinting the area prefix by area makes
+        // a long list scannable without reading every row. Match highlights
+        // still win, so search stays legible.
+        let area_len = display
+            .find(": ")
+            .filter(|&i| p.mode == PaletteMode::Commands || managed)
+            .map(|i| i + 2)
+            .unwrap_or(0);
         for (ci, ch) in display.chars().enumerate() {
             let hit = item.positions.binary_search(&ci).is_ok();
             let st = if hit {
                 bold(fgbg(pal.match_fg, bg))
+            } else if ci < area_len {
+                fgbg(area_color(&display[..area_len], &pal), bg)
             } else {
                 fgbg(pal.popup_fg, bg)
             };
@@ -397,6 +424,28 @@ pub fn render_palette(buf: &mut Buffer, screen: Rect, app: &mut App) -> Option<P
         r.right(),
     );
     Some(caret)
+}
+
+/// Colour for a menu row's area prefix (`File:`, `Edit:`, `Agent:`, ...).
+/// Related areas share a hue so the palette reads as groups rather than a
+/// uniform wall of text.
+fn area_color(label: &str, pal: &crate::theme::Palette) -> Color {
+    let area = label
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match area.as_str() {
+        "file" => pal.accent,
+        "edit" | "selection" => pal.success,
+        "view" | "window" | "editor" => pal.warning,
+        "go" | "navigate" => pal.match_fg,
+        "agent" | "ai" => pal.error,
+        "plugins" | "skills" | "preferences" | "settings" => pal.popup_dim,
+        "markdown" | "statistics" | "text" => pal.success,
+        _ => pal.accent,
+    }
 }
 
 pub fn render_find(buf: &mut Buffer, editor: Rect, app: &mut App) -> Option<Position> {

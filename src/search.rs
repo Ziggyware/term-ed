@@ -1418,18 +1418,20 @@ mod tests {
 
     #[test]
     fn roots_resolve_relative_to_the_project() {
+        // Derive the expected root rather than hardcoding it: `/work/app` is a
+        // drive-relative path on Windows, where `absolute_path` resolves it to
+        // `C:\work\app` (or whatever drive the tests run on).
         let project = Path::new("/work/app");
-        assert_eq!(resolve_root(project, ""), PathBuf::from("/work/app"));
-        assert_eq!(resolve_root(project, "  "), PathBuf::from("/work/app"));
-        assert_eq!(resolve_root(project, "."), PathBuf::from("/work/app"));
-        assert_eq!(resolve_root(project, "src"), PathBuf::from("/work/app/src"));
-        assert_eq!(
-            resolve_root(project, "src/../tests"),
-            PathBuf::from("/work/app/tests")
-        );
-        assert_eq!(
-            resolve_root(project, "/srv/other"),
-            PathBuf::from("/srv/other")
-        );
+        let root = absolute_path(project);
+        assert_eq!(resolve_root(project, ""), root);
+        assert_eq!(resolve_root(project, "  "), root);
+        assert_eq!(resolve_root(project, "."), root);
+        assert_eq!(resolve_root(project, "src"), root.join("src"));
+        assert_eq!(resolve_root(project, "src/../tests"), root.join("tests"));
+
+        // An absolute-but-elsewhere root stays absolute and keeps its tail.
+        let other = resolve_root(project, "/srv/other");
+        assert!(other.is_absolute(), "{other:?}");
+        assert!(other.ends_with(Path::new("srv").join("other")), "{other:?}");
     }
 }

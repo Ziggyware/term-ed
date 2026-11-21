@@ -98,6 +98,7 @@ termed writes and reads JSON-RPC 2.0, one object per line.
 | `editor.insert` | `{"text"}` | `null` — insert at the caret |
 | `editor.replace` | `{"text"}` | `null` — replace the buffer (undoable) |
 | `editor.open` | `{"path", "line"?}` | `null` |
+| `editor.preview` | `{"text", "title"?}` | `null` — open `text` read-only in a new tab (use this instead of `editor.replace` when the result is a rendering rather than an edit) |
 | `project.root` | — | the project folder |
 | `project.files` | `{"limit"?}` | relative paths, `.gitignore` respected |
 | `ui.toast` | `{"message", "kind"?}` | `null` — `info` (default), `success`, `error` |
@@ -113,6 +114,7 @@ on first run. They only need Python 3.
 
 | Plugin | Commands |
 | --- | --- |
+| `markdown-preview` | render the live Markdown buffer to a styled page and open it in the browser (`Ctrl+Shift+M`), or show it read-only in the editor. Standard library only: the renderer is a small Markdown parser, not a dependency. |
 | `text-tools` | sort (A-Z / Z-A), remove duplicate lines, trim trailing whitespace, UPPER/lower case, format/minify JSON — `Ctrl+Alt+L` sorts |
 | `todo` | list and count `TODO` / `FIXME` / `HACK` / `XXX` markers in the project, then jump to the first one — `Ctrl+Alt+T` |
 | `stats` | words, characters, lines and longest line for the document or the selection |

@@ -1178,8 +1178,16 @@ impl Worker {
         crate::config::workspace_path(&self.cwd, p.trim())
     }
 
+    /// Project-relative path for tool output. Always `/`-separated: these
+    /// strings reach the model (and the diff notice) as JSON, where a
+    /// backslash reads as an escape and Windows would otherwise disagree
+    /// with the search tools, which normalise the same way.
     fn rel(&self, p: &Path) -> String {
-        p.strip_prefix(&self.cwd).unwrap_or(p).display().to_string()
+        p.strip_prefix(&self.cwd)
+            .unwrap_or(p)
+            .display()
+            .to_string()
+            .replace('\\', "/")
     }
 
     fn tool_start(&self, id: &str, title: &str, kind: &str, path: Option<&Path>) {
@@ -1868,6 +1876,7 @@ mod tests {
             "edit_file",
             &json!({"path":"src/a.py","old_text":"y = 2","new_text":"y = 3"}),
         );
+        // `/` on every platform, so the model sees one spelling.
         assert_eq!(r, "Edited src/a.py.");
         assert_eq!(
             std::fs::read_to_string(dir.join("src/a.py")).unwrap(),

@@ -1,7 +1,7 @@
 {
   "name": "markdown-preview",
-  "version": "1.0.0",
-  "description": "Render Markdown to HTML and open in browser, or show terminal preview",
+  "version": "1.0.1",
+  "description": "Render the current Markdown buffer: a styled page in your browser, or a read-only preview in the editor",
   "author": "termed",
   "command": [
     "python3",
@@ -16,7 +16,7 @@
     },
     {
       "id": "preview-terminal",
-      "title": "Markdown: Terminal Preview"
+      "title": "Markdown: Preview Here"
     }
   ]
 }

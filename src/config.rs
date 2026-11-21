@@ -95,6 +95,9 @@ pub struct AgentConfig {
     pub toolkit_groups: Vec<String>,
     pub max_output_tokens: usize,
     pub auto_context: bool,
+    /// Encoder model for semantic search. Empty means the built-in default;
+    /// a Hugging Face repo id or a local directory both work.
+    pub embedding_model: String,
 }
 
 impl Default for AgentConfig {
@@ -127,6 +130,7 @@ impl Default for AgentConfig {
             toolkit_groups: Vec::new(),
             max_output_tokens: 4096,
             auto_context: true,
+            embedding_model: String::new(),
         }
     }
 }

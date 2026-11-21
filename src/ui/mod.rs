@@ -905,7 +905,6 @@ fn render_status(buf: &mut Buffer, area: Rect, app: &mut App) {
     let pal = app.theme.palette.clone();
     let (bg, fgc) = (pal.status_bg, pal.status_fg);
     fill(buf, area, bg);
-    let st = fgbg(fgc, bg);
     let dark = mix(bg, ratatui::style::Color::Black, 0.25);
 
     let compact = app.compact;
@@ -978,37 +977,73 @@ fn render_status(buf: &mut Buffer, area: Rect, app: &mut App) {
     }
     x += 1;
     if let Some(b) = app.git_branch.as_ref().filter(|_| !compact) {
-        x = put(buf, x, area.y, &format!("⎇ {b}"), st, area.right()) + 2;
+        let branch = format!("⎇ {b} ");
+        x = put(
+            buf,
+            x,
+            area.y,
+            &branch,
+            fgbg(pal.accent_fg, mix(bg, pal.accent, 0.55)),
+            area.right(),
+        ) + 2;
     }
     let dirty = app.editors.iter().filter(|e| e.doc.is_dirty()).count();
-    let state = if app.chord {
-        "(Ctrl+K) was pressed. Waiting for second key of chord...".to_string()
+    let (state, state_fg) = if app.chord {
+        (
+            "(Ctrl+K) was pressed. Waiting for second key of chord...".to_string(),
+            Some(pal.warning),
+        )
     } else if dirty > 0 {
-        if compact {
-            format!("● {dirty}")
-        } else {
-            format!("● {dirty} unsaved")
-        }
+        (
+            if compact {
+                format!("● {dirty}")
+            } else {
+                format!("● {dirty} unsaved")
+            },
+            Some(pal.warning),
+        )
     } else if compact {
-        "✓".to_string()
+        ("✓".to_string(), Some(pal.success))
     } else {
-        "✓ Ready".to_string()
+        ("✓ Ready".to_string(), Some(pal.success))
     };
+    // Unsaved work and pending chords are warnings; a clean buffer is green.
+    let state_style = bold(fgbg(state_fg.unwrap_or(fgc), bg));
     let left_end = x + width(&state);
 
-    // Right: clickable segments; low-priority ones drop out on narrow screens.
-    let mut segs: Vec<(String, Option<Command>, u8)> = Vec::new();
+    // Right: clickable segments grouped by colour. Low-priority ones drop out
+    // on narrow screens, so the bar stays useful on a phone.
+    let mut segs: Vec<Seg> = Vec::new();
     if let Some(e) = app.editor() {
         if let Some(preview) = &e.doc.preview {
             match preview {
                 crate::document::Preview::Image(image) => {
                     let (w, h) = image.dimensions();
-                    segs.push((format!("{} · {w}×{h}", image.format), None, 9));
-                    segs.push(("Read-only".into(), Some(Command::SaveAs), 8));
+                    segs.push(Seg::new(
+                        format!("{} · {w}×{h}", image.format),
+                        SegTone::Locked,
+                        9,
+                    ));
+                    segs.push(Seg::new("Read-only", SegTone::Locked, 8).click(Command::SaveAs));
                 }
                 crate::document::Preview::Archive(index) => {
-                    segs.push((format!("ZIP · {} entries", index.entries.len()), None, 9));
-                    segs.push(("Overview · Read-only".into(), Some(Command::SaveAs), 8));
+                    segs.push(Seg::new(
+                        format!("ZIP · {} entries", index.entries.len()),
+                        SegTone::Locked,
+                        9,
+                    ));
+                    segs.push(
+                        Seg::new("Overview · Read-only", SegTone::Locked, 8)
+                            .click(Command::SaveAs),
+                    );
+                }
+                crate::document::Preview::Text(text) => {
+                    segs.push(Seg::new(
+                        format!("Preview · {} lines", text.lines().count()),
+                        SegTone::Locked,
+                        9,
+                    ));
+                    segs.push(Seg::new("Read-only", SegTone::Locked, 8).click(Command::SaveAs));
                 }
             }
         } else {
@@ -1017,7 +1052,7 @@ fn render_status(buf: &mut Buffer, area: Rect, app: &mut App) {
                 .as_ref()
                 .is_some_and(|p| crate::archive::member_path(p).is_some())
             {
-                segs.push(("ZIP member".into(), None, 6));
+                segs.push(Seg::new("ZIP member", SegTone::Locked, 6));
             }
             let (line, _) = e.cursor();
             let col = e.cursor_display_col() + 1;
@@ -1028,53 +1063,173 @@ fn render_status(buf: &mut Buffer, area: Rect, app: &mut App) {
                 (false, 0) => format!("Ln {}, Col {col}", line + 1),
                 (false, n) => format!("Ln {}, Col {col} ({n} selected)", line + 1),
             };
-            segs.push((pos, Some(Command::GotoLine), 9));
-            segs.push((
-                e.doc.indent.label(),
-                Some(Command::ConvertIndentToSpaces),
-                3,
-            ));
-            segs.push(("UTF-8".into(), None, 1));
-            segs.push((
-                e.doc.line_ending.label().into(),
-                Some(Command::ToggleLineEnding),
-                4,
-            ));
+            segs.push(Seg::new(pos, SegTone::Position, 10).click(Command::GotoLine));
+
+            // File shape: characters, words and lines. Cheap enough to keep
+            // live (it is the same rope the renderer already walks), and it is
+            // what people reach for when writing rather than coding.
+            let lines = e.doc.len_lines();
+            let sel_or_doc = if sel_len > 0 {
+                e.selected_text()
+            } else {
+                e.doc.rope.to_string()
+            };
+            let chars = sel_or_doc.chars().count();
+            let words = sel_or_doc.split_whitespace().count();
+            if compact {
+                segs.push(Seg::new(format!("{lines}L"), SegTone::File, 5));
+            } else if sel_len > 0 {
+                // With a selection the counts describe the selection, so say so.
+                segs.push(Seg::new(
+                    format!("{lines} lines · {words} words · {chars} chars selected"),
+                    SegTone::File,
+                    7,
+                ));
+            } else {
+                segs.push(Seg::new(
+                    format!("{lines} lines · {words} words · {chars} chars"),
+                    SegTone::File,
+                    7,
+                ));
+            }
+
+            // Bytes on disk versus bytes in the buffer: a quick sanity check
+            // for line-ending and encoding surprises.
+            let disk = e
+                .doc
+                .path
+                .as_ref()
+                .and_then(|p| std::fs::metadata(p).ok())
+                .map(|m| m.len());
+            if let Some(bytes) = disk.filter(|_| !compact) {
+                segs.push(Seg::new(human_bytes(bytes), SegTone::File, 2));
+            }
+
+            segs.push(
+                Seg::new(e.doc.indent.label(), SegTone::Setting, 3)
+                    .click(Command::ConvertIndentToSpaces),
+            );
+            segs.push(Seg::new("UTF-8", SegTone::File, 1));
+            segs.push(
+                Seg::new(e.doc.line_ending.label(), SegTone::Setting, 4)
+                    .click(Command::ToggleLineEnding),
+            );
             let lang = if compact {
                 e.language().to_string()
             } else {
                 format!("{{ }} {}", e.language())
             };
-            segs.push((lang, Some(Command::SelectLanguage), 8));
+            segs.push(Seg::new(lang, SegTone::Setting, 8).click(Command::SelectLanguage));
         }
     }
-    segs.push((
-        format!("◐ {}", app.theme.name),
-        Some(Command::SelectTheme),
-        2,
-    ));
+    segs.push(
+        Seg::new(format!("◐ {}", app.theme.name), SegTone::Setting, 2)
+            .click(Command::SelectTheme),
+    );
     let budget = area.right().saturating_sub(left_end + 1);
-    while segs.iter().map(|(s, _, _)| width(s) + 2).sum::<u16>() > budget && !segs.is_empty() {
+    while segs.iter().map(|s| width(&s.text) + 2).sum::<u16>() > budget && !segs.is_empty() {
         let min = segs
             .iter()
             .enumerate()
-            .min_by_key(|(_, s)| s.2)
+            .min_by_key(|(_, s)| s.priority)
             .map(|(i, _)| i)
             .unwrap();
         segs.remove(min);
     }
-    put(buf, x, area.y, &state, st, area.right());
-    let total: u16 = segs.iter().map(|(s, _, _)| width(s) + 2).sum();
+    put(buf, x, area.y, &state, state_style, area.right());
+    let total: u16 = segs.iter().map(|s| width(&s.text) + 2).sum();
     let mut rx = area.right().saturating_sub(total);
-    for (s, cmd, _) in segs {
+    for seg in segs {
         let start = rx;
-        rx = put(buf, rx + 1, area.y, &s, st, area.right()) + 1;
-        if let Some(c) = cmd {
+        rx = put(buf, rx + 1, area.y, &seg.text, seg_style(&pal, seg.tone), area.right()) + 1;
+        if let Some(c) = seg.cmd {
             app.layout
                 .click_items
                 .push((Rect::new(start, area.y, rx - start, 1), c));
         }
     }
+}
+
+/// Human-readable byte count for the status bar.
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// A status-bar segment. Colours group related information so the bar can be
+/// read at a glance: position is neutral, language/file facts are warm,
+/// settings that change on click are cool, and anything dirty is red.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SegTone {
+    /// Cursor position and selection size.
+    Position,
+    /// File facts: language, encoding, line ending, indent.
+    File,
+    /// Something the user should notice: unsaved work, warnings.
+    Alert,
+    /// The file is read-only or a preview.
+    Locked,
+    /// Editor/app settings reached by clicking (theme and the like).
+    Setting,
+}
+
+struct Seg {
+    text: String,
+    cmd: Option<Command>,
+    /// Lower numbers are dropped first when the bar is narrow.
+    priority: u8,
+    tone: SegTone,
+}
+
+impl Seg {
+    fn new(text: impl Into<String>, tone: SegTone, priority: u8) -> Self {
+        Self {
+            text: text.into(),
+            cmd: None,
+            priority,
+            tone,
+        }
+    }
+
+    fn click(mut self, cmd: Command) -> Self {
+        self.cmd = Some(cmd);
+        self
+    }
+}
+
+/// Background for a segment: a tint of its tone over the status-bar colour, so
+/// adjacent segments stay distinguishable without drawing borders.
+fn seg_style(pal: &crate::theme::Palette, tone: SegTone) -> ratatui::style::Style {
+    let (fg, tint) = match tone {
+        SegTone::Position => (pal.status_fg, 0.0),
+        SegTone::File => (pal.status_fg, 0.22),
+        SegTone::Alert => (pal.status_fg, 0.0),
+        SegTone::Locked => (pal.status_fg, 0.30),
+        SegTone::Setting => (pal.status_fg, 0.12),
+    };
+    let accent = match tone {
+        SegTone::File => pal.success,
+        SegTone::Alert => pal.warning,
+        SegTone::Locked => pal.accent,
+        SegTone::Setting => pal.accent,
+        SegTone::Position => pal.status_fg,
+    };
+    let bg = if tint > 0.0 {
+        mix(pal.status_bg, accent, tint)
+    } else {
+        pal.status_bg
+    };
+    fgbg(fg, bg)
 }
 
 const LOGO: [&str; 6] = [

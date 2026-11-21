@@ -8,7 +8,9 @@ Run:  python3 -m unittest discover -s local_inference/tests -v
 """
 
 import json
+import math
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -86,6 +88,56 @@ def build_tiny_model(model_dir: str) -> str:
             {"chat_template": "<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n"},
             fh,
         )
+    return model_dir
+
+
+def build_tiny_embedder(model_dir: str) -> str:
+    """A 3-node encoder-shaped graph: Gather -> MatMul, mean-pooled by the
+    server. Enough to prove the /embeddings route wires input to output."""
+    import numpy as np
+    import onnx
+    from onnx import TensorProto, helper, numpy_helper
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+
+    os.makedirs(model_dir, exist_ok=True)
+    tok = Tokenizer(models.BPE(unk_token="[UNK]"))
+    tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tok.decoder = decoders.ByteLevel()
+    tok.train_from_iterator(
+        ["alpha beta gamma", "delta epsilon", "alpha alpha beta"],
+        trainers.BpeTrainer(vocab_size=48, special_tokens=["[UNK]", "[PAD]"]),
+    )
+    tok.save(os.path.join(model_dir, "tokenizer.json"))
+    vocab = tok.get_vocab_size()
+
+    rng = np.random.default_rng(1)
+    dim = 6
+    table = rng.normal(size=(vocab, dim)).astype(np.float32)
+    weight = np.eye(dim, dtype=np.float32)
+    graph = helper.make_graph(
+        [
+            helper.make_node("Gather", ["table", "input_ids"], ["hidden"], axis=0),
+            helper.make_node("MatMul", ["hidden", "weight"], ["last_hidden_state"]),
+        ],
+        "tiny-encoder",
+        [
+            helper.make_tensor_value_info("input_ids", TensorProto.INT64, [None, None]),
+            helper.make_tensor_value_info(
+                "attention_mask", TensorProto.INT64, [None, None]
+            ),
+        ],
+        [
+            helper.make_tensor_value_info(
+                "last_hidden_state", TensorProto.FLOAT, [None, None, dim]
+            )
+        ],
+        [
+            numpy_helper.from_array(table, name="table"),
+            numpy_helper.from_array(weight, name="weight"),
+        ],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    onnx.save(model, os.path.join(model_dir, "model.onnx"))
     return model_dir
 
 
@@ -430,6 +482,101 @@ class PrewarmTests(unittest.TestCase):
             with self.assertRaises(RuntimeError) as error:
                 onnx_server.prewarm(tmp, tmp)
             self.assertIn("tokenizer.json", str(error.exception))
+
+
+class EmbeddingTests(unittest.TestCase):
+    """`POST /v1/embeddings`: batching, shape, and the failure modes."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.model = build_tiny_model(os.path.join(self.tmp, "chat"))
+        self.saved = onnx_server.STATE
+        self.state = onnx_server.State(self.model)
+        self.state.engine = onnx_server.OnnxEngine(self.model)
+        # The handler reads the module global, so the fixture must publish it.
+        onnx_server.STATE = self.state
+
+    def tearDown(self):
+        onnx_server.STATE = self.saved
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_batches_return_one_normalised_vector_each(self):
+        self.state.embedding_id = "tiny-encoder"
+        self.state.embeddings = onnx_server.EmbeddingEngine(
+            build_tiny_embedder(os.path.join(self.tmp, "emb"))
+        )
+        server, port = start_server(self.state)
+        try:
+            status, body = request(
+                port, "POST", "/v1/embeddings", {"input": ["alpha beta", "gamma"]}
+            )
+            self.assertEqual(status, 200, body)
+            payload = json.loads(body)
+            self.assertEqual(len(payload["data"]), 2)
+            self.assertEqual(payload["model"], "tiny-encoder")
+            for item in payload["data"]:
+                vector = item["embedding"]
+                self.assertEqual(len(vector), 6)
+                norm = math.sqrt(sum(v * v for v in vector))
+                self.assertAlmostEqual(norm, 1.0, places=4)
+            # Indexes identify which input each vector belongs to.
+            self.assertEqual([i["index"] for i in payload["data"]], [0, 1])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_a_single_string_is_accepted(self):
+        self.state.embedding_id = "tiny-encoder"
+        self.state.embeddings = onnx_server.EmbeddingEngine(
+            build_tiny_embedder(os.path.join(self.tmp, "emb2"))
+        )
+        server, port = start_server(self.state)
+        try:
+            status, body = request(port, "POST", "/v1/embeddings", {"input": "alpha"})
+            self.assertEqual(status, 200, body)
+            self.assertEqual(len(json.loads(body)["data"]), 1)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_no_model_is_503_and_says_how_to_enable_it(self):
+        server, port = start_server(self.state)   # embedding_id is None
+        try:
+            status, body = request(port, "POST", "/v1/embeddings", {"input": "x"})
+            self.assertEqual(status, 503, body)
+            self.assertIn("--embedding-model", body)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_bad_inputs_are_400(self):
+        self.state.embedding_id = "tiny-encoder"
+        self.state.embeddings = onnx_server.EmbeddingEngine(
+            build_tiny_embedder(os.path.join(self.tmp, "emb3"))
+        )
+        server, port = start_server(self.state)
+        try:
+            for body in ({"input": []}, {"input": [1, 2]}, {"input": 5}, {}):
+                status, text = request(port, "POST", "/v1/embeddings", body)
+                self.assertEqual(status, 400, f"{body} -> {text}")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_health_reports_embeddings_without_failing_chat(self):
+        self.state.embedding_id = "tiny-encoder"
+        self.state.embedding_error = "disk on fire"
+        server, port = start_server(self.state)
+        try:
+            status, body = request(port, "GET", "/healthz")
+            self.assertEqual(status, 200, "chat still works")
+            payload = json.loads(body)
+            self.assertEqual(payload["status"], "ok")
+            self.assertEqual(payload["embeddings"], "failed")
+            self.assertEqual(payload["embedding_model"], "tiny-encoder")
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 class UnitTests(unittest.TestCase):
