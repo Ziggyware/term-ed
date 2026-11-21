@@ -23,7 +23,7 @@ use crate::editor::Editor;
 use crate::explorer::{self, Explorer};
 use crate::fuzzy;
 use crate::highlight;
-use crate::management::Management;
+use crate::management::{Edit, Management};
 use crate::plugin::{self, Host as PluginHost};
 use crate::search;
 use crate::skills::Skill;
@@ -45,8 +45,9 @@ pub enum Focus {
     Terminal,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PaletteMode {
+    #[default]
     Commands,
     Files,
     GotoLine,
@@ -68,8 +69,19 @@ pub enum PaletteMode {
     Input,
     ConfirmRemoveSkill,
     ConfirmRemoveSubAgent,
+    /// The editor context menu (code intelligence actions).
+    ContextMenu,
+    /// Project-wide reference results.
+    Locations,
+    /// A read-only explanation of the symbol under the caret.
+    Inspect,
+    /// Backend services: Jev decisions, MCP tools, embeddings, automation.
+    Backends,
+    /// The unattended agent's findings, each awaiting approval.
+    Review,
 }
 
+#[derive(Default)]
 pub struct Palette {
     pub mode: PaletteMode,
     pub input: String,
@@ -469,6 +481,9 @@ pub struct App {
     pub preferences: Preferences,
     pub skills: Vec<Skill>,
     pub management: Management,
+    /// Background analysis policy. Off by default; nothing it finds is ever
+    /// applied without approval unless the user opts in to high confidence.
+    pub autofix: crate::autofix::Policy,
     pub automation: Automation,
     pub git_branch: Option<String>,
     pub layout: Layout,
@@ -556,6 +571,7 @@ impl App {
             skills: crate::skills::discover(&root, &preferences.disabled_skills),
             preferences,
             management: Management::default(),
+            autofix: crate::autofix::Policy::default(),
             automation: Automation::default(),
             compact: false,
             mods: StickyMods::default(),
@@ -982,7 +998,7 @@ impl App {
         }
         // Keep project search and the documented menu mnemonics global, even
         // when a terminal or another docked panel currently owns input.
-        if ctrl && shift && code == KeyCode::Char('f') {
+        if ctrl && shift && code == KeyCode::Char('i') {
             self.palette = None;
             self.run(Command::FindInFiles);
             return;
@@ -1117,7 +1133,7 @@ impl App {
                 Some(Command::NextTab)
             }
             (KeyCode::PageUp, true, ..) | (KeyCode::BackTab, true, ..) => Some(Command::PrevTab),
-            (KeyCode::Char('f'), true, true, _) => Some(Command::FindInFiles),
+            (KeyCode::Char('i'), true, true, _) => Some(Command::FindInFiles),
             (KeyCode::Char('h'), true, true, _) => Some(Command::ReplaceInFiles),
             (KeyCode::Char('f'), true, ..) => Some(Command::Find),
             (KeyCode::Char('h'), true, ..) => Some(Command::Replace),
@@ -1125,6 +1141,14 @@ impl App {
             (KeyCode::F(3), _, true, _) => Some(Command::FindPrev),
             (KeyCode::F(3), ..) => Some(Command::FindNext),
             (KeyCode::F(8), ..) => Some(Command::NextTheme),
+            // Code intelligence. F12/Shift+F12/Shift+F2 follow the convention
+            // most editors use, so muscle memory carries over.
+            (KeyCode::F(12), _, false, false) => Some(Command::GotoDefinition),
+            (KeyCode::F(12), _, true, _) => Some(Command::FindReferences),
+            (KeyCode::F(2), true, _, _) => Some(Command::InspectSymbol),
+            (KeyCode::F(2), ..) => Some(Command::RenameSymbol),
+            (KeyCode::Char(' '), true, true, _) => Some(Command::ContextMenu),
+            (KeyCode::Char('f'), true, false, true) => Some(Command::FindRelated),
             (KeyCode::F(6), _, true, _) => Some(Command::FocusPrevTerminal),
             (KeyCode::F(6), ..) => Some(Command::FocusNextTerminal),
             (KeyCode::Char('`'), true, ..) => Some(Command::NewTerminal),
@@ -1718,6 +1742,596 @@ impl App {
             }
             self.clipboard.set(text, whole);
         }
+        // Code intelligence runs after the editor borrow ends: each of these
+        // opens a palette or replaces the document.
+        match cmd {
+            ContextMenu => self.open_context_menu(),
+            GotoDefinition => self.goto_definition(),
+            FindReferences => self.find_references(false),
+            InspectSymbol => self.inspect_symbol(),
+            RenameSymbol => self.rename_symbol(),
+            ExtractBlock => self.extract_block(),
+            SortLines => self.transform_lines(false),
+            DedupeLines => self.transform_lines(true),
+            CopySymbolPath => self.copy_symbol_path(),
+            FindRelated => self.find_related(),
+            ReviewCode => self.review_project(),
+            _ => {}
+        }
+    }
+
+    /// Semantic search over the open buffers and the project.
+    ///
+    /// Embeddings need a model, so this degrades honestly: without one it says
+    /// how to get it and offers the text search instead of returning nothing.
+    fn find_related(&mut self) {
+        let seed = match self
+            .editor()
+            .map(|e| e.selected_text())
+            .filter(|s| !s.trim().is_empty())
+        {
+            Some(seed) => seed,
+            None => match self
+                .editor()
+                .and_then(|e| crate::code_intel::word_at(&e.doc.line_str(e.cursor().0), e.cursor().1))
+            {
+                Some(w) => w.text,
+                None => {
+                    self.toast(
+                        "Select some code (or put the cursor on a name) to find related code",
+                        ToastKind::Info,
+                    );
+                    return;
+                }
+            },
+        };
+
+        // Gather candidate chunks from the project plus unsaved buffers.
+        let overrides: Vec<(PathBuf, String)> = self
+            .editors
+            .iter()
+            .filter_map(|e| e.doc.path.clone().map(|p| (p, e.doc.rope.to_string())))
+            .collect();
+        let mut chunks: Vec<crate::embeddings::Chunk> = Vec::new();
+        let files = explorer::project_files(&self.explorer.root, 4000);
+        for rel in &files {
+            let path = self.explorer.root.join(rel);
+            let text = overrides
+                .iter()
+                .find(|(p, _)| *p == path)
+                .map(|(_, t)| t.clone())
+                .or_else(|| std::fs::read_to_string(&path).ok());
+            if let Some(text) = text
+                && text.len() <= self.autofix.max_file_bytes as usize
+            {
+                chunks.extend(crate::embeddings::chunk_file(&path, &text));
+            }
+        }
+        if chunks.is_empty() {
+            self.toast("No files to search in this project", ToastKind::Info);
+            return;
+        }
+        // Bound the work: small models are fast, but a huge tree still costs.
+        chunks.truncate(1500);
+        let mut cache = std::collections::HashMap::new();
+        let index = match crate::embeddings::embed_chunks(&chunks, &mut cache) {
+            Ok(index) => index,
+            Err(e) => {
+                self.toast(e, ToastKind::Error);
+                return;
+            }
+        };
+        let hits = match crate::embeddings::search_text(&index, &seed, 40) {
+            Ok(hits) => hits,
+            Err(e) => {
+                self.toast(e, ToastKind::Error);
+                return;
+            }
+        };
+        if hits.is_empty() {
+            self.toast(
+                format!("Nothing semantically close to that ({} chunks indexed)", index.len()),
+                ToastKind::Info,
+            );
+            return;
+        }
+        let mut items = Vec::new();
+        let mut hints = Vec::new();
+        let mut locations = Vec::new();
+        for hit in &hits {
+            let rel = crate::search::relative(&self.explorer.root, &hit.chunk.path);
+            let first = hit.chunk.text.lines().next().unwrap_or("").trim();
+            items.push(format!(
+                "{rel}:{}-{}  {first}",
+                hit.chunk.start_line + 1,
+                hit.chunk.end_line + 1
+            ));
+            hints.push(format!("{:.0}% related", hit.score * 100.0));
+            locations.push(crate::code_intel::Location {
+                path: hit.chunk.path.clone(),
+                line: hit.chunk.start_line,
+                col: 0,
+                preview: first.to_string(),
+                definition: false,
+            });
+        }
+        self.management.locations = locations;
+        self.palette = Some(Palette {
+            mode: PaletteMode::Locations,
+            items,
+            hints,
+            filtered: (0..self.management.locations.len())
+                .map(|index| crate::fuzzy::Scored {
+                    index,
+                    score: 0,
+                    positions: Vec::new(),
+                })
+                .collect(),
+            ..Palette::default()
+        });
+        self.focus = Focus::Palette;
+    }
+
+    /// Analyse the project for obvious problems and show what it found. Every
+    /// suggestion is a proposal: nothing is written.
+    fn review_project(&mut self) {
+        let files: Vec<PathBuf> = explorer::project_files(&self.explorer.root, 5000)
+            .into_iter()
+            .map(|rel| self.explorer.root.join(rel))
+            .collect();
+        let report = crate::autofix::limit(
+            crate::autofix::analyze_files(&files, self.autofix.max_file_bytes),
+            self.autofix.max_proposals,
+        );
+        let summary = report.summary();
+        if report.is_empty() {
+            self.toast(summary, ToastKind::Success);
+            return;
+        }
+        let mut items = Vec::new();
+        let mut hints = Vec::new();
+        let mut locations = Vec::new();
+        for proposal in report.at_least(crate::autofix::Confidence::Low) {
+            let rel = crate::search::relative(&self.explorer.root, &proposal.path);
+            items.push(format!(
+                "{} · {}:{}  {}",
+                proposal.confidence.label().to_uppercase(),
+                rel,
+                proposal.line + 1,
+                proposal.summary
+            ));
+            let applies = if self.autofix.may_apply_unattended(proposal) {
+                "auto-applied on accept"
+            } else {
+                "needs your approval"
+            };
+            hints.push(format!("{} · {applies}", proposal.kind.label()));
+            locations.push(crate::code_intel::Location {
+                path: proposal.path.clone(),
+                line: proposal.line,
+                col: 0,
+                preview: proposal.summary.clone(),
+                definition: false,
+            });
+        }
+        self.management.locations = locations;
+        self.management.review = report;
+        self.palette = Some(Palette {
+            mode: PaletteMode::Review,
+            items,
+            hints,
+            filtered: (0..self.management.locations.len())
+                .map(|index| crate::fuzzy::Scored {
+                    index,
+                    score: 0,
+                    positions: Vec::new(),
+                })
+                .collect(),
+            ..Palette::default()
+        });
+        self.focus = Focus::Palette;
+        self.toast(summary, ToastKind::Info);
+    }
+
+    // ============================================================ code intel
+
+    /// The identifier under (or just before) the caret, if there is one.
+    fn symbol_under_caret(&self) -> Option<crate::code_intel::Word> {
+        let e = self.editor()?;
+        let (line, col) = e.cursor();
+        crate::code_intel::word_at(&e.doc.line_str(line), col)
+    }
+
+    /// Open the editor context menu for the word under the caret. The menu is
+    /// the normal palette, so filtering by typing works and every action also
+    /// appears in the command list.
+    pub fn open_context_menu(&mut self) {
+        let word = self.symbol_under_caret();
+        let (context, word_label) = match &word {
+            Some(w) => (
+                format!("`{}` ({}), line {}", w.text, w.kind.label(), self.editor().map(|e| e.cursor().0 + 1).unwrap_or(0)),
+                w.text.clone(),
+            ),
+            None => (
+                "no symbol here; cursor actions only".to_string(),
+                String::new(),
+            ),
+        };
+        self.management.word = word;
+        let mut items: Vec<String> = Vec::new();
+        let mut hints: Vec<String> = Vec::new();
+        let mut runnable: Vec<Command> = Vec::new();
+        fn push(
+            title: String,
+            hint: &str,
+            cmd: Command,
+            items: &mut Vec<String>,
+            hints: &mut Vec<String>,
+            run: &mut Vec<Command>,
+        ) {
+            items.push(title);
+            hints.push(hint.to_string());
+            run.push(cmd);
+        }
+        if !word_label.is_empty() {
+            push(
+                format!("Inspect {word_label}"),
+                "Declaration, uses and likely problems",
+                Command::InspectSymbol,
+                &mut items,
+                &mut hints,
+                &mut runnable,
+            );
+            push(
+                format!("Go to Definition of {word_label}"),
+                "Nearest declaration in this file",
+                Command::GotoDefinition,
+                &mut items,
+                &mut hints,
+                &mut runnable,
+            );
+            push(
+                format!("Find All References to {word_label}"),
+                "Whole project, whole word",
+                Command::FindReferences,
+                &mut items,
+                &mut hints,
+                &mut runnable,
+            );
+            push(
+                format!("Rename {word_label}..."),
+                "Preview before anything changes",
+                Command::RenameSymbol,
+                &mut items,
+                &mut hints,
+                &mut runnable,
+            );
+            push(
+                format!("Copy File:Line of {word_label}"),
+                "For sharing and notes",
+                Command::CopySymbolPath,
+                &mut items,
+                &mut hints,
+                &mut runnable,
+            );
+        }
+        for (title, hint, cmd) in [
+            ("Extract Enclosing Block...", "Pull a function into its own buffer", Command::ExtractBlock),
+            ("Sort Selected Lines", "Case-insensitive, keeps duplicates", Command::SortLines),
+            ("Remove Duplicate Lines", "Keeps the first of each", Command::DedupeLines),
+            ("Find in Files", "Search the project", Command::FindInFiles),
+            ("Toggle Line Comment", "Comment the selection", Command::ToggleComment),
+        ] {
+            push(title.to_string(), hint, cmd, &mut items, &mut hints, &mut runnable);
+        }
+        self.management.context_commands = runnable;
+        self.palette = Some(Palette {
+            mode: PaletteMode::ContextMenu,
+            items,
+            hints,
+            filtered: (0..self.management.context_commands.len())
+                .map(|index| crate::fuzzy::Scored { index, score: 0, positions: Vec::new() })
+                .collect(),
+            ..Palette::default()
+        });
+        // Remember the subject so the palette title can name it.
+        self.management.context_title = context;
+        self.focus = Focus::Palette;
+    }
+
+    /// Jump to the first declaration of the word under the caret.
+    fn goto_definition(&mut self) {
+        let Some(word) = self.symbol_under_caret() else {
+            self.toast("Put the cursor on a name first", ToastKind::Info);
+            return;
+        };
+        let Some(e) = self.editor() else { return };
+        let text = e.doc.rope.to_string();
+        let defs = crate::code_intel::definitions(&text, &word.text);
+        let Some(def) = defs.first().cloned() else {
+            // Fall back to the project so cross-file symbols still resolve.
+            self.find_references(true);
+            return;
+        };
+        let at = e.doc.idx(def.line, def.col);
+        if let Some(e) = self.editor_mut() {
+            e.sel = Selection::caret(at);
+            e.center_on_cursor();
+            e.scroll_into_view();
+        }
+        self.toast(
+            format!("Definition of {} on line {}", word.text, def.line + 1),
+            ToastKind::Success,
+        );
+        self.focus = Focus::Editor;
+    }
+
+    /// List every use of the word under the caret across the project.
+    fn find_references(&mut self, definitions_only: bool) {
+        let Some(word) = self.symbol_under_caret() else {
+            self.toast("Put the cursor on a name first", ToastKind::Info);
+            return;
+        };
+        let overrides: Vec<(PathBuf, String)> = self
+            .editors
+            .iter()
+            .filter_map(|e| e.doc.path.clone().map(|p| (p, e.doc.rope.to_string())))
+            .collect();
+        let locations = match crate::code_intel::project_references(
+            &self.explorer.root,
+            &word.text,
+            &overrides,
+            500,
+        ) {
+            Ok(l) => l,
+            Err(e) => {
+                self.toast(e, ToastKind::Error);
+                return;
+            }
+        };
+        let shown: Vec<crate::code_intel::Location> = locations
+            .into_iter()
+            .filter(|l| !definitions_only || l.definition)
+            .collect();
+        if shown.is_empty() {
+            self.toast(
+                format!("No references to {} found in this project", word.text),
+                ToastKind::Info,
+            );
+            return;
+        }
+        let mut items = Vec::new();
+        let mut hints = Vec::new();
+        self.management.locations = shown.clone();
+        for (i, loc) in shown.iter().enumerate() {
+            let rel = crate::search::relative(&self.explorer.root, &loc.path);
+            items.push(format!("{rel}:{}  {}", loc.line + 1, loc.preview.trim()));
+            hints.push(if loc.definition {
+                format!("definition · {} of {}", i + 1, shown.len())
+            } else {
+                format!("{} of {}", i + 1, shown.len())
+            });
+        }
+        self.palette = Some(Palette {
+            mode: PaletteMode::Locations,
+            items,
+            hints,
+            filtered: (0..self.management.locations.len())
+                .map(|index| crate::fuzzy::Scored { index, score: 0, positions: Vec::new() })
+                .collect(),
+            ..Palette::default()
+        });
+        self.focus = Focus::Palette;
+    }
+
+    /// Explain what the symbol under the caret is and where it is used.
+    fn inspect_symbol(&mut self) {
+        let Some(e) = self.editor() else { return };
+        let (line, col) = e.cursor();
+        let Some(word) = crate::code_intel::word_at(&e.doc.line_str(line), col) else {
+            self.toast("Put the cursor on a name first", ToastKind::Info);
+            return;
+        };
+        let report = crate::code_intel::inspect(&e.doc.rope.to_string(), &word);
+        let mut items = vec![format!(
+            "{} `{}` — {} use(s), {} declaration(s)",
+            word.kind.label().to_uppercase(),
+            word.text,
+            report.references,
+            report.definitions
+        )];
+        let mut hints: Vec<String> = vec![format!("on line {}", line + 1)];
+        for finding in &report.findings {
+            items.push(finding.clone());
+            hints.push(String::new());
+        }
+        self.palette = Some(Palette {
+            mode: PaletteMode::Inspect,
+            items,
+            hints,
+            filtered: (0..1)
+                .map(|index| crate::fuzzy::Scored { index, score: 0, positions: Vec::new() })
+                .collect(),
+            ..Palette::default()
+        });
+        self.focus = Focus::Palette;
+    }
+
+    /// Ask for the new name, then apply it as one undoable edit.
+    fn rename_symbol(&mut self) {
+        let Some(word) = self.symbol_under_caret() else {
+            self.toast("Put the cursor on a name first", ToastKind::Info);
+            return;
+        };
+        let line = self.editor().map(|e| e.cursor().0).unwrap_or(0);
+        self.management.edit = Some(Edit {
+            title: format!("Rename `{}`", word.text),
+            hint: "Every occurrence in the open buffer changes as one undo step".into(),
+            value: word.text.clone(),
+            secret: false,
+            target: crate::management::EditTarget::RenameSymbol {
+                word: word.text.clone(),
+                from: word.start,
+                to: word.end,
+                line,
+            },
+        });
+        self.open_palette(PaletteMode::Input);
+    }
+
+    /// Apply a rename produced by `code_intel::rename`. Refuses rather than
+    /// guessing when the picture is ambiguous (see `code_intel`).
+    pub(crate) fn apply_rename(
+        &mut self,
+        word: &str,
+        new_name: &str,
+        _line: usize,
+    ) -> anyhow::Result<()> {
+        let Some(e) = self.editor() else {
+            anyhow::bail!("No buffer to rename in");
+        };
+        let text = e.doc.rope.to_string();
+        // Prefer the word under the caret; fall back to the first occurrence so
+        // a rename still works if the cursor moved while the prompt was open.
+        let Some(w) = crate::code_intel::word_at(&e.doc.line_str(e.cursor().0), e.cursor().1)
+            .filter(|w| w.text == word)
+            .or_else(|| {
+                crate::code_intel::occurrences(&text, word)
+                    .first()
+                    .map(|o| crate::code_intel::Word {
+                        text: word.to_string(),
+                        start: o.col,
+                        end: o.col + word.chars().count(),
+                        kind: o.kind,
+                    })
+            })
+        else {
+            anyhow::bail!("`{word}` is gone; nothing to rename");
+        };
+        let path = e.doc.path.clone().unwrap_or_else(|| PathBuf::from("buffer"));
+        let buffers = vec![(path, text.clone())];
+        let edits = match crate::code_intel::rename(&w, new_name, &buffers) {
+            Ok(edits) => edits,
+            Err(crate::code_intel::Refusal(why)) => anyhow::bail!("{why}"),
+        };
+
+        // Rewrite line by line: `occurrences` gives exact character columns for
+        // this buffer, so nothing can drift the way accumulating offsets would.
+        let touched: std::collections::BTreeSet<usize> = edits.iter().map(|e| e.line).collect();
+        let out: String = text
+            .split('\n')
+            .enumerate()
+            .map(|(i, line)| {
+                if !touched.contains(&i) {
+                    return line.to_string();
+                }
+                let mut chars: Vec<char> = line.chars().collect();
+                let mut hits: Vec<(usize, usize)> = crate::code_intel::occurrences(line, word)
+                    .into_iter()
+                    .map(|o| (o.col, o.col + word.chars().count()))
+                    .collect();
+                hits.sort_unstable();
+                for (start, end) in hits.into_iter().rev() {
+                    chars.splice(start..end, new_name.chars());
+                }
+                chars.into_iter().collect()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if let Some(e) = self.editor_mut() {
+            e.replace_document(&out);
+        }
+        self.toast(
+            format!("Renamed {word} to {new_name} ({} change(s))", edits.len()),
+            ToastKind::Success,
+        );
+        Ok(())
+    }
+
+    /// Copy the enclosing block into a new buffer, so it can be moved or
+    /// reused without touching the original.
+    fn extract_block(&mut self) {
+        let Some(e) = self.editor() else { return };
+        let (line, _) = e.cursor();
+        let text = e.doc.rope.to_string();
+        let Some((start, end)) = crate::code_intel::enclosing_block(&text, line) else {
+            self.toast("No enclosing block to extract here", ToastKind::Info);
+            return;
+        };
+        let body: String = text
+            .split('\n')
+            .enumerate()
+            .filter(|(i, _)| (start..=end).contains(i))
+            .map(|(_, l)| format!("{l}\n"))
+            .collect();
+        let mut doc = crate::document::Document::from_text(&body, None);
+        doc.name_override = Some(format!("extracted-lines-{}-{}.txt", start + 1, end + 1));
+        let syntax = e.doc.path.clone();
+        let mut editor = Editor::new(doc);
+        if let Some(p) = syntax {
+            editor.hl = crate::highlight::HighlightCache::new(crate::highlight::detect_syntax(
+                Some(&p),
+                &body,
+            ));
+        }
+        self.editors.push(editor);
+        self.active = self.editors.len() - 1;
+        self.focus = Focus::Editor;
+        self.toast(
+            format!("Extracted lines {}–{} into a new buffer", start + 1, end + 1),
+            ToastKind::Success,
+        );
+    }
+
+    /// Sort or dedupe the selected lines (or the whole buffer).
+    fn transform_lines(&mut self, dedupe: bool) {
+        let Some(e) = self.editor_mut() else { return };
+        let text = e.doc.rope.to_string();
+        let (from, to) = if e.sel.start() == e.sel.end() {
+            (0, text.split('\n').count().saturating_sub(1))
+        } else {
+            let (a, _) = e.doc.pos(e.sel.start().min(e.sel.end()));
+            let (b, _) = e.doc.pos(e.sel.start().max(e.sel.end()));
+            (a, b)
+        };
+        let next = if dedupe {
+            crate::code_intel::dedupe_lines(&text, from, to)
+        } else {
+            crate::code_intel::sort_lines(&text, from, to)
+        };
+        if next == text {
+            self.toast("Nothing to change", ToastKind::Info);
+            return;
+        }
+        let changed = text.split('\n').count().saturating_sub(next.split('\n').count());
+        e.replace_document(&next);
+        self.toast(
+            if dedupe {
+                format!("Removed {changed} duplicate line(s)")
+            } else {
+                format!("Sorted lines {}–{}", from + 1, to + 1)
+            },
+            ToastKind::Success,
+        );
+    }
+
+    fn copy_symbol_path(&mut self) {
+        let Some(word) = self.symbol_under_caret() else {
+            self.toast("Put the cursor on a name first", ToastKind::Info);
+            return;
+        };
+        let Some(e) = self.editor() else { return };
+        let rel = e
+            .doc
+            .path
+            .as_ref()
+            .map(|p| crate::search::relative(&self.explorer.root, p))
+            .unwrap_or_else(|| e.doc.name());
+        let line = e.cursor().0 + 1;
+        let text = format!("{rel}:{line} {}", word.text);
+        self.clipboard.set(text.clone(), false);
+        self.toast(format!("Copied {text}"), ToastKind::Success);
     }
 
     fn convert_indent(&mut self, to_tabs: bool) {
@@ -2007,6 +2621,32 @@ impl App {
             | PaletteMode::ConfirmRemoveSkill
             | PaletteMode::ConfirmRemoveSubAgent => self.management_items(mode),
             PaletteMode::GotoLine | PaletteMode::SaveAs => (Vec::new(), Vec::new()),
+            // These are built directly where they are opened (the context menu
+            // needs the caret word, references need a project scan).
+            PaletteMode::Review => (
+                self.management
+                    .locations
+                    .iter()
+                    .map(|l| {
+                        format!(
+                            "{}:{}",
+                            crate::search::relative(&self.explorer.root, &l.path),
+                            l.line + 1
+                        )
+                    })
+                    .collect(),
+                Vec::new(),
+            ),
+            PaletteMode::ContextMenu | PaletteMode::Locations | PaletteMode::Inspect => (
+                self.management.context_commands.iter().map(|c| {
+                    crate::commands::COMMANDS
+                        .iter()
+                        .find(|i| i.cmd == *c)
+                        .map(|i| i.title.to_string())
+                        .unwrap_or_else(|| format!("{c:?}"))
+                }).collect(),
+                Vec::new(),
+            ),
         };
         let mut input = if mode == PaletteMode::Input {
             self.management
@@ -2248,13 +2888,67 @@ impl App {
             | PaletteMode::PluginCommands
             | PaletteMode::Input
             | PaletteMode::ConfirmRemoveSkill
-            | PaletteMode::ConfirmRemoveSubAgent => {
+            | PaletteMode::ConfirmRemoveSubAgent
+            | PaletteMode::Backends => {
                 self.management_accept(
                     p.mode,
                     p.filtered.get(p.selected).map(|s| s.index),
                     p.input,
                 );
             }
+            PaletteMode::ContextMenu => {
+                if let Some(s) = p.filtered.get(p.selected)
+                    && let Some(&cmd) = self.management.context_commands.get(s.index)
+                {
+                    self.run(cmd);
+                }
+            }
+            PaletteMode::Locations => {
+                if let Some(s) = p.filtered.get(p.selected)
+                    && let Some(loc) = self.management.locations.get(s.index).cloned()
+                {
+                    self.open_file(&loc.path);
+                    if let Some(e) = self.editor_mut() {
+                        let at = e.doc.idx(loc.line, loc.col);
+                        e.sel = Selection::caret(at);
+                        e.center_on_cursor();
+                        e.scroll_into_view();
+                    }
+                    self.focus = Focus::Editor;
+                }
+            }
+            PaletteMode::Review => {
+                if let Some(s) = p.filtered.get(p.selected)
+                    && let Some(loc) = self.management.locations.get(s.index).cloned()
+                {
+                    self.open_file(&loc.path);
+                    if let Some(e) = self.editor_mut() {
+                        let at = e.doc.idx(loc.line, loc.col);
+                        e.sel = Selection::caret(at);
+                        e.center_on_cursor();
+                        e.scroll_into_view();
+                    }
+                    self.focus = Focus::Editor;
+                    // The row is a location, not a permission slip: the edit
+                    // itself still goes through the normal editor review.
+                    if let Some(proposal) = self
+                        .management
+                        .review
+                        .proposals
+                        .iter()
+                        .find(|pr| pr.path == loc.path && pr.line == loc.line)
+                        .cloned()
+                        && !proposal.old.is_empty()
+                        && proposal.old != proposal.new
+                    {
+                        self.toast(
+                            format!("{} — {}", proposal.summary, proposal.kind.label()),
+                            ToastKind::Info,
+                        );
+                    }
+                }
+            }
+            PaletteMode::Inspect => {}
             PaletteMode::Files => {
                 if let Some(f) = chosen {
                     let path = self.explorer.root.join(f);
@@ -3442,6 +4136,29 @@ impl App {
                 Some(e) => json!(e.doc.rope.to_string()),
                 None => Value::Null,
             },
+            // A plugin renders something the editor cannot (Markdown, a
+            // report) and shows it read-only in a new tab. `title` names it;
+            // the text is never written over the source buffer.
+            "editor.preview" => {
+                let text = params
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let title = params
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Preview")
+                    .to_string();
+                let mut doc = crate::document::Document::from_text(&text, None);
+                doc.preview = Some(crate::document::Preview::Text(text));
+                let mut editor = Editor::new(doc);
+                editor.doc.name_override = Some(title);
+                self.editors.push(editor);
+                self.active = self.editors.len() - 1;
+                self.focus = Focus::Editor;
+                Value::Null
+            }
             "editor.path" => match self.editor().and_then(|e| e.doc.path.clone()) {
                 Some(p) => json!(p.to_string_lossy()),
                 None => Value::Null,

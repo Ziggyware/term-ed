@@ -67,7 +67,7 @@ termed adapts to phone terminals such as Termux, Blink, Termius and iSH. Below 8
 - Box (column) selection like Visual Studio: Alt+Shift+arrows or Alt+drag. Typing, Tab, Backspace and Delete edit every line of the column, and copy/paste work per line.
 - Undo and redo that group typing into words, like VS.
 - Find and replace with match case, whole word and regex options (including `$1` capture groups), plus replace-one and replace-all.
-- **Find in files** (`Ctrl+Shift+F`) and **Replace in Files** (`Ctrl+Shift+H`): pick the folder to search in the *root* box (empty = the project, `~/code/app` and `../other` work too), then filter with the *dirs* box (`src` scopes the search, `!bin;!obj` skips folders and everything under them) and the *files* box (`*.cs;!*.csproj`; `*`, `?`, `[...]` and `**` globs). Results are grouped by file with highlighted hits; `↑`/`↓` walk them, `Enter` opens one, clicking a file header collapses it. Replace All edits open files in memory (so `Ctrl+Z` undoes it and they stay unsaved) and writes the rest to disk; `$1` groups work in regex mode and `⇄` replaces a single hit. `.gitignore` is honored and binary or >2 MB files are skipped.
+- **Find in files** (`Ctrl+Shift+I`) and **Replace in Files** (`Ctrl+Shift+H`): pick the folder to search in the *root* box (empty = the project, `~/code/app` and `../other` work too), then filter with the *dirs* box (`src` scopes the search, `!bin;!obj` skips folders and everything under them) and the *files* box (`*.cs;!*.csproj`; `*`, `?`, `[...]` and `**` globs). Results are grouped by file with highlighted hits; `↑`/`↓` walk them, `Enter` opens one, clicking a file header collapses it. Replace All edits open files in memory (so `Ctrl+Z` undoes it and they stay unsaved) and writes the rest to disk; `$1` groups work in regex mode and `⇄` replaces a single hit. `.gitignore` is honored and binary or >2 MB files are skipped.
 - Copy with no selection copies the whole line, and pasting it inserts the line above, as in VS.
 - Clipboard works through OSC 52 (over SSH and in tmux) and through `wl-copy`, `xclip`, `xsel` or `pbcopy`.
 - Full mouse support: click, drag-select, double-click a word, triple-click a line, click the gutter to select a line, scroll, use tabs and the tree, drag the minimap or scrollbar, and resize the sidebar.
@@ -85,7 +85,7 @@ See [images, archive safety, controls and UI/UX research](docs/assets-and-interf
 
 ### Find in files
 
-`Ctrl+Shift+F` (or **Find in Files** in the command palette) opens the panel above the editor. Search runs asynchronously: the editor stays responsive, a live progress line shows scanned files/matches/skips and the current path, and **Stop** (or `Esc`) cancels. Results stream in as they are found, include unsaved editor buffers (even new or ignored files with a path), and are grouped by file: click a file header to collapse it, click a hit to open it. The result list is virtualized and capped by a configurable **Limit** (default 10,000, max 100,000) instead of a hidden per-file cap.
+`Ctrl+Shift+I` (or **Find in Files** in the command palette) opens the panel above the editor. Search runs asynchronously: the editor stays responsive, a live progress line shows scanned files/matches/skips and the current path, and **Stop** (or `Esc`) cancels. Results stream in as they are found, include unsaved editor buffers (even new or ignored files with a path), and are grouped by file: click a file header to collapse it, click a hit to open it. The result list is virtualized and capped by a configurable **Limit** (default 10,000, max 100,000) instead of a hidden per-file cap.
 
 The targets are independently selectable: **Content**, **File names** and **Directory names** (`Alt+1` / `Alt+2` / `Alt+3`). **Skip binary (NUL)** (`Alt+b`) ignores any file containing a zero byte for content scans; file/directory-name targets still match those paths. The limit is persisted in user preferences (`search.max_results`) and can be edited in the panel (`Alt+l`), where an invalid value is rejected instead of silently clamped.
 
@@ -106,7 +106,7 @@ The fields are cycled with `Tab`: **query**, optional **replace**, **root** (emp
 | `F5` | Re-run the search after changes made behind the panel |
 | `Esc` | Stop a running search, otherwise close the panel |
 
-Directory scopes also work below intermediate folders (`src`, `**/src`, `packages/*/src`). Explicit filters still apply to open buffers. Missing/inaccessible roots and filesystem errors are reported instead of silently returning an unexplained empty result. **Search** in the desktop title bar is an alternative to `Ctrl+Shift+F` for terminals that cannot distinguish shifted Ctrl keys.
+Directory scopes also work below intermediate folders (`src`, `**/src`, `packages/*/src`). Explicit filters still apply to open buffers. Missing/inaccessible roots and filesystem errors are reported instead of silently returning an unexplained empty result. **Search** in the desktop title bar is an alternative to `Ctrl+Shift+I` for terminals that cannot distinguish shifted Ctrl keys.
 
 Regex mode supports capture groups in the replacement (`$1`, `${name}`). Matches inside a folder excluded by the filter are never touched, even by Replace All. Replacement requires a completed **Content** search and refuses truncated result lists; raise the limit or narrow the filters first. Content files are bounded to 16 MiB (2 MiB for replacement) and oversized files are reported as skips rather than silently searched.
 
@@ -122,13 +122,15 @@ Open **Settings** in the desktop title bar or press **Ctrl+,**. The command pale
 - **Configurable sub-agents:** create and manage isolated built-in specialists with their own role, model, skills, budgets and permissions. Reviewer, Test planner and Coordinator start read-only. The coordinator can delegate to grandchildren within depth, task and deadline limits; the visible overwatch ledger tracks every result and cancels orphaned subtrees.
 - **Managed skills:** create/edit, enable/disable, attach and remove Markdown instruction skills in `.termed/skills/<id>/SKILL.md`; user skills are discovered too. Enabled skills can be attached per agent or read on demand.
 
-See [router setup, supervised task trees and generated functions](docs/router-and-supervision.md), [local ONNX inference](docs/local-inference.md), and [the configuration and safety guide](docs/agent-configuration.md) for settings JSON, provider setup, scope and limits. External ACP agents and plugins are trusted local processes, **not an OS sandbox**. [Ten additional feature proposals](docs/feature-roadmap.md) describe recommended next steps, not features implemented here.
+See [router setup, supervised task trees and generated functions](docs/router-and-supervision.md), [local ONNX inference](docs/local-inference.md), [code intelligence](docs/code-intelligence.md), and [the configuration and safety guide](docs/agent-configuration.md) for settings JSON, provider setup, scope and limits. External ACP agents and plugins are trusted local processes, **not an OS sandbox**. [Ten additional feature proposals](docs/feature-roadmap.md) describe recommended next steps, not features implemented here.
 
 ### Plugins
 
 - Add commands with a folder and a script, in any language. A plugin is a manifest plus a program that speaks JSON-RPC over stdin/stdout, so a Python, Node, Go or Rust script is a plugin; the palette gets its commands and the manifest can claim keybindings. The **Plugins** title-bar menu or `Ctrl+Alt+P` opens the plugin manager (commands, reload, reinstall the bundled set, enable/disable and AI access).
 - Reads VS Code extension manifests (`package.json` with `contributes.commands`), so `prettier-vscode`, `eslint` and friends appear in the manager with a clear reason when they need a bridge — and a one-line adapter makes them runnable.
-- Four plugins ship in the binary: **text-tools** (`Ctrl+Alt+L` sorts lines, plus de-duplicate, trim, case, format/minify JSON), **todo** (`Ctrl+Alt+T` lists `TODO`/`FIXME` markers across the project), **stats** (words/characters/lines) and **git-info** (`Ctrl+Alt+G` branch and status). See [docs/plugins.md](docs/plugins.md).
+- **Code intelligence without a language server.** `Ctrl+Shift+Space` opens a context menu for the symbol under the caret: go to definition (`F12`), find all references (`Shift+F12`), inspect it (`Ctrl+F2`), rename it (`F2`, refused rather than guessed when ambiguous), extract the enclosing block, or sort/dedupe the selection. Nothing is installed and no daemon runs. See [code intelligence](docs/code-intelligence.md).
+- **Semantic and unattended search.** `Ctrl+Alt+F` ranks the project against your selection using an on-device ONNX encoder, so you find code that *does* the thing when you cannot remember its name. **Agent: Review the Project for Obvious Bugs** lists duplicate blocks, swallowed errors, unbalanced brackets and `TODO` markers — and applies nothing without approval; only high-confidence fixes can ever be applied unattended, and only if you opt in. See [code intelligence](docs/code-intelligence.md).
+- Five plugins ship in the binary: **markdown-preview** (**Markdown: Preview in Browser** renders the live buffer to a dark-mode page and opens it, or **Preview Here** shows it read-only in the editor), **text-tools** (`Ctrl+Alt+L` sorts lines, plus de-duplicate, trim, case, format/minify JSON), **todo** (`Ctrl+Alt+T` lists `TODO`/`FIXME` markers across the project), **stats** (words/characters/lines) and **git-info** (`Ctrl+Alt+G` branch and status). See [docs/plugins.md](docs/plugins.md).
 
 ## Install
 
@@ -160,13 +162,18 @@ You need a terminal with truecolor support to get the full look (Windows Termina
 | ZIP: expand / open as file (Explorer) | `Enter` or `Right` / `Shift+Enter` |
 | Image: zoom / pan / fit | `+` and `-` / arrows / `0` or `Home` |
 | Find / replace / next / previous | `Ctrl+F` / `Ctrl+H` / `F3` / `Shift+F3` |
-| Find / replace in files | `Ctrl+Shift+F` / `Ctrl+Shift+H` |
+| Find / replace in files | `Ctrl+Shift+I` / `Ctrl+Shift+H` |
 | Plugin manager | `Ctrl+Alt+P` |
 | Settings | `Ctrl+,` |
 | Bundled plugins: sort lines / TODOs / git status | `Ctrl+Alt+L` / `Ctrl+Alt+T` / `Ctrl+Alt+G` |
+| Markdown: preview in browser / preview here | `Ctrl+Shift+M` / command palette |
 | Find options: case, word, regex | `Alt+C`, `Alt+W`, `Alt+R` |
 | Go to line (`line:col`) | `Ctrl+G` |
 | Go to matching bracket | `Ctrl+\` |
+| Context menu (refactor, inspect, definitions) | `Ctrl+Shift+Space` |
+| Go to definition / find references | `F12` / `Shift+F12` |
+| Rename symbol / inspect symbol | `F2` / `Ctrl+F2` |
+| Find related code (semantic) | `Ctrl+Alt+F` |
 | Undo / redo | `Ctrl+Z` / `Ctrl+Y`, `Ctrl+Shift+Z` |
 | Cut / copy / paste | `Ctrl+X` / `Ctrl+C` / `Ctrl+V`, `Shift+Insert`, or `Alt+V` |
 | Select all / line / next occurrence | `Ctrl+A` / `Ctrl+L` / `Ctrl+D` |

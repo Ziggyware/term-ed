@@ -1,0 +1,22 @@
+{
+  "name": "markdown-preview",
+  "version": "1.0.1",
+  "description": "Render the current Markdown buffer: a styled page in your browser, or a read-only preview in the editor",
+  "author": "termed",
+  "command": [
+    "python3",
+    "main.py"
+  ],
+  "events": [],
+  "commands": [
+    {
+      "id": "preview",
+      "title": "Markdown: Preview in Browser",
+      "keys": "ctrl+shift+m"
+    },
+    {
+      "id": "preview-terminal",
+      "title": "Markdown: Preview Here"
+    }
+  ]
+}

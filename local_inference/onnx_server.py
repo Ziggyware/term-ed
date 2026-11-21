@@ -121,6 +121,11 @@ def _download(url: str, dest: str) -> None:
     os.replace(tmp, dest)
 
 
+# Small encoder for /v1/embeddings. ~23 MB quantised, so it is cheap to fetch
+# and fast on a CPU; sentence-transformers/all-MiniLM-L6-v2 is the same model.
+DEFAULT_EMBEDDING_MODEL = "Xenova/all-MiniLM-L6-v2"
+
+
 def _hf_wanted_files(repo: str) -> list[str]:
     api = f"{HUB}/api/models/{repo}"
     req = urllib.request.Request(api, headers={"User-Agent": USER_AGENT})
@@ -483,13 +488,81 @@ class OnnxEngine:
 # HTTP server
 # --------------------------------------------------------------------------
 
+class EmbeddingEngine:
+    """A separate, much smaller ONNX model for `POST /embeddings`.
+
+    Encoder models (MiniLM and friends) take `input_ids`/`attention_mask` and
+    return a hidden state; there is no KV cache and no chat template, so this
+    shares nothing with `OnnxEngine` except the ONNX Runtime call.
+    """
+
+    def __init__(self, model_dir: str):
+        import numpy as np
+        import onnxruntime as ort
+        from tokenizers import Tokenizer
+
+        self.np = np
+        onnx_path = find_onnx_file(model_dir)
+        if not onnx_path:
+            raise RuntimeError(f"no .onnx file found in {model_dir}")
+        tok_path = os.path.join(model_dir, "tokenizer.json")
+        if not os.path.isfile(tok_path):
+            raise RuntimeError(f"no tokenizer.json found in {model_dir}")
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = os.cpu_count() or 1
+        self.session = ort.InferenceSession(
+            onnx_path, sess_options=opts, providers=["CPUExecutionProvider"]
+        )
+        self.tokenizer = Tokenizer.from_file(tok_path)
+        if self.tokenizer.padding is None:
+            # Batch inputs must be rectangular; pad to the longest in the batch.
+            self.tokenizer.enable_padding()
+        self.tokenizer.enable_truncation(max_length=512)
+        names = {i.name for i in self.session.get_inputs()}
+        self.input_name = "input_ids" if "input_ids" in names else "input_ids"
+        self.mask_name = "attention_mask" if "attention_mask" in names else None
+        self.type_ids_name = "token_type_ids" if "token_type_ids" in names else None
+        self.output_name = self.session.get_outputs()[0].name
+        log(f"embedding model ready: {onnx_path}")
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        """Mean-pool the token vectors, then L2-normalise."""
+        np = self.np
+        encodings = self.tokenizer.encode_batch(texts)
+        ids = np.array([e.ids for e in encodings], dtype=np.int64)
+        feeds = {self.input_name: ids}
+        if self.mask_name:
+            feeds[self.mask_name] = np.array(
+                [e.attention_mask for e in encodings], dtype=np.int64
+            )
+        if self.type_ids_name:
+            feeds[self.type_ids_name] = np.array(
+                [e.type_ids for e in encodings], dtype=np.int64
+            )
+        hidden = self.session.run([self.output_name], feeds)[0]
+        mask = np.array([e.attention_mask for e in encodings], dtype=np.float32)
+        mask = mask[..., None]                       # (batch, tokens, 1)
+        summed = (hidden * mask).sum(axis=1)
+        counts = np.clip(mask.sum(axis=1), 1e-9, None)
+        pooled = summed / counts
+        norms = np.linalg.norm(pooled, axis=1, keepdims=True)
+        pooled = pooled / np.clip(norms, 1e-12, None)
+        return pooled.astype(np.float32).tolist()
+
+
 class State:
-    def __init__(self, model_id: str):
+    def __init__(self, model_id: str, embedding_id: str | None = None):
         self.model_id = model_id
         self.engine: OnnxEngine | None = None
         self.error: str | None = None
         self.lock = threading.Lock()
         self.gen_lock = threading.Lock()
+        # Embeddings are optional and load independently: a chat model that
+        # works must not be taken down by a missing embedding model.
+        self.embedding_id = embedding_id
+        self.embeddings: EmbeddingEngine | None = None
+        self.embedding_error: str | None = None
+        self.embedding_loading = embedding_id is not None
 
 
 STATE: State | None = None
@@ -527,11 +600,20 @@ class Handler(BaseHTTPRequestHandler):
             state = STATE
             assert state is not None
             if state.engine is not None:
-                self._send_json(200, {
+                body = {
                     "status": "ok",
                     "model": state.model_id,
                     "version": __version__,
-                })
+                }
+                # Embeddings are reported separately: chat works even when the
+                # encoder is missing, so `status` stays "ok".
+                if state.embedding_id:
+                    body["embeddings"] = (
+                        "ok" if state.embeddings is not None
+                        else ("failed" if state.embedding_error else "loading")
+                    )
+                    body["embedding_model"] = state.embedding_id
+                self._send_json(200, body)
             elif state.error:
                 self._send_json(503, {
                     "status": "failed",
@@ -561,11 +643,65 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send_json(404, error_body(f"unknown route: {path}", "not_found"))
 
+    def _handle_embeddings(self) -> None:
+        """`POST /v1/embeddings` (OpenAI-compatible) for semantic search."""
+        payload, err = self._read_json()
+        if payload is None:
+            self._send_json(err or 400, error_body("invalid JSON body"))
+            return
+        state = STATE
+        assert state is not None
+        if state.embedding_id is None:
+            self._send_json(503, error_body(
+                "no embedding model configured; start the server with --embedding-model",
+                "embeddings_unavailable"))
+            return
+        if state.embeddings is None:
+            if state.embedding_error:
+                self._send_json(503, error_body(
+                    f"embedding model failed to load: {state.embedding_error}",
+                    "embeddings_unavailable"))
+            else:
+                self._send_json(503, error_body(
+                    "embedding model is still loading", "model_loading"))
+            return
+        raw = payload.get("input")
+        if isinstance(raw, str):
+            texts = [raw]
+        elif isinstance(raw, list) and all(isinstance(t, str) for t in raw):
+            texts = raw
+        else:
+            self._send_json(400, error_body("input must be a string or list of strings"))
+            return
+        if not texts:
+            self._send_json(400, error_body("input must not be empty"))
+            return
+        if len(texts) > 256:
+            self._send_json(400, error_body("at most 256 inputs per request"))
+            return
+        try:
+            vectors = state.embeddings.embed(texts)
+        except Exception as exc:  # noqa: BLE001 - surfaced to the client
+            self._send_json(500, error_body(f"embedding failed: {exc}", "embedding_failed"))
+            return
+        self._send_json(200, {
+            "object": "list",
+            "model": state.embedding_id,
+            "data": [
+                {"object": "embedding", "index": i, "embedding": v}
+                for i, v in enumerate(vectors)
+            ],
+            "usage": {"prompt_tokens": sum(len(t.split()) for t in texts), "total_tokens": 0},
+        })
+
     def do_POST(self) -> None:  # noqa: N802 (stdlib naming)
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         if path == "/admin/shutdown":
             self._send_json(200, {"status": "shutting_down"})
             threading.Thread(target=self.server.shutdown, daemon=True).start()
+            return
+        if path == "/v1/embeddings":
+            self._handle_embeddings()
             return
         if path != "/v1/chat/completions":
             self._send_json(404, error_body(f"unknown route: {path}", "not_found"))
@@ -747,6 +883,17 @@ def load_model(state: State, model: str, cache_dir: str) -> None:
         log(f"model load failed: {exc}")
 
 
+def load_embeddings(state: State, model: str, cache_dir: str) -> None:
+    try:
+        model_dir = resolve_model_dir(model, cache_dir)
+        state.embeddings = EmbeddingEngine(model_dir)
+    except Exception as exc:  # noqa: BLE001 - reported via /healthz and /embeddings
+        state.embedding_error = str(exc)
+        log(f"embedding model load failed: {exc}")
+    finally:
+        state.embedding_loading = False
+
+
 def main() -> int:
     global STATE, MAX_TOKENS
     parser = argparse.ArgumentParser(description=__doc__)
@@ -760,17 +907,28 @@ def main() -> int:
                         help="server-side cap for a single completion")
     parser.add_argument("--prewarm", action="store_true",
                         help="download the model and exit (no ONNX Runtime needed)")
+    parser.add_argument("--prewarm-embeddings", action="store_true",
+                        help="with --prewarm, also fetch the default embedding model")
+    parser.add_argument("--embedding-model", default=None,
+                        help="encoder model for /v1/embeddings "
+                             "(e.g. Xenova/all-MiniLM-L6-v2); omitted = route disabled")
     args = parser.parse_args()
     MAX_TOKENS = max(1, min(args.max_tokens, MAX_OUTPUT_TOKENS))
     if args.prewarm:
-        try:
-            model_dir = prewarm(args.model, args.cache_dir)
-        except RuntimeError as exc:
-            log(f"prewarm failed: {exc}")
-            return 1
-        log(f"model ready in {model_dir}")
+        targets = [args.model]
+        # Prefetching the encoder is opt-in: it is only needed for semantic
+        # search, so a plain `--prewarm` should not pull two models.
+        if args.prewarm_embeddings:
+            targets.append(args.embedding_model or DEFAULT_EMBEDDING_MODEL)
+        for target in targets:
+            try:
+                model_dir = prewarm(target, args.cache_dir)
+            except RuntimeError as exc:
+                log(f"prewarm failed for {target}: {exc}")
+                return 1
+            log(f"model ready in {model_dir}")
         return 0
-    STATE = State(args.model)
+    STATE = State(args.model, args.embedding_model)
     try:
         server = ThreadingHTTPServer((args.host, args.port), Handler)
     except OSError as exc:
@@ -781,6 +939,12 @@ def main() -> int:
         target=load_model, args=(STATE, args.model, args.cache_dir), daemon=True
     )
     loader.start()
+    if args.embedding_model:
+        threading.Thread(
+            target=load_embeddings,
+            args=(STATE, args.embedding_model, args.cache_dir),
+            daemon=True,
+        ).start()
     log(f"listening on http://{args.host}:{args.port}/v1 (model {args.model})")
     try:
         server.serve_forever()

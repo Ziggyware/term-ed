@@ -99,10 +99,15 @@ impl Indent {
 pub enum Preview {
     Image(crate::image_view::ImageView),
     Archive(crate::archive::Index),
+    /// Output produced by a plugin (Markdown rendering, reports). Read-only,
+    /// and never written back over the file it came from.
+    Text(String),
 }
 
 pub struct Document {
     pub preview: Option<Preview>,
+    /// Tab title for a buffer with no path (plugin previews, scratch output).
+    pub name_override: Option<String>,
     archive_stamp: Option<crate::archive::MemberVersion>,
     /// Stable for this buffer's lifetime, even when tabs move or paths change.
     pub(crate) id: u64,
@@ -207,6 +212,7 @@ impl Document {
                 }
                 fs::copy(source, path)?;
             }
+            Some(Preview::Text(text)) => fs::write(path, text)?,
             None => anyhow::bail!("Not a binary preview"),
         }
         Ok(())
@@ -244,6 +250,7 @@ impl Document {
         static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self {
             preview: None,
+            name_override: None,
             archive_stamp: None,
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             rope: Rope::from_str(&normalized),
@@ -264,6 +271,9 @@ impl Document {
     }
 
     pub fn name(&self) -> String {
+        if let Some(name) = &self.name_override {
+            return name.clone();
+        }
         self.path
             .as_ref()
             .and_then(|p| p.file_name())

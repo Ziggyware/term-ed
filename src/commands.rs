@@ -76,6 +76,19 @@ pub enum Command {
     FocusPrevTerminal,
     ToggleTerminalDock,
     CloseTerminal,
+    // Code intelligence, reached from the editor context menu.
+    ContextMenu,
+    GotoDefinition,
+    FindReferences,
+    InspectSymbol,
+    RenameSymbol,
+    ExtractBlock,
+    SortLines,
+    DedupeLines,
+    CopySymbolPath,
+    // Semantic search and unattended maintenance.
+    FindRelated,
+    ReviewCode,
 }
 
 pub struct CommandInfo {
@@ -111,7 +124,7 @@ cmds! {
     SelectNextOccurrence, "Selection: Add Next Occurrence", "Ctrl+D";
     Find, "Edit: Find", "Ctrl+F / Alt+I";
     Replace, "Edit: Replace", "Ctrl+H";
-    FindInFiles, "Edit: Find in Files", "Ctrl+Shift+F";
+    FindInFiles, "Edit: Find in Files", "Ctrl+Shift+I";
     ReplaceInFiles, "Edit: Replace in Files", "Ctrl+Shift+H";
     Plugins, "Plugins: Manage Plugins", "Ctrl+Alt+P";
     Settings, "Preferences: Settings", "Ctrl+,";
@@ -155,6 +168,17 @@ cmds! {
     FocusNextTerminal, "Terminal: Focus Next", "F6";
     FocusPrevTerminal, "Terminal: Focus Previous", "Shift+F6";
     CloseTerminal, "Terminal: Close", "Ctrl+W";
+    ContextMenu, "Editor: Context Menu", "Ctrl+Shift+Space";
+    GotoDefinition, "Go: Go to Definition", "F12";
+    FindReferences, "Go: Find All References", "Shift+F12";
+    InspectSymbol, "Go: Inspect Symbol", "Ctrl+Shift+F12";
+    RenameSymbol, "Refactor: Rename Symbol", "F2";
+    ExtractBlock, "Refactor: Extract Enclosing Block", "";
+    SortLines, "Edit: Sort Selected Lines", "";
+    DedupeLines, "Edit: Remove Duplicate Lines", "";
+    CopySymbolPath, "Edit: Copy File:Line of Symbol", "";
+    FindRelated, "Search: Find Related Code", "Ctrl+Alt+F";
+    ReviewCode, "Agent: Review the Project for Obvious Bugs", "";
 }
 
 /// Stable access keys in the command menu, independent of the search results.

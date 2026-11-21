@@ -12,6 +12,17 @@ pub struct Management {
     pub skill: Option<String>,
     pub edit: Option<Edit>,
     pub load_error: Option<String>,
+    /// The symbol the context menu was opened on, if any.
+    pub word: Option<crate::code_intel::Word>,
+    /// Commands listed by the context menu, in row order.
+    pub context_commands: Vec<crate::commands::Command>,
+    /// Locations shown by "Find All References".
+    pub locations: Vec<crate::code_intel::Location>,
+    /// Description of what the context menu was opened on.
+    pub context_title: String,
+    /// The latest unattended-agent review, kept so accepting a row can apply
+    /// the exact proposal it was generated from.
+    pub review: crate::autofix::Report,
 }
 
 #[derive(Clone)]
@@ -20,11 +31,11 @@ pub struct Edit {
     pub hint: String,
     pub value: String,
     pub secret: bool,
-    target: EditTarget,
+    pub(crate) target: EditTarget,
 }
 
 #[derive(Clone)]
-enum EditTarget {
+pub(crate) enum EditTarget {
     Main(Field),
     Sub(String, Field),
     SubName(String),
@@ -32,6 +43,11 @@ enum EditTarget {
     CreateSub,
     CreateSkill,
     RouterKey,
+    /// Rename the symbol under the caret (from the editor context menu).
+    RenameSymbol { word: String, from: usize, to: usize, line: usize },
+    JevKey,
+    JevUrl,
+    EmbeddingModel,
 }
 
 #[derive(Clone, Copy)]
@@ -361,6 +377,10 @@ impl App {
                     ("Skills", "Manage local Markdown instruction skills"),
                     ("Plugins", "Commands, enable/disable and AI access"),
                     ("Color theme", "Choose an editor theme"),
+                    (
+                        "Backends",
+                        "Jev decisions, MCP tools, embeddings and unattended agents",
+                    ),
                 ] {
                     row(label.into(), description.into());
                 }
@@ -384,12 +404,6 @@ impl App {
                 row(
                     "Reload Settings from Disk".into(),
                     "Applies validated user settings (or a legacy workspace file)".into(),
-                );
-                row(
-                    "Open Legacy Workspace Settings JSON".into(),
-                    config::settings_path(&self.explorer.root)
-                        .display()
-                        .to_string(),
                 );
             }
             PaletteMode::AgentSettings | PaletteMode::SubAgentSettings => {
@@ -598,10 +612,100 @@ impl App {
                 row("Cancel".into(), "Keep it".into());
                 row("Delete".into(), "This cannot be undone".into());
             }
-            PaletteMode::Input => {}
+            PaletteMode::Backends => {
+                row("← Settings".into(), String::new());
+                for (label, value, hint) in self.backend_rows() {
+                    row(format!("{label}: {value}"), hint);
+                }
+            }
+            PaletteMode::Input
+            | PaletteMode::ContextMenu
+            | PaletteMode::Locations
+            | PaletteMode::Inspect
+            | PaletteMode::Review => {}
             _ => {}
         }
         rows.into_iter().unzip()
+    }
+
+    /// One row per backend service: label, current state, and what the user can
+    /// do about it. Status is read live so the panel never shows a stale claim.
+    fn backend_rows(&self) -> Vec<(String, String, String)> {
+        let mut rows = Vec::new();
+
+        // Jev typed decisions: which backend is actually answering.
+        let jev_key = std::env::var("TERMED_JEV_API_KEY")
+            .ok()
+            .filter(|k| !k.trim().is_empty())
+            .is_some();
+        let jev_url = std::env::var("TERMED_JEV_URL").unwrap_or_else(|_| "default".into());
+        rows.push((
+            "Jev decisions".into(),
+            if jev_key {
+                format!("TypeSafe cloud ({jev_url})")
+            } else {
+                "local heuristic (offline)".into()
+            },
+            if jev_key {
+                "Enter to replace the API key; Esc keeps it".into()
+            } else {
+                "Enter to add an API key for calibrated judgments".into()
+            },
+        ));
+
+        // MCP: how many tools are exposed and whether the bridge is running.
+        let tools = crate::mcp::standard_mcp_tools().len();
+        rows.push((
+            "MCP tools".into(),
+            format!(
+                "{tools} exposed · bridge {}",
+                if self.automation.bridge.is_some() {
+                    "connected"
+                } else {
+                    "idle"
+                }
+            ),
+            "Reload plugins and the tool bridge".into(),
+        ));
+
+        // Embeddings: semantic search needs an encoder model.
+        let model = if self.preferences.agent.embedding_model.trim().is_empty() {
+            crate::embeddings::DEFAULT_EMBEDDING_MODEL.to_string()
+        } else {
+            self.preferences.agent.embedding_model.clone()
+        };
+        rows.push((
+            "Embeddings".into(),
+            model,
+            "Enter to change the model, or a directory containing model.onnx".into(),
+        ));
+
+        // Unattended agent: off unless the user turns it on.
+        rows.push((
+            "Unattended fixes".into(),
+            self.autofix.describe(),
+            "Toggle background analysis; changes always need approval by default".into(),
+        ));
+
+        rows
+    }
+
+    /// Flip the unattended-analysis switch. Approval stays required: the
+    /// toggle only decides whether analysis runs, never whether edits land.
+    fn toggle_automation(&mut self) {
+        self.autofix.enabled = !self.autofix.enabled;
+        let policy = self.autofix.clone();
+        let note = policy.describe();
+        self.toast(format!("Unattended fixes: {note}"), ToastKind::Info);
+    }
+
+    fn reload_plugins_and_report(&mut self) {
+        self.plugins.reload();
+        let count = self.plugins.plugins.len();
+        self.toast(
+            format!("Reloaded {count} plugin(s) and refreshed MCP tools"),
+            ToastKind::Success,
+        );
     }
 
     fn edit_value(&mut self, target: EditTarget, title: &str, hint: &str, value: String) {
@@ -692,6 +796,13 @@ impl App {
             EditTarget::CreateSkill => PaletteMode::Skills,
             EditTarget::CreateSub => PaletteMode::SubAgents,
             EditTarget::Main(_) | EditTarget::RouterKey => PaletteMode::AgentSettings,
+            EditTarget::RenameSymbol { .. } => {
+                self.management.edit = None;
+                return;
+            }
+            EditTarget::JevKey | EditTarget::JevUrl | EditTarget::EmbeddingModel => {
+                PaletteMode::Backends
+            }
             _ => PaletteMode::SubAgentSettings,
         });
         self.management.edit = None;
@@ -736,20 +847,16 @@ impl App {
             PaletteMode::Settings => match i {
                 0 => self.open_palette(PaletteMode::AgentSettings), 1 => self.open_palette(PaletteMode::SubAgents),
                 2 => self.open_palette(PaletteMode::Skills), 3 => self.open_palette(PaletteMode::Plugins), 4 => self.open_palette(PaletteMode::Themes),
-                5..=10 => {
+                5 => self.open_palette(PaletteMode::Backends),
+                6..=11 => {
                     let mut prefs = self.preferences.clone();
-                    match i { 5=>prefs.editor.minimap=!prefs.editor.minimap, 6=>prefs.editor.whitespace=!prefs.editor.whitespace,
-                        7=>prefs.editor.indent_guides=!prefs.editor.indent_guides, 8=>prefs.editor.line_numbers=!prefs.editor.line_numbers,
-                        9=>prefs.editor.word_wrap=cycle(prefs.editor.word_wrap), _=>prefs.editor.toolbar=cycle(prefs.editor.toolbar) }
+                    match i { 6=>prefs.editor.minimap=!prefs.editor.minimap, 7=>prefs.editor.whitespace=!prefs.editor.whitespace,
+                        8=>prefs.editor.indent_guides=!prefs.editor.indent_guides, 9=>prefs.editor.line_numbers=!prefs.editor.line_numbers,
+                        10=>prefs.editor.word_wrap=cycle(prefs.editor.word_wrap), _=>prefs.editor.toolbar=cycle(prefs.editor.toolbar) }
                     self.save_preferences(prefs)?; self.open_palette(mode);
                 }
-                11 => { let path = config::user_settings_path(); if !path.exists() { self.save_preferences(self.preferences.clone())?; } self.open_file(&path); }
-                12 => { self.reload_preferences(); self.open_palette(mode); }
-                13 => {
-                    let path = config::settings_path(&self.explorer.root);
-                    if !path.exists() { bail!("No legacy workspace settings exist in this folder"); }
-                    self.open_file(&path);
-                }
+                12 => { let path = config::user_settings_path(); if !path.exists() { self.save_preferences(self.preferences.clone())?; } self.open_file(&path); }
+                13 => { self.reload_preferences(); self.open_palette(mode); }
                 _ => {}
             },
             PaletteMode::AgentSettings | PaletteMode::SubAgentSettings => {
@@ -875,6 +982,30 @@ impl App {
                     self.save_preferences(prefs)?; self.open_palette(PaletteMode::SubAgents);
                 } else { self.open_palette(PaletteMode::SubAgentSettings); }
             }
+            PaletteMode::Backends => match i {
+                0 => self.open_palette(PaletteMode::Settings),
+                1 => self.toggle_automation(),
+                2 => self.edit_value(
+                    EditTarget::JevKey,
+                    "Jev API key",
+                    "Stored privately; decides permissions with calibrated confidence",
+                    String::new(),
+                ),
+                3 => self.edit_value(
+                    EditTarget::JevUrl,
+                    "Jev endpoint",
+                    "Example: https://api.typesafe.ai/v1",
+                    std::env::var("TERMED_JEV_URL").unwrap_or_default(),
+                ),
+                4 => self.edit_value(
+                    EditTarget::EmbeddingModel,
+                    "Embedding model",
+                    "Hugging Face repo id or local directory; used for semantic search",
+                    self.preferences.agent.embedding_model.clone(),
+                ),
+                5 => self.reload_plugins_and_report(),
+                _ => {}
+            },
             PaletteMode::Input => self.accept_edit(input)?,
             _ => {}
         }
@@ -929,6 +1060,56 @@ impl App {
                         ToastKind::Success,
                     ),
                 }
+                return Ok(());
+            }
+            EditTarget::JevKey => {
+                // Environment-only: the key never enters the settings file.
+                self.management.edit = None;
+                if input.is_empty() {
+                    self.toast("No key entered; Jev stays on the local heuristic", ToastKind::Info);
+                } else {
+                    self.toast(
+                        "Set TERMED_JEV_API_KEY in your shell (the key is not written to settings)",
+                        ToastKind::Info,
+                    );
+                }
+                self.open_palette(PaletteMode::Backends);
+                return Ok(());
+            }
+            EditTarget::JevUrl => {
+                self.management.edit = None;
+                self.toast(
+                    if input.is_empty() {
+                        "Set TERMED_JEV_URL in your shell to use a non-default endpoint".to_string()
+                    } else {
+                        format!("Set TERMED_JEV_URL={input} in your shell to use it")
+                    },
+                    ToastKind::Info,
+                );
+                self.open_palette(PaletteMode::Backends);
+                return Ok(());
+            }
+            EditTarget::EmbeddingModel => {
+                let mut prefs = self.preferences.clone();
+                prefs.agent.embedding_model = input.to_string();
+                self.save_preferences(prefs)?;
+                self.toast(
+                    format!(
+                        "Semantic search model: {}",
+                        if input.is_empty() {
+                            "default"
+                        } else {
+                            input
+                        }
+                    ),
+                    ToastKind::Success,
+                );
+                self.open_palette(PaletteMode::Backends);
+                return Ok(());
+            }
+            EditTarget::RenameSymbol { word, line, .. } => {
+                self.management.edit = None;
+                self.apply_rename(&word, input, line)?;
                 return Ok(());
             }
             EditTarget::CreateSkill => {

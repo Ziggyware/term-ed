@@ -1,19 +1,23 @@
 //! termed — a terminal code editor with a Visual Studio-grade look and feel.
 
+pub mod a2a;
 pub mod aep;
 pub mod agent;
 pub mod agui;
 pub mod app;
 pub mod archive;
+pub mod autofix;
 pub mod automation;
 pub mod builtin_agent;
 pub mod clipboard;
+pub mod code_intel;
 pub mod commands;
 pub mod config;
 pub mod credentials;
 pub mod decisions;
 pub mod document;
 pub mod editor;
+pub mod embeddings;
 pub mod explorer;
 pub mod fuzzy;
 pub mod generated_tools;

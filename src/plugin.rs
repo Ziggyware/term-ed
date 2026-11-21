@@ -514,6 +514,19 @@ const BUNDLED: &[Bundled] = &[
         ],
     },
     Bundled {
+        name: "markdown-preview",
+        files: &[
+            (
+                "plugin.json",
+                include_str!("../plugins/markdown-preview/plugin.json"),
+            ),
+            (
+                "main.py",
+                include_str!("../plugins/markdown-preview/main.py"),
+            ),
+        ],
+    },
+    Bundled {
         name: "stats",
         files: &[
             ("plugin.json", include_str!("../plugins/stats/plugin.json")),
@@ -1167,34 +1180,61 @@ for line in sys.stdin:
         assert_eq!(host.commands().len(), 1);
 
         host.start(0);
-        std::thread::sleep(Duration::from_millis(200));
+        // Poll instead of sleeping a fixed amount: a cold interpreter start
+        // (first run, antivirus scanning the new script) is far slower on
+        // Windows than on a Unix CI box, and a bare `sleep` turns that into a
+        // flaky failure that looks like a protocol bug.
+        assert!(
+            host.start_errors.get(&0).is_none(),
+            "plugin failed to start: {:?}",
+            host.start_errors.get(&0)
+        );
         host.run(0, 0, None);
-        std::thread::sleep(Duration::from_millis(300));
 
-        let mut methods = Vec::new();
-        for msg in host.pump() {
-            match msg {
-                Msg::Request {
-                    method, params, id, ..
-                } => {
-                    if method == "ui.toast" {
-                        assert_eq!(params["message"], "hi do");
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let (mut methods, mut results, mut junk, mut exited) = (Vec::new(), 0usize, Vec::new(), None);
+        while std::time::Instant::now() < deadline {
+            for msg in host.pump() {
+                match msg {
+                    Msg::Request {
+                        method, params, id, ..
+                    } => {
+                        if method == "ui.toast" {
+                            assert_eq!(params["message"], "hi do");
+                        }
+                        methods.push((method, id));
                     }
-                    methods.push((method, id));
+                    Msg::Response { result, .. } => {
+                        assert_eq!(result.expect("command succeeded")["ok"], true);
+                        results += 1;
+                    }
+                    Msg::Exited { code, .. } => exited = Some(code),
+                    Msg::Junk { line, .. } => junk.push(line),
                 }
-                Msg::Response { result, .. } => {
-                    assert_eq!(result.expect("command succeeded")["ok"], true);
-                }
-                Msg::Exited { .. } => panic!("plugin exited"),
-                Msg::Junk { line, .. } => panic!("junk: {line}"),
             }
+            let toast = methods.iter().any(|(m, _)| m == "ui.toast");
+            let root = methods
+                .iter()
+                .any(|(m, id)| m == "project.root" && *id == Some(99));
+            if (toast && root && results > 0) || exited.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
-        assert!(methods.iter().any(|(m, _)| m == "ui.toast"), "{methods:?}");
+        assert!(
+            exited.is_none(),
+            "plugin exited: {exited:?}; stderr: {junk:?}"
+        );
+        assert!(results > 0, "no command response; stderr: {junk:?}");
+        assert!(
+            methods.iter().any(|(m, _)| m == "ui.toast"),
+            "no ui.toast; got {methods:?}; stderr: {junk:?}"
+        );
         assert!(
             methods
                 .iter()
                 .any(|(m, id)| m == "project.root" && *id == Some(99)),
-            "{methods:?}"
+            "no project.root; got {methods:?}; stderr: {junk:?}"
         );
         host.stop(0);
         let _ = std::fs::remove_dir_all(&root);
