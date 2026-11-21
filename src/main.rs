@@ -35,6 +35,21 @@ struct Args {
     /// Remove the saved local router key and exit (does not unset the environment).
     #[arg(long)]
     router_logout: bool,
+    /// Use on-device ONNX inference (starts the local server; no network or key).
+    #[arg(long, conflicts_with = "router")]
+    local: bool,
+    /// Base URL of the local ONNX server (default http://127.0.0.1:8080/v1).
+    #[arg(long, env = "TERMED_LOCAL_ENDPOINT")]
+    local_endpoint: Option<String>,
+    /// Run the local ONNX server in the foreground and exit on Ctrl-C.
+    #[arg(long)]
+    local_serve: bool,
+    /// Model for the local ONNX server: a Hugging Face repo id or a directory.
+    #[arg(long)]
+    local_model: Option<String>,
+    /// Port for --local-serve (default 8080; 0 picks a free port).
+    #[arg(long)]
+    local_port: Option<u16>,
     /// Color theme (see --list-themes).
     #[arg(
         short,
@@ -72,6 +87,29 @@ fn main() -> Result<()> {
     if let Some(address) = &args.mcp_bridge {
         return termed::tool_bridge::run_stdio(address);
     }
+    if args.local_serve {
+        // Reuse a configured endpoint when one is given; otherwise serve the
+        // default port next to the default endpoint the agent will use.
+        let port = args.local_port.unwrap_or_else(|| {
+            args.local_endpoint
+                .as_deref()
+                .and_then(termed::local_server::endpoint_port)
+                .unwrap_or(8080)
+        });
+        let endpoint = match &args.local_endpoint {
+            Some(endpoint) => endpoint.clone(),
+            None => format!("http://127.0.0.1:{port}/v1"),
+        };
+        return termed::local_server::serve_foreground(
+            &endpoint,
+            args.local_model
+                .as_deref()
+                .unwrap_or(termed::local_server::DEFAULT_MODEL),
+            port,
+        )
+        .map_err(anyhow::Error::msg);
+    }
+
     if args.router_login {
         termed::credentials::import_from_terminal()?;
         eprintln!(
@@ -146,6 +184,16 @@ fn main() -> Result<()> {
         app.agent
             .configure(app.preferences.agent.clone(), String::new())
             .map_err(anyhow::Error::msg)?;
+    }
+    if args.local {
+        app.preferences.agent.use_local();
+        app.agent
+            .configure(app.preferences.agent.clone(), String::new())
+            .map_err(anyhow::Error::msg)?;
+    }
+    if let Some(endpoint) = &args.local_endpoint {
+        app.preferences.agent.local_endpoint = endpoint.clone();
+        app.preferences.agent.validate().map_err(anyhow::Error::msg)?;
     }
 
     if let Some(port) = args.agui_port {

@@ -32,6 +32,23 @@ Open **F1 → Agent: Configure AI Agent** (or **F1, Alt+A**). Use the **builtin*
 
 Run `llama-server` on the same machine as Termed and wait for the model to load before opening the agent. Use a tool-capable instruct model with a compatible chat template; llama.cpp may need `--jinja` for tool calls. With an 8,192-token context, start with a smaller **Model output token budget** (e.g. 1,024) to leave room for instructions, tools, and history. If the server is still starting or Kono is waking from sleep, retry once it is ready.
 
+## On-device ONNX inference
+
+termed can run the built-in agent on a local ONNX model with ONNX Runtime:
+no network, no API key. It is used **automatically when the provider returns
+HTTP 503** (or any other 5xx), and can be selected outright with **Use Local
+ONNX Inference**, `"provider": "local"` or `--local`. If local inference also
+fails, the turn goes back to the configured provider.
+
+Set up Python with `pip install -r local_inference/requirements.txt`; the
+default model (~150 MB) downloads once from Hugging Face and then runs
+offline. termed starts the server from the embedded
+`local_inference/onnx_server.py` on the **Local ONNX endpoint** (default
+`http://127.0.0.1:8080/v1`) and reuses it across sessions. Only loopback
+`http://` endpoints are started automatically; run `termed --local-serve` to
+serve one yourself. See [local ONNX inference](local-inference.md) for models,
+logs, limits and tests.
+
 ## Configuring the primary agent
 
 The agent configuration menu exposes:
@@ -41,7 +58,8 @@ The agent configuration menu exposes:
 | Backend | `builtin` (default), `custom`, or the exact display name of an installed ACP agent; legacy `auto` selects the built-in agent |
 | Custom ACP command | An argv string with single/double-quoted arguments; no shell expansion. Set it before choosing `custom` |
 | Model | Explicit provider model ID; empty uses the provider default or discovers the first model advertised by a custom server |
-| API base URL | Built-in agent's OpenAI-compatible base URL, including `/v1` when required; empty uses the selected provider. The default router uses `https://nokey-router.ziggyware.deno.net/v1` |
+| API base URL | Built-in agent's OpenAI-compatible base URL, including `/v1` when required; empty uses the selected provider. The default router uses `https://nokey-router.ziggyware.deno.net/v1`. Ignored while the `local` provider is selected |
+| Local ONNX endpoint | On-device ONNX server base URL used by the `local` provider and the 503 fallback; empty uses `http://127.0.0.1:8080/v1` |
 | API key environment variable | **The name of an environment variable**, never the API key itself |
 | Instructions | Role, conventions and additional instructions; use JSON for multiple lines |
 | Step budget | 1–100 built-in model/tool rounds per turn (default 30) |
@@ -54,7 +72,7 @@ The agent configuration menu exposes:
 | Delegations per turn | 1–32 total tasks for the whole root tree (default 4); descendants share this budget |
 | Task timeout | 10–1800 seconds (default 300) for the root turn and inherited absolute specialist deadlines, including approval waits |
 | Attach editor context | Include the active file and selection in prompts and bounded worker briefs |
-| Built-in provider | `router` (default), `auto` (legacy Kilo/custom), `kilo`, `custom`; external ACP processes configure their own providers |
+| Built-in provider | `router` (default), `auto` (legacy Kilo/custom), `kilo`, `custom`, `local` (on-device ONNX, alias `onnx`); external ACP processes configure their own providers |
 | Maximum agent depth | 1–3 (default 2): root=0, child=1, grandchild=2; every ancestor can impose a smaller cap |
 | Concurrent tasks | 1–8 active tasks (default 4), including waiting coordinators; new delegation fails fast when full |
 | Overwatch stall timeout | 15–600 seconds (default 150); child/approval/plugin waits are exempt from idle detection, not absolute deadlines |

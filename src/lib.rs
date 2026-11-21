@@ -22,6 +22,7 @@ pub mod highlight;
 pub mod icons;
 pub mod image_view;
 pub mod dock;
+pub mod local_server;
 pub mod management;
 pub mod mcp;
 mod model_response;

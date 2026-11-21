@@ -37,6 +37,9 @@ fn gateway() -> String {
 }
 /// Kilo's router across its free models.
 pub const DEFAULT_MODEL: &str = "kilo-auto/free";
+/// Output cap for on-device ONNX inference: small CPU models are slow, and a
+/// runaway reply should not hold the turn open for the whole task budget.
+const LOCAL_MAX_OUTPUT_TOKENS: usize = 1024;
 
 /// Start the agent thread. `out` receives the JSON-RPC messages an external
 /// agent would print; the returned sender takes the messages we'd write to it.
@@ -95,6 +98,8 @@ pub fn spawn_configured_with_agui(
             w.model = options.model.clone();
         } else if options.uses_router() {
             w.model = crate::provider::ROUTER_MODEL.into();
+        } else if options.uses_local() {
+            w.model = crate::provider::LOCAL_MODEL.into();
         } else if !options.endpoint.is_empty() {
             w.model = if crate::provider::endpoint(&options) == crate::provider::KONO_ENDPOINT {
                 crate::provider::KONO_MODEL.into()
@@ -352,6 +357,11 @@ struct Worker {
     model_selector: ModelSelector,
     decisions: Arc<dyn DecisionEngine>,
     agui: AGUIHub,
+    /// Local ONNX server in use after the remote provider returned 5xx.
+    /// While set, requests go to the machine, not the network.
+    local: Option<crate::config::LocalInference>,
+    /// Remote model and model list to return to if local inference fails.
+    saved_remote: Option<(String, Vec<(String, String)>)>,
     /// Host replies that arrived while a different request was being awaited.
     stashed: HashMap<u64, Value>,
 }
@@ -401,6 +411,8 @@ impl Worker {
             model_selector,
             decisions,
             agui,
+            local: None,
+            saved_remote: None,
             stashed: HashMap::new(),
         }
     }
@@ -448,9 +460,54 @@ impl Worker {
                 self.history.clear();
                 self.used_tool_ids.clear();
                 self.always_allow_commands = false;
+                // A new session starts on the configured provider again; the
+                // local server stays up and can still serve a 5xx fallback.
+                self.local = None;
+                self.saved_remote = None;
                 if self.models.is_empty() {
                     self.models = if self.options.uses_router() {
                         crate::provider::router_models()
+                    } else if self.options.uses_local() {
+                        // On-device inference: start (or attach to) the local
+                        // server now so /models reports the model it loaded.
+                        let endpoint = crate::provider::local_endpoint(&self.options);
+                        let cancel = self.cancel.clone();
+                        let out = self.out.clone();
+                        let waiting = move |elapsed: Duration| {
+                            out(json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"builtin",
+                                "update":{"sessionUpdate":"notice","severity":"info","title":format!(
+                                    "Waiting for the local ONNX server ({}s); the first run downloads the model.",
+                                    elapsed.as_secs()
+                                )}}}));
+                        };
+                        match crate::local_server::ensure_running(
+                            &self.http,
+                            &endpoint,
+                            &self.model,
+                            move || cancel.load(Ordering::SeqCst),
+                            waiting,
+                        ) {
+                            Ok(model) => {
+                                self.local =
+                                    Some(crate::config::LocalInference { endpoint, model });
+                                self.model = self
+                                    .local
+                                    .as_ref()
+                                    .map(|l| l.model.clone())
+                                    .unwrap_or_default();
+                                // The local endpoint is outside `options.endpoint`,
+                                // so the list comes from the server itself.
+                                let local = crate::config::AgentConfig {
+                                    provider: "local".into(),
+                                    local_endpoint: endpoint.clone(),
+                                    ..self.options.clone()
+                                };
+                                custom_models(&self.http, &local)
+                                    .unwrap_or_else(|_| crate::provider::local_models())
+                            }
+                            // The real reason is delivered on the first prompt.
+                            Err(_) => crate::provider::local_models(),
+                        }
                     } else if self.options.endpoint.is_empty() {
                         free_models(&self.http)
                     } else {
@@ -536,6 +593,13 @@ impl Worker {
             prompt.push_str("\n\n");
             prompt.push_str(&configured);
         }
+        // Small on-device models are far weaker at tool calling than the
+        // remote provider, so state the limitation and how to reply.
+        if self.local.is_some() || self.options.uses_local() {
+            prompt.push_str(
+                "\n\n<local_inference>\n                 You are running on a small on-device model without reliable tool calling.\n                 - Answer from the conversation and files already shown above.\n                 - If you call a tool, call one at a time and wait for its result.\n                 - Be brief and concrete. If you cannot verify something, say so and name the file or command the user should run.\n                 </local_inference>",
+            );
+        }
         prompt
     }
 
@@ -585,7 +649,24 @@ impl Worker {
         }
         self.history
             .push(json!({"role":"user","content":user_content.trim()}));
+        // A fallback covers one outage, not the rest of the session: retry
+        // the configured provider each turn, and fall back again if it is
+        // still failing. The local server stays warm either way.
+        if self.local.is_some() && !self.options.uses_local() {
+            self.local = None;
+            if let Some((model, models)) = self.saved_remote.take() {
+                self.model = model;
+                self.models = models;
+            }
+        }
         let mut tried_models = vec![self.model.clone()];
+        // Remote provider 5xx (notably 503) switches this turn to the local
+        // ONNX server once; its model belongs to a different endpoint, so it
+        // is tracked apart from `tried_models`.
+        let mut local_fallback_tried = false;
+        // Set when local inference already took over and then failed: the
+        // provider's original error is the real explanation.
+        let mut local_failed = false;
         let (mut steps, mut resets) = (0, 0u32);
         loop {
             if self.cancel.load(Ordering::SeqCst) {
@@ -601,12 +682,52 @@ impl Worker {
                 Ok(true) => {
                     steps += 1;
                     resets = 0;
+                    local_failed = false;
                     // Failover budget covers one outage, not every blip in a long turn.
                     tried_models = vec![self.model.clone()];
                     continue;
                 }
                 Ok(false) => return "end_turn",
                 Err(Step::Cancelled) => return "cancelled",
+                // Local inference failed: fall back to the configured
+                // provider instead of failing the turn on the machine.
+                Err(Step::Failed(msg, _)) if self.local.is_some() => {
+                    if self.options.uses_local() {
+                        self.notice(
+                            &format!(
+                                "Local ONNX inference failed ({msg}). Check the server log at {} or run termed --local-serve.",
+                                crate::local_server::log_path().display()
+                            ),
+                            true,
+                        );
+                        return "end_turn";
+                    }
+                    self.notice(
+                        &format!("Local ONNX inference failed ({msg}). Back to the remote provider."),
+                        true,
+                    );
+                    self.local = None;
+                    local_failed = true;
+                    if let Some((model, models)) = self.saved_remote.take() {
+                        self.model = model;
+                        self.models = models;
+                    }
+                    continue;
+                }
+                // Both the provider and the on-device model are down: one
+                // clear message instead of a second round of 5xx retries.
+                Err(Step::Failed(msg, status))
+                    if local_failed
+                        && (status.is_none() || matches!(status, Some(500..=599))) =>
+                {
+                    self.notice(
+                        &format!(
+                            "The provider and local ONNX inference both failed ({msg}). Check the connection, then run termed --local-serve or pip install -r local_inference/requirements.txt."
+                        ),
+                        true,
+                    );
+                    return "end_turn";
+                }
                 // A reset before any response is transport noise, not a busy
                 // model: retry the same model on a fresh connection first.
                 Err(Step::Failed(_, None)) if resets < 2 => {
@@ -617,6 +738,19 @@ impl Worker {
                 }
                 Err(Step::Failed(msg, status)) => {
                     resets = 0;
+                    // 503 means the provider is out of service, not merely
+                    // busy: finish this turn on the machine instead of
+                    // retrying a model that cannot answer.
+                    if !local_fallback_tried
+                        && !self.options.uses_local()
+                        && matches!(status, Some(500..=599))
+                    {
+                        local_fallback_tried = true;
+                        let cancel = self.cancel.clone();
+                        if self.switch_to_local(&msg, move || cancel.load(Ordering::SeqCst)) {
+                            continue;
+                        }
+                    }
                     // Busy or failing free model: move on to another free model.
                     let busy = matches!(status, Some(429) | Some(500..=599)) || status.is_none();
                     let busy_set: HashSet<String> = tried_models.iter().cloned().collect();
@@ -669,6 +803,9 @@ impl Worker {
                                 Some(429) => {
                                     "The provider rate limit was reached. Wait before trying again."
                                 }
+                                _ if self.options.uses_local() => {
+                                    "Local ONNX inference is not running. Install its dependencies with pip install -r local_inference/requirements.txt, or run termed --local-serve, then retry."
+                                }
                                 _ => {
                                     "Provider request failed. Check the connection, context size and provider configuration."
                                 }
@@ -678,6 +815,70 @@ impl Worker {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Point the rest of this turn at the on-device ONNX server after the
+    /// remote provider failed (HTTP 5xx or unreachable). Returns true when
+    /// the switch happened and the caller should retry the step; false after
+    /// noting why it could not, so normal provider failover continues.
+    fn switch_to_local(&mut self, reason: &str, cancelled: impl Fn() -> bool) -> bool {
+        let endpoint = crate::provider::local_endpoint(&self.options);
+        // The remote model id means nothing on this machine (and a
+        // `vendor/model:free` string would be mistaken for a Hugging Face
+        // repo), so the fallback loads the configured local model instead.
+        let requested = if self.options.uses_local() {
+            self.model.as_str()
+        } else {
+            ""
+        };
+        let waiting = |elapsed: Duration| {
+            self.notice(
+                &format!(
+                    "Waiting for the local ONNX server ({}s); the first run downloads the model.",
+                    elapsed.as_secs()
+                ),
+                false,
+            )
+        };
+        match crate::local_server::ensure_running(
+            &self.http,
+            &endpoint,
+            requested,
+            cancelled,
+            waiting,
+        ) {
+            Ok(model) => {
+                self.notice(
+                    &format!(
+                        "Remote provider unavailable ({reason}). Continuing on local ONNX inference ({model}) on this machine; tools are limited while it is active."
+                    ),
+                    false,
+                );
+                // Keep the remote model list first so a local failure can
+                // restore it exactly, then advertise what the local server
+                // actually loaded in the picker.
+                self.saved_remote =
+                    Some((std::mem::take(&mut self.model), std::mem::take(&mut self.models)));
+                self.models = crate::provider::local_models();
+                if !self.models.iter().any(|(id, _)| *id == model) {
+                    self.models.insert(0, (model.clone(), format!("Local ONNX · {model}")));
+                }
+                self.model = model.clone();
+                self.local = Some(crate::config::LocalInference { endpoint, model });
+                self.send(json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"builtin",
+                    "update":{"sessionUpdate":"config_option_update","configOptions":self.config_options()}}}));
+                true
+            }
+            Err(error) => {
+                self.notice(
+                    &format!(
+                        "Remote provider unavailable ({reason}) and local ONNX inference could not start: {error}"
+                    ),
+                    true,
+                );
+                false
             }
         }
     }
@@ -715,8 +916,24 @@ impl Worker {
         if self.options.generated_tools {
             schemas.extend(self.dynamic_tools.clone());
         }
-        let mut body = json!({"model":self.model,"messages":messages,
-            "max_tokens":self.options.max_output_tokens,"stream":true,"stream_options":{"include_usage":true}});
+        // On-device models are slow and do not need provider extensions;
+        // keep the stream plain and the answer short enough to arrive.
+        let (max_tokens, stream_options) = if self.local.is_some() {
+            (
+                self.options.max_output_tokens.min(LOCAL_MAX_OUTPUT_TOKENS),
+                Value::Null,
+            )
+        } else {
+            (
+                self.options.max_output_tokens,
+                json!({"include_usage":true}),
+            )
+        };
+        let mut body: Value = json!({"model":self.model,"messages":messages,
+            "max_tokens":max_tokens,"stream":true});
+        if !stream_options.is_null() {
+            body["stream_options"] = stream_options;
+        }
         // Some providers reject an empty tools array, so omit the key instead.
         if !finalize && !schemas.is_empty() {
             body["tools"] = json!(schemas);
@@ -725,8 +942,20 @@ impl Worker {
         if body.len() > 480 * 1024 {
             return Err(Step::Failed("Context exceeds the safe request budget. Split this task or shorten instructions/attached skills; no instructions or current objective were silently removed.".into(), Some(413)));
         }
-        let endpoint = crate::provider::endpoint(&self.options);
-        let key = crate::provider::authorization(&self.options, &endpoint)
+        let (endpoint, key) = match &self.local {
+            // The local ONNX server needs no credentials and takes the model
+            // id it advertised.
+            Some(local) => (
+                local.endpoint.clone(),
+                Ok::<_, String>(None),
+            ),
+            None => {
+                let endpoint = crate::provider::endpoint(&self.options);
+                let key = crate::provider::authorization(&self.options, &endpoint);
+                (endpoint, key)
+            }
+        };
+        let key = key
             .map_err(|e| Step::Failed(e, Some(401)))?;
         let clean = |s: &str| crate::provider::sanitize(s, key.as_ref());
         let stall = self.options.stall_timeout_secs;
@@ -739,7 +968,10 @@ impl Worker {
             .timeout_per_read((stall > 0).then(|| Duration::from_secs(stall)))
             .timeout_per_call(Some(Duration::from_secs(self.options.task_timeout_secs)))
             .max_redirects(
-                if key.is_none() && !self.options.uses_router() && self.options.endpoint.is_empty()
+                if key.is_none()
+                    && self.local.is_none()
+                    && !self.options.uses_router()
+                    && self.options.endpoint.is_empty()
                 {
                     5
                 } else {
@@ -786,6 +1018,7 @@ impl Worker {
                     || media_type.to_ascii_lowercase().ends_with("+json")
             });
         let mut response = crate::model_response::ModelResponse::default();
+        response.allow_truncation(self.local.is_some());
         let mut reader = BufReader::new(resp.into_body().into_reader());
         if is_json {
             let mut text = String::new();
@@ -850,11 +1083,23 @@ impl Worker {
                 self.accept_model_event(&mut response, &value, key.as_ref())?;
             }
         }
+        let truncated = response.was_truncated();
         let (content, mut calls) = response
             .finish()
             .map_err(|e| Step::Failed(clean(&e.message), Some(e.status)))?;
+        if truncated && self.local.is_some() {
+            self.notice(
+                "The local model reached its output limit; the answer is cut short. Raise the model output budget or ask for a smaller step.",
+                false,
+            );
+        }
         if finalize {
             if content.trim().is_empty() {
+                // A local answer cut off before its first token is still the
+                // budget ending the turn, not the provider failing.
+                if truncated {
+                    return Ok(false);
+                }
                 return Err(Step::Failed("Model kept calling tools after its step budget".into(), Some(502)));
             }
             calls.clear();

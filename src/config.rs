@@ -42,6 +42,14 @@ impl CommandPolicy {
     }
 }
 
+/// An active on-device ONNX inference session: the server base URL and the
+/// model id it advertised.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalInference {
+    pub endpoint: String,
+    pub model: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentConfig {
@@ -50,9 +58,14 @@ pub struct AgentConfig {
     pub command: String,
     /// Empty strings preserve the environment / provider default.
     pub model: String,
-    /// auto (legacy Kilo/custom), router, kilo, or custom. Never contains a key.
+    /// auto (legacy Kilo/custom), router, kilo, custom, or local (on-device
+    /// ONNX inference). Never contains a key.
     pub provider: String,
     pub endpoint: String,
+    /// Base URL of the local ONNX inference server. Empty uses the loopback
+    /// default (`http://127.0.0.1:8080/v1`); also the automatic fallback
+    /// target when the remote provider returns HTTP 503.
+    pub local_endpoint: String,
     pub api_key_env: String,
     pub instructions: String,
     /// Runtime-only ancestor rules; never accepted from workspace JSON.
@@ -92,6 +105,7 @@ impl Default for AgentConfig {
             model: String::new(),
             provider: "router".into(),
             endpoint: String::new(),
+            local_endpoint: String::new(),
             api_key_env: String::new(),
             instructions: String::new(),
             inherited_instructions: Vec::new(),
@@ -127,8 +141,11 @@ impl AgentConfig {
     }
 
     pub fn uses_router(&self) -> bool {
-        crate::provider::pinned_router(&self.endpoint)
-            || (self.provider == "router" && !self.custom_endpoint_selected())
+        // A stale API base URL (or the pinned router URL) in settings must
+        // never pull on-device inference back onto the network.
+        !self.uses_local()
+            && (crate::provider::pinned_router(&self.endpoint)
+                || (self.provider == "router" && !self.custom_endpoint_selected()))
     }
 
     pub fn use_router(&mut self) {
@@ -139,12 +156,36 @@ impl AgentConfig {
         self.model = crate::provider::ROUTER_MODEL.into();
     }
 
+    /// On-device ONNX inference: no key, no network. `onnx` is accepted as
+    /// an alias for `local` in settings files.
+    pub fn uses_local(&self) -> bool {
+        matches!(self.provider.as_str(), "local" | "onnx")
+    }
+
+    pub fn use_local(&mut self) {
+        self.backend = "builtin".into();
+        self.provider = "local".into();
+        self.endpoint = String::new();
+        if self.api_key_env == crate::credentials::ROUTER_ENV {
+            self.api_key_env.clear();
+        }
+        // Remote model ids mean nothing on this machine, so fall back to the
+        // local server's default until the user names an ONNX model.
+        let remote = self.model == crate::provider::ROUTER_MODEL
+            || self.model == crate::builtin_agent::DEFAULT_MODEL
+            || self.model == crate::provider::KONO_MODEL
+            || self.model.ends_with(":free");
+        if remote {
+            self.model.clear();
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         if !matches!(
             self.provider.as_str(),
-            "auto" | "router" | "kilo" | "custom"
+            "auto" | "router" | "kilo" | "custom" | "local" | "onnx"
         ) {
-            bail!("Provider must be auto, router, kilo or custom");
+            bail!("Provider must be auto, router, kilo, custom or local");
         }
         if self.provider == "custom" && self.endpoint.trim().is_empty() {
             bail!("Set an API base URL before choosing the custom provider");
@@ -221,6 +262,12 @@ impl AgentConfig {
         {
             bail!("The API endpoint must start with http:// or https://");
         }
+        if !(self.local_endpoint.is_empty()
+            || self.local_endpoint.starts_with("https://")
+            || self.local_endpoint.starts_with("http://"))
+        {
+            bail!("The local ONNX endpoint must start with http:// or https://");
+        }
         if !self.api_key_env.is_empty()
             && !self
                 .api_key_env
@@ -278,6 +325,11 @@ impl AgentConfig {
                 child.endpoint = parent.endpoint.clone();
             }
             child.provider = parent.provider.clone();
+        }
+        // Children inherit the local inference server too, whether they came
+        // from an `auto` provider or explicitly ask for on-device inference.
+        if child.uses_local() && child.local_endpoint.is_empty() {
+            child.local_endpoint = parent.local_endpoint.clone();
         }
         // Do not accidentally forward a provider's credential to a different
         // explicitly configured specialist endpoint.
@@ -757,6 +809,70 @@ mod command_policy_tests {
             ..Default::default()
         };
         assert!(pinned.uses_router());
+    }
+
+    #[test]
+    fn local_provider_validates_and_clears_router_defaults() {
+        let mut local = AgentConfig::default();
+        local.use_local();
+        assert!(local.uses_local());
+        assert!(!local.uses_router());
+        assert_eq!(local.provider, "local");
+        assert_eq!(local.backend, "builtin");
+        local.validate().unwrap();
+        assert_eq!(
+            crate::provider::endpoint(&local),
+            crate::provider::LOCAL_ENDPOINT
+        );
+
+        // The `onnx` alias is accepted too.
+        let alias = AgentConfig {
+            provider: "onnx".into(),
+            ..Default::default()
+        };
+        assert!(alias.uses_local());
+        alias.validate().unwrap();
+
+        // The router key must never be paired with local inference.
+        let bad = AgentConfig {
+            provider: "local".into(),
+            api_key_env: crate::credentials::ROUTER_ENV.into(),
+            ..Default::default()
+        };
+        assert!(bad.validate().is_err());
+
+        // A malformed local endpoint is rejected.
+        let bad_url = AgentConfig {
+            provider: "local".into(),
+            local_endpoint: "localhost:8080".into(),
+            ..Default::default()
+        };
+        assert!(bad_url.validate().is_err());
+    }
+
+    #[test]
+    fn delegated_agents_inherit_the_local_endpoint() {
+        let parent = AgentConfig {
+            provider: "local".into(),
+            local_endpoint: "http://127.0.0.1:9090/v1".into(),
+            ..Default::default()
+        };
+        let child = AgentConfig {
+            provider: "auto".into(),
+            ..Default::default()
+        };
+        let restricted = child.restricted_by(&parent);
+        assert!(restricted.uses_local());
+        assert_eq!(restricted.local_endpoint, "http://127.0.0.1:9090/v1");
+
+        // An explicit local child inherits the endpoint without the provider.
+        let local_child = AgentConfig {
+            provider: "local".into(),
+            ..Default::default()
+        };
+        let restricted = local_child.restricted_by(&parent);
+        assert!(restricted.uses_local());
+        assert_eq!(restricted.local_endpoint, "http://127.0.0.1:9090/v1");
     }
 
     #[test]

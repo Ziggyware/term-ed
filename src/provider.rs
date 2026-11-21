@@ -19,6 +19,15 @@ pub const KONO_ENDPOINT: &str = "https://kono-router.onrender.com/v1";
 /// prose without calling tools, so the agent asks for the tool-capable lane.
 pub const KONO_MODEL: &str = "free:tools";
 
+/// Default base URL of the on-device ONNX inference server
+/// (`local_inference/onnx_server.py`). Loopback only: prompts never leave
+/// the machine, and no API key is involved.
+pub const LOCAL_ENDPOINT: &str = "http://127.0.0.1:8080/v1";
+/// Model id reported when the local server has not advertised one yet.
+pub const LOCAL_MODEL: &str = "local-onnx";
+/// Environment overrides for the local endpoint, in priority order.
+pub const LOCAL_ENDPOINT_ENVS: [&str; 2] = ["TERMED_LOCAL_ENDPOINT", "TERMED_ONNX_ENDPOINT"];
+
 /// Accept the root URLs users see in the Kono and OpenAI-compatible launch
 /// output. A bare origin (`https://host`, `http://host:port`, loopback included)
 /// gets the conventional `/v1`; any URL with a path is used verbatim, so a
@@ -50,9 +59,28 @@ pub fn custom_endpoint(input: &str) -> String {
     base.into()
 }
 
+/// Resolve the local ONNX server base URL: the configured local endpoint,
+/// then the environment overrides, then the loopback default. A bare host
+/// gets `/v1`, exactly like a custom endpoint.
+pub fn local_endpoint(options: &AgentConfig) -> String {
+    if !options.local_endpoint.trim().is_empty() {
+        return custom_endpoint(&options.local_endpoint);
+    }
+    for name in LOCAL_ENDPOINT_ENVS {
+        if let Ok(value) = std::env::var(name)
+            && !value.trim().is_empty()
+        {
+            return custom_endpoint(&value);
+        }
+    }
+    LOCAL_ENDPOINT.into()
+}
+
 pub fn endpoint(options: &AgentConfig) -> String {
     if options.uses_router() {
         ROUTER_ENDPOINT.into()
+    } else if options.uses_local() {
+        local_endpoint(options)
     } else if options.endpoint.is_empty() {
         std::env::var("TERMED_FREE_GATEWAY")
             .unwrap_or_else(|_| crate::builtin_agent::GATEWAY.into())
@@ -62,6 +90,11 @@ pub fn endpoint(options: &AgentConfig) -> String {
 }
 
 pub fn authorization(options: &AgentConfig, endpoint: &str) -> Result<Option<Secret>, String> {
+    // Local inference needs no key, and no credential (above all the router
+    // key) must ever be sent to it, even if settings still name one.
+    if options.uses_local() {
+        return Ok(None);
+    }
     if options.uses_router() || options.api_key_env == ROUTER_ENV {
         if endpoint != ROUTER_ENDPOINT {
             return Err("Refusing to send ROUTER_API_KEY to any origin except the pinned HTTPS router /v1 endpoint".into());
@@ -102,6 +135,11 @@ pub fn router_models() -> Vec<(String, String)> {
     .into_iter()
     .map(|(id, name)| (id.into(), name.into()))
     .collect()
+}
+
+/// Models offered before the local server has advertised its own list.
+pub fn local_models() -> Vec<(String, String)> {
+    vec![(LOCAL_MODEL.into(), "Local ONNX (this machine)".into())]
 }
 
 #[cfg(test)]
@@ -151,6 +189,51 @@ mod tests {
                 .contains("Refusing")
         );
     }
+    #[test]
+    fn local_endpoint_resolves_default_env_and_explicit_values() {
+        // SAFETY: single test in this binary touching these variables.
+        unsafe {
+            std::env::remove_var("TERMED_LOCAL_ENDPOINT");
+            std::env::remove_var("TERMED_ONNX_ENDPOINT");
+        }
+        let options = AgentConfig {
+            provider: "local".into(),
+            ..Default::default()
+        };
+        assert_eq!(local_endpoint(&options), LOCAL_ENDPOINT);
+        assert_eq!(endpoint(&options), LOCAL_ENDPOINT);
+        assert!(local_models().iter().any(|(id, _)| id == LOCAL_MODEL));
+
+        let explicit = AgentConfig {
+            provider: "local".into(),
+            local_endpoint: "http://127.0.0.1:9090".into(),
+            ..Default::default()
+        };
+        assert_eq!(local_endpoint(&explicit), "http://127.0.0.1:9090/v1");
+
+        unsafe {
+            std::env::set_var("TERMED_LOCAL_ENDPOINT", "http://localhost:7000/v1");
+        }
+        assert_eq!(local_endpoint(&options), "http://localhost:7000/v1");
+        unsafe {
+            std::env::remove_var("TERMED_LOCAL_ENDPOINT");
+        }
+    }
+
+    #[test]
+    fn local_provider_never_sends_credentials() {
+        let options = AgentConfig {
+            provider: "local".into(),
+            api_key_env: ROUTER_ENV.into(),
+            ..Default::default()
+        };
+        // Even with the router key named, local inference gets no header.
+        assert!(authorization(&options, LOCAL_ENDPOINT).unwrap().is_none());
+        // And a local selection must not be mistaken for the router.
+        assert!(!options.uses_router());
+        assert!(options.uses_local());
+    }
+
     #[test]
     fn router_selection_has_sane_aliases_without_breaking_custom_endpoints() {
         let mut c = AgentConfig::default();

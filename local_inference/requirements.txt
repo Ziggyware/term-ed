@@ -1,0 +1,4 @@
+# Runtime dependencies of onnx_server.py (install these to use local inference).
+onnxruntime>=1.17
+tokenizers>=0.15
+numpy

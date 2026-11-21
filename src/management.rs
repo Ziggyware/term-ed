@@ -40,6 +40,7 @@ enum Field {
     Command,
     Model,
     Endpoint,
+    LocalEndpoint,
     ApiKeyEnv,
     Instructions,
     MaxSteps,
@@ -67,6 +68,7 @@ const FIELDS: &[(Field, &str)] = &[
     (Field::Command, "Custom ACP command"),
     (Field::Model, "Model"),
     (Field::Endpoint, "API base URL"),
+    (Field::LocalEndpoint, "Local ONNX endpoint"),
     (Field::ApiKeyEnv, "API key environment variable"),
     (Field::Instructions, "Instructions"),
     (Field::MaxSteps, "Step budget"),
@@ -119,6 +121,7 @@ fn value(field: Field, a: &AgentConfig) -> String {
         Field::Command => a.command.clone(),
         Field::Model => a.model.clone(),
         Field::Endpoint => a.endpoint.clone(),
+        Field::LocalEndpoint => a.local_endpoint.clone(),
         Field::ApiKeyEnv => a.api_key_env.clone(),
         Field::Instructions => a.instructions.clone(),
         Field::MaxSteps => a.max_steps.to_string(),
@@ -162,6 +165,9 @@ fn hint(field: Field) -> &'static str {
         Field::Endpoint => {
             "Built-in only. Try https://kono-router.onrender.com or http://127.0.0.1:8080; a bare host gets /v1, other paths are used as written."
         }
+        Field::LocalEndpoint => {
+            "On-device ONNX server (provider local, and the fallback when the provider returns 503). Empty = http://127.0.0.1:8080/v1; loopback servers start automatically when Python has onnxruntime."
+        }
         Field::ApiKeyEnv => {
             "Environment variable NAME only (e.g. OPENAI_API_KEY). Never paste a secret here"
         }
@@ -199,7 +205,7 @@ fn hint(field: Field) -> &'static str {
             "Attach the open file and selection to prompts and descendant task briefs"
         }
         Field::Provider => {
-            "auto (legacy Kilo/custom), router (pinned authenticated NoKey Router), kilo, or custom; does not change external ACP providers"
+            "auto (legacy Kilo/custom), router (pinned authenticated NoKey Router), kilo, custom, or local (on-device ONNX, no key or network); does not change external ACP providers"
         }
         Field::MaxDepth => {
             "1–3; root = 0, child = 1, grandchild = 2. Restrictions and deadline propagate at every level"
@@ -434,6 +440,18 @@ impl App {
                             Field::Model => format!("{} (default)", crate::provider::ROUTER_MODEL),
                             _ => "(default / empty)".into(),
                         }
+                    } else if !sub && v.is_empty() && config.uses_local() {
+                        match field {
+                            Field::LocalEndpoint => format!(
+                                "{} (default)",
+                                crate::provider::LOCAL_ENDPOINT
+                            ),
+                            Field::Model => format!(
+                                "{} (first model the local server loads)",
+                                crate::provider::LOCAL_MODEL
+                            ),
+                            _ => "(default / empty)".into(),
+                        }
                     } else if v.is_empty() {
                         "(default / empty)".into()
                     } else {
@@ -460,6 +478,17 @@ impl App {
                         "Does not unset an environment override".into(),
                     );
                     row("Show Agent Overwatch".into(),"Task tree, progress, deadlines, terminal results and blockers in the agent panel".into());
+                    row(
+                        if config.uses_local() {
+                            "Local ONNX inference: on this machine".into()
+                        } else {
+                            "Use Local ONNX Inference".into()
+                        },
+                        format!(
+                            "Built-in · on-device model via ONNX Runtime · {} · no key, no network; also used automatically when the provider returns 503",
+                            crate::provider::local_endpoint(config)
+                        ),
+                    );
                 }
             }
             PaletteMode::SubAgents => {
@@ -756,6 +785,13 @@ impl App {
                             self.agent.entries.push(crate::agent::Entry::Notice{text:format!("Agent overwatch\n{summary}"),error:false});
                             self.palette=None;self.show_agent=true;self.focus=crate::app::Focus::Agent;
                         }
+                        4 => {
+                            let mut prefs=self.preferences.clone();
+                            prefs.agent.use_local();
+                            self.save_preferences(prefs)?;
+                            self.toast("Local ONNX inference selected; the server starts on the first prompt",ToastKind::Success);
+                            self.open_palette(mode);
+                        }
                         _=>{}
                     }}
                 }
@@ -982,6 +1018,16 @@ fn set_field(a: &mut AgentConfig, field: Field, input: &str) -> Result<()> {
         }
         Field::Command => a.command = input.into(),
         Field::Model => a.model = input.into(),
+        Field::LocalEndpoint => {
+            let endpoint = input.trim().trim_end_matches('/');
+            if !(endpoint.is_empty()
+                || endpoint.starts_with("https://")
+                || endpoint.starts_with("http://"))
+            {
+                bail!("The local ONNX endpoint must start with http:// or https://");
+            }
+            a.local_endpoint = endpoint.into();
+        }
         Field::Endpoint => {
             let endpoint = input.trim().trim_end_matches('/');
             if endpoint.is_empty() {

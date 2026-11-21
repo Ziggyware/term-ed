@@ -75,7 +75,12 @@ responses do not execute incomplete tool arguments.
 
 The legacy anonymous Kilo path and custom OpenAI-compatible endpoints remain
 available. Custom providers use a separately named environment variable, not
-the saved router key. External ACP backends manage their own provider setup;
+the saved router key.
+
+If the router (or another 5xx provider) answers **503**, the turn continues on
+[on-device ONNX inference](local-inference.md) instead of failing: it runs on
+this machine, receives no credential, and the next turn retries the router.
+Select the `local` provider to stay on-device all the time. External ACP backends manage their own provider setup;
 choose the built-in backend to use this integration.
 
 ## Children and grandchildren

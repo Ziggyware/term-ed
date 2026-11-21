@@ -372,7 +372,9 @@ impl Agent {
         options.validate().map_err(|e| e.to_string())?;
         let available = detect_agents();
         let spec = match options.backend.as_str() {
-            "auto" if options.uses_router() => Some(builtin_spec()),
+            // Local ONNX inference is served by the built-in worker too, so a
+            // missing external agent never blocks it.
+            "auto" if options.uses_router() || options.uses_local() => Some(builtin_spec()),
             "auto" => available.first().cloned(),
             "builtin" => Some(builtin_spec()),
             "custom" => {

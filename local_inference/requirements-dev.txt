@@ -1,0 +1,4 @@
+# Server tests and the tiny fixture-model builder need `onnx` on top of the
+# runtime dependencies.
+-r requirements.txt
+onnx>=1.15

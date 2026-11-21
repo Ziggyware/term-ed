@@ -1,0 +1,1 @@
+{"chat_template": "<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n"}
