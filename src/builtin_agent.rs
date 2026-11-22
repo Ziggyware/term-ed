@@ -344,6 +344,16 @@ fn compact_history(history: &mut Vec<Value>, system_bytes: usize) {
     }
 }
 
+
+/// Read a text file, decoding UTF-8/UTF-16 (with or without BOM). The
+/// detected encoding is returned so callers can re-encode on write and keep
+/// the file in its original encoding.
+fn read_text(path: &std::path::Path) -> Result<(crate::text_encoding::TextEncoding, String), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    crate::text_encoding::decode(&bytes)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))
+}
+
 struct Worker {
     cwd: PathBuf,
     options: AgentConfig,
@@ -738,7 +748,7 @@ impl Worker {
                 // clear message instead of a second round of 5xx retries.
                 Err(Step::Failed(msg, status))
                     if local_failed
-                        && (status.is_none() || matches!(status, Some(500..=599))) =>
+                        && (status.is_none() || matches!(status, Some(401 | 403 | 500..=599))) =>
                 {
                     self.notice(
                         &format!(
@@ -758,12 +768,13 @@ impl Worker {
                 }
                 Err(Step::Failed(msg, status)) => {
                     resets = 0;
-                    // 503 means the provider is out of service, not merely
-                    // busy: finish this turn on the machine instead of
-                    // retrying a model that cannot answer.
+                    // 401/403 mean the provider rejected the key; 5xx means
+                    // it is out of service — in either case, finish this turn
+                    // on the machine instead of retrying a model that cannot
+                    // answer.
                     if !local_fallback_tried
                         && !self.options.uses_local()
-                        && matches!(status, Some(500..=599))
+                        && matches!(status, Some(401 | 403 | 500..=599))
                     {
                         local_fallback_tried = true;
                         let cancel = self.cancel.clone();
@@ -840,9 +851,9 @@ impl Worker {
     }
 
     /// Point the rest of this turn at the on-device ONNX server after the
-    /// remote provider failed (HTTP 5xx or unreachable). Returns true when
-    /// the switch happened and the caller should retry the step; false after
-    /// noting why it could not, so normal provider failover continues.
+    /// remote provider failed (HTTP 401/403, 5xx, or unreachable). Returns
+    /// true when the switch happened and the caller should retry the step;
+    /// false after noting why it could not, so normal provider failover continues.
     fn switch_to_local(&mut self, reason: &str, cancelled: impl Fn() -> bool) -> bool {
         let endpoint = crate::provider::local_endpoint(&self.options);
         // The remote model id means nothing on this machine (and a
@@ -872,7 +883,7 @@ impl Worker {
             Ok(model) => {
                 self.notice(
                     &format!(
-                        "Remote provider unavailable ({reason}). Continuing on local ONNX inference ({model}) on this machine; tools are limited while it is active."
+                        "Remote provider failed ({reason}). Continuing on local ONNX inference ({model}) on this machine; tools are limited while it is active."
                     ),
                     false,
                 );
@@ -894,7 +905,7 @@ impl Worker {
             Err(error) => {
                 self.notice(
                     &format!(
-                        "Remote provider unavailable ({reason}) and local ONNX inference could not start: {error}"
+                        "Remote provider failed ({reason}) and local ONNX inference could not start: {error}"
                     ),
                     true,
                 );
@@ -1468,7 +1479,7 @@ impl Worker {
                 "Text tool read exceeds 2 MiB; use a smaller file or editor excerpt".into(),
             );
         }
-        let text = std::fs::read_to_string(&p).map_err(|e| format!("cannot read {path}: {e}"))?;
+        let (_, text) = read_text(&p)?;
         let start = a
             .get("start_line")
             .and_then(Value::as_u64)
@@ -1512,7 +1523,7 @@ impl Worker {
             if std::fs::metadata(e.path()).is_ok_and(|m| m.len() > 2 * 1024 * 1024) {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(e.path()) else {
+            let Ok((_, text)) = read_text(e.path()) else {
                 continue;
             };
             for (n, line) in text.lines().enumerate() {
@@ -1541,7 +1552,7 @@ impl Worker {
         let p = self.resolve(path)?;
         let rel = self.rel(&p);
         self.tool_start(id, &format!("Edit {rel}"), "edit", Some(&p));
-        let text = std::fs::read_to_string(&p).map_err(|e| format!("cannot read {path}: {e}"))?;
+        let (encoding, text) = read_text(&p)?;
         // Tolerate CRLF files when the model sends LF snippets.
         let crlf = text.contains("\r\n");
         let (old_n, new_n) = if crlf {
@@ -1560,7 +1571,11 @@ impl Worker {
             ));
         }
         let updated = text.replacen(old_n.as_str(), &new_n, 1);
-        std::fs::write(&p, &updated).map_err(|e| e.to_string())?;
+        std::fs::write(
+            &p,
+            crate::text_encoding::encode(encoding, &updated),
+        )
+        .map_err(|e| e.to_string())?;
 
         // Structured AEP patch tracking & AG-UI emission
         let patch = AepPatch::from_replace(&rel, old, new);
@@ -1613,7 +1628,12 @@ impl Worker {
         let p = self.resolve(path)?;
         let rel = self.rel(&p);
         crate::document::ensure_text_target(&p).map_err(|e| e.to_string())?;
-        let old = std::fs::read_to_string(&p).ok();
+        let existing = read_text(&p).ok();
+        let old = existing.as_ref().map(|(_, text)| text.clone());
+        let write_encoding = existing
+            .as_ref()
+            .map(|(encoding, _)| *encoding)
+            .unwrap_or(crate::text_encoding::TextEncoding::Utf8);
         self.tool_start(
             id,
             &format!("{} {rel}", if old.is_some() { "Write" } else { "Create" }),
@@ -1623,7 +1643,8 @@ impl Worker {
         if let Some(dir) = p.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
-        std::fs::write(&p, content).map_err(|e| e.to_string())?;
+        std::fs::write(&p, crate::text_encoding::encode(write_encoding, content))
+            .map_err(|e| e.to_string())?;
         self.tool_end(id, true, vec![json!({"type":"diff","path":p.display().to_string(),"oldText":old,"newText":content})]);
         Ok(format!("Wrote {rel} ({} lines).", content.lines().count()))
     }
@@ -1665,6 +1686,8 @@ impl Worker {
     }
 
     fn run_command(&mut self, id: &str, command: &str) -> Result<String, String> {
+        let command = crate::shell::normalize_shell_command(command).into_boxed_str();
+        let command = command.as_ref();
         self.tool_start(id, &format!("Run `{command}`"), "execute", None);
 
         // Pre-flight lexical analysis: redirect redundant file/navigation commands
@@ -2004,6 +2027,51 @@ mod tests {
             assert!(result.starts_with("Error: Cannot overwrite"), "{result}");
             assert_eq!(std::fs::read(dir.join(name)).unwrap(), bytes);
         }
+    }
+
+    #[test]
+    fn utf16_files_read_edit_and_write_preserve_encoding() {
+        let dir = std::env::temp_dir().join(format!(
+            "termed-builtin-utf16-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let path = dir.join("src/readme.md");
+        std::fs::write(
+            &path,
+            crate::text_encoding::encode(
+                crate::text_encoding::TextEncoding::Utf16Le,
+                "hello\nworld\n",
+            ),
+        )
+        .unwrap();
+        let mut w = worker(&dir);
+        // read_file decodes the UTF-16 BOM file.
+        let r = w.run_tool("1", "read_file", &json!({"path":"src/readme.md"}));
+        assert!(r.contains("hello") && r.contains("world"), "{r}");
+        // edit_file re-encodes to UTF-16 LE with the BOM.
+        let r = w.run_tool(
+            "2",
+            "edit_file",
+            &json!({"path":"src/readme.md","old_text":"world","new_text":"there"}),
+        );
+        assert!(r.starts_with("Edited"), "{r}");
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.starts_with(b"\xFF\xFE"), "BOM preserved: {bytes:?}");
+        let (enc, text) = crate::text_encoding::decode(&bytes).unwrap();
+        assert_eq!(enc, crate::text_encoding::TextEncoding::Utf16Le);
+        assert_eq!(text, "hello\nthere\n");
+        // write_file overwrite preserves the original encoding too.
+        let r = w.run_tool(
+            "3",
+            "write_file",
+            &json!({"path":"src/readme.md","content":"new content\n"}),
+        );
+        assert!(r.starts_with("Wrote"), "{r}");
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.starts_with(b"\xFF\xFE"));
+        let (_, text) = crate::text_encoding::decode(&bytes).unwrap();
+        assert_eq!(text, "new content\n");
     }
 
     #[test]

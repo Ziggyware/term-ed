@@ -108,6 +108,9 @@ pub struct Document {
     pub preview: Option<Preview>,
     /// Tab title for a buffer with no path (plugin previews, scratch output).
     pub name_override: Option<String>,
+    /// Encoding the file was read from; preserved on save so writing back a
+    /// UTF-16 file does not silently change it to UTF-8.
+    pub encoding: crate::text_encoding::TextEncoding,
     archive_stamp: Option<crate::archive::MemberVersion>,
     /// Stable for this buffer's lifetime, even when tabs move or paths change.
     pub(crate) id: u64,
@@ -169,14 +172,22 @@ impl Document {
             doc.preview = Some(Preview::Image(preview));
             doc
         } else {
-            if bytes.contains(&0) {
-                anyhow::bail!(
-                    "Binary file is not a supported image or ZIP; it was not opened as text"
-                );
+            // Decode UTF-8 / UTF-16 (with or without BOM) before anything
+            // else: a UTF-16 file is text and must open, never fall back to
+            // a binary error that mentions NUL bytes.
+            if let Ok((encoding, text)) = crate::text_encoding::decode(&bytes) {
+                let text = text.as_str();
+                Self::from_text_with_encoding(text, Some(path.to_path_buf()), encoding)
+            } else {
+                if bytes.contains(&0) {
+                    anyhow::bail!(
+                        "Binary file is not a supported image or ZIP; it was not opened as text"
+                    );
+                }
+                let text = std::str::from_utf8(&bytes)
+                    .context("File is not UTF-8 text or a supported image")?;
+                Self::from_text(text, Some(path.to_path_buf()))
             }
-            let text = std::str::from_utf8(&bytes)
-                .context("File is not UTF-8 text or a supported image")?;
-            Self::from_text(text, Some(path.to_path_buf()))
         };
         doc.archive_stamp = stamp;
         Ok(doc)
@@ -240,6 +251,14 @@ impl Document {
     }
 
     pub fn from_text(text: &str, path: Option<PathBuf>) -> Self {
+        Self::from_text_with_encoding(text, path, crate::text_encoding::TextEncoding::Utf8)
+    }
+
+    pub fn from_text_with_encoding(
+        text: &str,
+        path: Option<PathBuf>,
+        encoding: crate::text_encoding::TextEncoding,
+    ) -> Self {
         let line_ending = if text.contains("\r\n") {
             LineEnding::CrLf
         } else {
@@ -251,6 +270,7 @@ impl Document {
         Self {
             preview: None,
             name_override: None,
+            encoding,
             archive_stamp: None,
             id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             rope: Rope::from_str(&normalized),
@@ -297,6 +317,7 @@ impl Document {
         } else {
             Cow::Borrowed(&baseline)
         };
+        let encoded = crate::text_encoding::encode(self.encoding, &text).into_boxed_slice();
         let member = crate::archive::member_path(&path);
         if self.archive_stamp.is_some() && member.is_none() {
             anyhow::bail!("ZIP container is missing or no longer a file; your edits were kept");
@@ -309,7 +330,7 @@ impl Document {
             self.archive_stamp = Some(crate::archive::write_member(
                 &member,
                 &stamp,
-                text.as_bytes(),
+                &encoded,
             )?);
         } else {
             ensure_text_target(&path)?;
@@ -319,7 +340,7 @@ impl Document {
             {
                 fs::create_dir_all(parent)?;
             }
-            fs::write(&path, text.as_bytes())
+            fs::write(&path, &encoded)
                 .with_context(|| format!("writing {}", path.display()))?;
         }
         self.saved_text = baseline;

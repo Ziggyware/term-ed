@@ -519,10 +519,8 @@ impl TextFile {
             return Ok(None);
         }
         let bytes = std::fs::read(path)?;
-        if memchr::memchr(0, &bytes).is_some() {
-            return Ok(None);
-        }
-        let Ok(mut text) = String::from_utf8(bytes) else {
+        let Ok((_encoding, mut text)) = crate::text_encoding::decode(&bytes) else {
+            // Not decodable text (binary, unreadable JSON, etc.): skip.
             return Ok(None);
         };
         let crlf = text.contains("\r\n");
@@ -1053,6 +1051,14 @@ fn read_search_file(path: &Path, ignore_binary: bool, counters: &Counters) -> st
     if bytes.len() as u64 > MAX_FILE_BYTES {
         counters.skipped_large.fetch_add(1, Ordering::Relaxed);
         return Ok(None);
+    }
+    // UTF-8 / UTF-16 text is used as-is; anything else is binary. A file
+    // that decodes as UTF-8 or UTF-16 is text even if it contains NULs, so
+    // the binary skip must not fire first.
+    if let Ok((_encoding, text)) = crate::text_encoding::decode(&bytes) {
+        let mut text = text;
+        if text.contains("\r\n") { text = text.replace("\r\n", "\n"); }
+        return Ok(Some(text));
     }
     // SIMD NUL detection examines EVERY byte, not just an 8 KiB prefix.
     if ignore_binary && memchr::memchr(0, &bytes).is_some() {

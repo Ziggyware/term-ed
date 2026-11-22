@@ -460,6 +460,10 @@ pub enum AgentTarget {
     Settings,
     Stop,
     Send,
+    /// Copy the full chat transcript to the clipboard.
+    CopyAll,
+    /// Toggle the agent panel between docked and full-window.
+    Expand,
     /// A one-tap starter prompt.
     Suggest(String),
 }
@@ -526,6 +530,10 @@ pub struct App {
     pub agent_selection: Option<AgentSelection>,
     /// Plain text of the current transcript selection, rebuilt each frame.
     pub agent_selection_text: String,
+    /// Plain text of the entire transcript, rebuilt each frame (copy-all).
+    pub agent_transcript_text: String,
+    /// The agent panel fills the main window (editor hidden) instead of docking.
+    pub agent_expanded: bool,
     /// External plugin processes (see `plugin.rs`).
     pub plugins: PluginHost,
     pub show_agent: bool,
@@ -611,6 +619,8 @@ impl App {
             agent: Agent::new(root.clone()),
             agent_selection: None,
             agent_selection_text: String::new(),
+            agent_transcript_text: String::new(),
+            agent_expanded: false,
             plugins: PluginHost::new(root.clone()),
             show_agent: false,
             toolbar_page: 0,
@@ -1544,6 +1554,7 @@ impl App {
             AgentToggle => {
                 if self.show_agent && self.focus == Focus::Agent {
                     self.show_agent = false;
+                    self.agent_expanded = false;
                     self.focus = if self.editors.is_empty() {
                         Focus::Explorer
                     } else {
@@ -1561,6 +1572,7 @@ impl App {
                 self.agent_selection = None;
                 self.agent_selection_text = String::new();
                 self.drag = None;
+                self.agent_expanded = false;
                 self.cancel_automation();
                 self.agent.cancel();
                 self.agent.new_chat();
@@ -4855,6 +4867,27 @@ impl App {
         (row, col)
     }
 
+    /// Toggle the agent panel between docked and full-window. Expanding hides
+    /// the editor behind the panel and focuses the agent; collapsing gives the
+    /// editor back.
+    fn toggle_agent_expanded(&mut self) {
+        if self.compact {
+            // On phones the agent already fills the screen; expanding is a no-op.
+            return;
+        }
+        self.agent_expanded = !self.agent_expanded;
+        if self.agent_expanded {
+            self.show_agent = true;
+            self.focus = Focus::Agent;
+        } else if self.focus == Focus::Agent {
+            self.focus = if self.editors.is_empty() {
+                Focus::Explorer
+            } else {
+                Focus::Editor
+            };
+        }
+    }
+
     /// Copy the transcript selection to the clipboard.
     fn agent_copy_selection(&mut self) {
         let Some(sel) = self.agent_selection else { return };
@@ -5159,6 +5192,16 @@ impl App {
             AgentTarget::PickAgent => self.run(Command::AgentPick),
             AgentTarget::Settings => self.run(Command::AgentSettings),
             AgentTarget::Stop => self.run(Command::AgentStop),
+            AgentTarget::CopyAll => {
+                let text = self.agent_transcript_text.trim().to_string();
+                if text.is_empty() {
+                    self.toast("Nothing to copy".into(), ToastKind::Info);
+                } else {
+                    self.clipboard.set(text, false);
+                    self.toast("Transcript copied to clipboard".into(), ToastKind::Success);
+                }
+            }
+            AgentTarget::Expand => self.toggle_agent_expanded(),
             AgentTarget::Send => {
                 self.focus = Focus::Agent;
                 self.agent_send();
@@ -5207,6 +5250,14 @@ impl App {
             KeyCode::Esc => {
                 if a.is_working() {
                     a.cancel();
+                } else if self.agent_expanded {
+                    // Leave full-window mode; the panel docks again.
+                    self.agent_expanded = false;
+                    self.focus = if self.editors.is_empty() {
+                        Focus::Explorer
+                    } else {
+                        Focus::Editor
+                    };
                 } else {
                     self.focus = if self.editors.is_empty() {
                         Focus::Explorer
@@ -5224,7 +5275,15 @@ impl App {
             }
             KeyCode::Enter => self.agent_send(),
             KeyCode::Tab | KeyCode::BackTab => {
-                if !self.editors.is_empty() {
+                if self.agent_expanded {
+                    // Leave full-window mode and focus the editor.
+                    self.agent_expanded = false;
+                    self.focus = if self.editors.is_empty() {
+                        Focus::Explorer
+                    } else {
+                        Focus::Editor
+                    };
+                } else if !self.editors.is_empty() {
                     self.focus = Focus::Editor;
                 }
             }

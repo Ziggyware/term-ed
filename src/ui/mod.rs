@@ -85,10 +85,14 @@ pub fn draw(frame: &mut Frame, app: &mut App, truecolor: bool) {
     }
 
     // Agent panel: docked on the right when there is room, otherwise a
-    // full-screen sheet drawn over everything (phones).
+    // full-screen sheet drawn over everything (phones), and optionally
+    // expanded to fill the main window (editor hidden).
     let dock_w = (main.width * 2 / 5).clamp(36, 64);
-    let docked = app.show_agent && !compact && main.width >= dock_w + 40;
-    let agent_area = if docked {
+    let docked = app.show_agent && !compact && !app.agent_expanded && main.width >= dock_w + 40;
+    let expanded = app.show_agent && app.agent_expanded && !compact;
+    let agent_area = if expanded {
+        main
+    } else if docked {
         Rect::new(main.right() - dock_w, main.y, dock_w, main.height)
     } else {
         body
@@ -99,7 +103,9 @@ pub fn draw(frame: &mut Frame, app: &mut App, truecolor: bool) {
         main
     };
     let mut cursor = None;
-    if app.editors.is_empty() {
+    if expanded {
+        // The agent panel fills the main window; the editor is hidden.
+    } else if app.editors.is_empty() {
         render_welcome(buf, main, app);
         // Project search works without an open file too.
         if app.search.visible

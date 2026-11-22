@@ -40,6 +40,7 @@ pub mod shell;
 pub mod skills;
 pub mod supervision;
 pub mod theme;
+pub mod text_encoding;
 pub mod tool_bridge;
 pub mod toolkit;
 pub mod ui;
