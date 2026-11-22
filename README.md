@@ -10,35 +10,32 @@ A terminal code editor that looks and feels like the Visual Studio C# editor, fo
 
 ## Built-in AI agent
 
-Press `Ctrl+K A`, click **✦ Agent** in the title bar, or tap **✦** on a phone. Then ask in plain words, or tap one of the suggestions ("Find bugs in calc.py"). The agent can read and edit your project:
+Press `Ctrl+K A`, click **✦ Agent** in the title bar, or tap **✦** on a phone. Ask in plain words or tap a suggestion ("Find bugs in calc.py"). The agent can read, edit, create, search and run commands in your project (UTF-8 or UTF-16 files).
 
-- **Built-in by default.** Uses Kono Router `/v1` with `free:code` model; set API key in Settings or run `termed --router-login`. Agent can list, read, search, edit, create files and folders, and run commands. Files are UTF-8 or UTF-16.
-- **Settings follow you.** Settings save to your user config directory and are used across folders. Legacy workspace settings import only if no user settings exist.
-- **Local fallback when the router is down.** On HTTP 5xx or 401/403, the turn continues on an on-device ONNX model instead of failing: `pip install -r local_inference/requirements.txt` once, then run `termed --local` or use **Use Local ONNX Inference**.
-- **Free models are busy sometimes.** Availability and rate limits depend on the router. Requests fail after a 150 s stall timeout or 5 min task timeout; long streams aren't cut. Tap the model name to choose another.
-- **Privacy.** Your prompt, open file and files the agent reads are sent to the provider. Free models may log or train on what they receive, so don't use them with secrets or confidential code.
-- **You stay in control.** Edits appear with change bars; Ctrl+Z reverts. Command permissions: Allow, Always allow, Reject, Never ask (destructive commands still blocked).
-- **100 extra tools.** Extended host tools (10 groups: workspace, text, buffers, edit, filesystem, search, git, UI, code, session) with permission gating. Read-only agents get no write tools; destructive calls need a confirm token.
-- **Context is automatic.** The open file and selection attach to every message (shown as `@ file.py:12-20`).
-- **Esc or ■ stops the agent and its task tree.** Partial edits remain for review; Stop resets the provider session, so restate essential context before continuing. + New starts a fresh chat.
-- **Other agents work too.** Gemini CLI, Claude Code and Codex can be selected via *Agent: Choose Agent*; they are not automatic and may need sign-in.
+- **Built-in by default.** Uses Kono Router `/v1` with `free:code`; set the API key in Settings or run `termed --router-login`.
+- **Settings follow you.** User settings save to your config directory and apply across folders. Legacy workspace settings import only if no user settings exist.
+- **Local fallback on router failure.** On HTTP 5xx or 401/403, the turn continues on an on-device ONNX model: `pip install -r local_inference/requirements.txt` once, then `termed --local` or **Use Local ONNX Inference**.
+- **Free models can be busy.** Availability and rate limits depend on the router. Requests fail after a 150 s stall or 5 min task timeout; long streams aren't cut. Tap the model name to choose another.
+- **Privacy.** Your prompt, open file and files the agent reads go to the provider. Free models may log or train on them — don't use them with secrets or confidential code.
+- **You stay in control.** Edits show change bars; Ctrl+Z reverts. Command permissions: Allow, Always allow, Reject, Never ask (destructive commands still blocked).
+- **100 extra tools** in 10 groups (workspace, text, buffers, edit, filesystem, search, git, UI, code, session) with permission gating. Read-only agents get no write tools; destructive calls need a confirm token.
+- **Context is automatic.** The open file and selection attach to every message (`@ file.py:12-20`).
+- **Esc or ■ stops the agent and its task tree.** Partial edits remain for review; Stop resets the provider session — restate essential context before continuing. + New starts a fresh chat.
+- **Other agents.** Gemini CLI, Claude Code and Codex can be selected via *Agent: Choose Agent*; not automatic and may need sign-in.
 - **On a phone** the panel is a full-screen sheet above the touch keyboard ([screenshot](docs/agent-phone.png)).
 
 ## On a phone
 
-![termed on a 46-column phone screen: explorer drawer, wrapped C#, find, command palette](docs/mobile.png)
-
 termed adapts to phone terminals (Termux, Blink, Termius, iSH). Below 80 columns it switches to compact layout automatically; `--mobile` forces it at any size. Resizing re-lays out immediately.
 
-- **Word wrap.** Long lines wrap so you never scroll sideways; `Alt+Z` toggles it.
-- **Touch keyboard.** A fixed 2×9 grid of laptop-style keys (modifiers left, arrows right). `--no-toolbar` hides it.
-
-- **Sticky modifiers.** Tap once: modifier applies to next key only. Tap twice: locked until tapped again or Esc.
-- **Box selection.** Tap **Box**, lock Alt+Shift, draw a rectangle; typing/Tab/Delete apply to every line at once. Hardware keyboard: `Alt+Shift+arrows` or Alt+drag.
-- **Selection by touch.** Double-tap selects a word; triple-tap selects a line. Shift+tap extends selection.
+- **Word wrap.** Long lines wrap; `Alt+Z` toggles it.
+- **Touch keyboard.** Fixed 2×9 grid (modifiers left, arrows right). `--no-toolbar` hides it.
+- **Sticky modifiers.** Tap once: applies to next key. Tap twice: locked until tapped again or Esc.
+- **Box selection.** Tap **Box**, lock Alt+Shift, draw a rectangle; typing/Tab/Delete apply to every line. Hardware: `Alt+Shift+arrows` or Alt+drag.
+- **Selection by touch.** Double-tap = word, triple-tap = line, Shift+tap extends.
 - **Explorer drawer.** ☰ slides the file tree over the editor; tapping outside dismisses it.
-- **Compact chrome.** Title bar shows ☰, ⌕ and ⋯ buttons; tab row appears only with multiple files; breadcrumbs, minimap and hints hidden.
-- **Phone-sized overlays.** Command palette and find/replace span full width; dialog buttons stack when needed; welcome screen is large buttons.
+- **Compact chrome.** Title bar shows ☰, ⌕, ⋯; tab row only with multiple files; breadcrumbs, minimap and hints hidden.
+- **Phone-sized overlays.** Command palette and find/replace span full width; dialog buttons stack; welcome screen is large buttons.
 - **Gestures and keyboards.** Swipes scroll, tap moves cursor, drag scrollbar; keyboards sending LF for Return work as Enter.
 
 ## Features
@@ -47,8 +44,7 @@ termed adapts to phone terminals (Termux, Blink, Termius, iSH). Below 80 columns
 - *Visual Studio Dark* theme mapped to TextMate scopes; bracket-pair colorization; indent guides; change-tracking margin; highlight references; minimap; current-line highlight; change bars; whitespace rendering.
 - Chrome: title bar with quick-open, file tree, tabs, breadcrumbs, clickable status bar; floating panels with rounded borders and shadows.
 - 15 themes: Visual Studio Dark, Termed Studio, Termed Neon, Dracula, Catppuccin, One Half Dark, Nord, Gruvbox, Solarized, Monokai and more.
-**Editing**
-- Highlighting for 192 languages (`termed --list-languages` for the full list). Auto-indent, smart block expansion, auto-closing brackets/quotes, smart Home, word navigation, Ctrl+D for next occurrence, line move/duplicate, toggle comment, block indent/outdent.
+- **Editing.** Highlighting for 192 languages (`termed --list-languages`). Auto-indent, smart block expansion, auto-closing brackets/quotes, smart Home, word navigation, Ctrl+D for next occurrence, line move/duplicate, toggle comment, block indent/outdent.
 - Box selection (Alt+Shift+arrows or Alt+drag); undo/redo grouped into words; find/replace with case/whole word/regex (`$1` capture groups), replace-one/replace-all.
 - Find in files (`Ctrl+Shift+I`) and Replace in Files (`Ctrl+Shift+H`): root/dirs/files filters, `.gitignore` honored, results grouped by file, binary/>2 MB files skipped. Limit default 10,000 (max 100,000).
 - Copy with no selection copies whole line; paste inserts above (VS-style). Clipboard via OSC 52, wl-copy, xclip, xsel, pbcopy.

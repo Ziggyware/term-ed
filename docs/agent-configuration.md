@@ -9,58 +9,47 @@
 
 ## User settings and migration
 
-Menu changes save a complete user configuration at **`$XDG_CONFIG_HOME/termed/settings.json`** (normally `~/.config/termed/settings.json`). `XDG_CONFIG_HOME` must be an absolute path; an empty or relative value is ignored. On Windows, when `XDG_CONFIG_HOME` and `HOME` are unset, it is under `%USERPROFILE%\.config\termed\settings.json`. The same settings load across folders and restarts; opening the editor alone does not create a file. On Unix, a newly created configuration directory is private (`0700`), and settings are atomically replaced using a private (`0600`) file. Other platforms rely on their user-directory ACLs. The separate **Save Router API Key** action stores credentials in a user-local credentials file, never in settings JSON. See [router setup and supervision](router-and-supervision.md).
+Menu changes save a complete user configuration at **`$XDG_CONFIG_HOME/termed/settings.json`** (normally `~/.config/termed/settings.json`). `XDG_CONFIG_HOME` must be an absolute path; empty or relative values are ignored. On Windows, when `XDG_CONFIG_HOME` and `HOME` are unset, it is under `%USERPROFILE%\.config\termed\settings.json`. Settings load across folders and restarts; opening the editor alone does not create a file. On Unix, a new config directory is private (`0700`) and settings are atomically replaced using a private (`0600`) file. Other platforms rely on user-directory ACLs. The separate **Save Router API Key** action stores credentials in a user-local credentials file, never in settings JSON. See [router setup and supervision](router-and-supervision.md).
 
-For migration, if no user settings file exists, termed reads the current folder's old `.termed/settings.json`. Version 1 or unversioned automatic/OpenCode backends are migrated to the built-in agent; the old implicit built-in gateway becomes the router, and an old OpenCode default model is cleared. A deliberately selected `auto`, `kilo`, or custom provider in version 2 is retained. Other settings, including explicitly selected non-OpenCode backends, custom providers and permission restrictions, are preserved. Loading alone does not write a file. The first successful menu save writes these settings at user scope and leaves the old workspace file untouched.
+For migration, if no user settings file exists, termed reads the current folder's old `.termed/settings.json`. Version 1 or unversioned automatic/OpenCode backends migrate to the built-in agent; the old implicit built-in gateway becomes the router, and an old OpenCode default model is cleared. A deliberately selected `auto`, `kilo`, or custom provider in version 2 is retained. Other settings (non-OpenCode backends, custom providers, permission restrictions) are preserved. Loading alone does not write a file. The first successful menu save writes settings at user scope and leaves the old workspace file untouched.
 
-**Important:** Once a user settings file exists it is authoritative, and legacy `.termed/settings.json` files in *all* folders are ignored—including any per-project instructions, `read_only`, command or plugin restrictions. An in-editor notice appears when a legacy file is present. Before migrating, inspect and copy any restrictions you need into the user settings; reapply folder-specific safeguards yourself. The old workspace files are not deleted. Skills and plugins still have their own workspace discovery rules.
+**Important:** Once a user settings file exists it is authoritative, and legacy `.termed/settings.json` files in *all* folders are ignored — including per-project instructions, `read_only`, command or plugin restrictions. An in-editor notice appears when a legacy file is present. Before migrating, inspect and copy any restrictions you need into the user settings; reapply folder-specific safeguards yourself. Old workspace files are not deleted. Skills and plugins still have their own workspace discovery rules.
 
 Use **Open User Settings JSON** for multi-line instructions or bulk edits, then **Reload Settings from Disk**. Invalid JSON, unsupported versions, invalid budgets and unavailable backends are reported; the last live configuration is retained on a failed reload. At startup, an invalid configuration falls back to defaults with an error notification. Menu changes do not overwrite an invalid configuration or an unsaved user settings buffer. Stop an AI turn before changing its agent/sub-agent configuration.
 
-Editor preferences include theme, minimap, whitespace, indent guides, line numbers, word wrap and the touch toolbar. Wrap and toolbar each cycle through automatic/on/off. Editor display commands also persist their changes.
+Editor preferences include theme, minimap, whitespace, indent guides, line numbers, word wrap and the touch toolbar. Wrap and toolbar each cycle through automatic/on/off. Editor display commands persist their changes.
 
 ## Connecting Kono Router or local llama.cpp
 
 Open **F1 → Agent: Configure AI Agent** (or **F1, Alt+A**). Use the **builtin** backend, then set **API base URL**:
 
 | Server | API base URL | Model |
-| --- | --- | --- |
+|---|---|---|
 | Kono Router | `https://kono-router.onrender.com` | Leave empty for `free:tools` (the tool-capable lane), or enter a model ID advertised by Kono |
 | llama.cpp | `http://127.0.0.1:8080` | Leave empty to discover the loaded model via `/v1/models`, or use the model's exact ID or `--alias` |
 
-`/v1` is added automatically to a base URL with no path (`http://192.168.1.20:8080`, `https://api.example.com`). A URL that already has a path is used verbatim, so include any other API prefix yourself. Setting an API base URL also selects the custom provider when the built-in provider is still `router`, so a settings file never silently keeps using the router. Leave **API key environment variable** empty for an unauthenticated server; if your deployment requires a key, enter the name of the environment variable holding it. For Kono, use a separate variable such as `KONO_API_KEY` for the Kono credential. The saved NoKey Router credential and the reserved `ROUTER_API_KEY` variable are not forwarded to either server.
+`/v1` is added automatically to a base URL with no path (`http://192.168.1.20:8080`, `https://api.example.com`). A URL that already has a path is used verbatim — include any other API prefix yourself. Setting an API base URL also selects the custom provider when the built-in provider is still `router`, so a settings file never silently keeps using the router. Leave **API key environment variable** empty for an unauthenticated server; if your deployment requires a key, enter the name of the environment variable holding it. For Kono, use a separate variable such as `KONO_API_KEY`. The saved NoKey Router credential and reserved `ROUTER_API_KEY` variable are not forwarded to either server.
 
-Run `llama-server` on the same machine as Termed and wait for the model to load before opening the agent. Use a tool-capable instruct model with a compatible chat template; llama.cpp may need `--jinja` for tool calls. With an 8,192-token context, start with a smaller **Model output token budget** (e.g. 1,024) to leave room for instructions, tools, and history. If the server is still starting or Kono is waking from sleep, retry once it is ready.
+Run `llama-server` on the same machine as termed and wait for the model to load before opening the agent. Use a tool-capable instruct model with a compatible chat template; llama.cpp may need `--jinja` for tool calls. With an 8,192-token context, start with a smaller **Model output token budget** (e.g. 1,024) to leave room for instructions, tools, and history. If the server is still starting or Kono is waking from sleep, retry once it is ready.
 
 ## On-device ONNX inference
 
-termed can run the built-in agent on a local ONNX model with ONNX Runtime:
-no network, no API key. It is used **automatically when the provider returns
-HTTP 503** (or any other 5xx), and can be selected outright with **Use Local
-ONNX Inference**, `"provider": "local"` or `--local`. If local inference also
-fails, the turn goes back to the configured provider.
+termed can run the built-in agent on a local ONNX model with ONNX Runtime: no network, no API key. It is used **automatically when the provider returns HTTP 503** (or any other 5xx), and can be selected outright with **Use Local ONNX Inference**, `"provider": "local"` or `--local`. If local inference also fails, the turn goes back to the configured provider.
 
-Set up Python with `pip install -r local_inference/requirements.txt`; the
-default model (~150 MB) downloads once from Hugging Face and then runs
-offline. termed starts the server from the embedded
-`local_inference/onnx_server.py` on the **Local ONNX endpoint** (default
-`http://127.0.0.1:8080/v1`) and reuses it across sessions. Only loopback
-`http://` endpoints are started automatically; run `termed --local-serve` to
-serve one yourself. See [local ONNX inference](local-inference.md) for models,
-logs, limits and tests.
+Set up Python with `pip install -r local_inference/requirements.txt`; the default model (~150 MB) downloads once from Hugging Face and then runs offline. termed starts the server from the embedded `local_inference/onnx_server.py` on the **Local ONNX endpoint** (default `http://127.0.0.1:8080/v1`) and reuses it across sessions. Only loopback `http://` endpoints are started automatically; run `termed --local-serve` to serve one yourself. See [local ONNX inference](local-inference.md) for models, logs, limits and tests.
 
 ## Configuring the primary agent
 
 The agent configuration menu exposes:
 
 | Setting | Meaning |
-| --- | --- |
+|---|---|
 | Backend | `builtin` (default), `custom`, or the exact display name of an installed ACP agent; legacy `auto` selects the built-in agent |
 | Custom ACP command | An argv string with single/double-quoted arguments; no shell expansion. Set it before choosing `custom` |
 | Model | Explicit provider model ID; empty uses the provider default or discovers the first model advertised by a custom server |
-| API base URL | Built-in agent's OpenAI-compatible base URL, including `/v1` when required; empty uses the selected provider. The default router uses `https://nokey-router.ziggyware.deno.net/v1`. Ignored while the `local` provider is selected |
-| Local ONNX endpoint | On-device ONNX server base URL used by the `local` provider and the 503 fallback; empty uses `http://127.0.0.1:8080/v1` |
-| API key environment variable | **The name of an environment variable**, never the API key itself |
+| API base URL | Built-in agent's OpenAI-compatible base URL, including `/v1` when required; empty uses the selected provider. The default router uses `https://nokey-router.ziggyware.deno.net/v1`. Ignored while `local` is selected |
+| Local ONNX endpoint | On-device ONNX server base URL used by `local` and the 503 fallback; empty uses `http://127.0.0.1:8080/v1` |
+| API key environment variable | Name of an environment variable, never the API key itself |
 | Instructions | Role, conventions and additional instructions; use JSON for multiple lines |
 | Step budget | 1–100 built-in model/tool rounds per turn (default 30) |
 | Read-only | Built-in agent cannot edit/write files, run commands or execute plugins |
@@ -70,22 +59,22 @@ The agent configuration menu exposes:
 | Attached skills | Comma-separated enabled skill IDs to include on each prompt |
 | Sub-agent delegation | Whether the primary AI can delegate to configured specialists |
 | Delegations per turn | 1–32 total tasks for the whole root tree (default 4); descendants share this budget |
-| Task timeout | 10–1800 seconds (default 300) for the root turn and inherited absolute specialist deadlines, including approval waits |
+| Task timeout | 10–1800 seconds (default 300) for the root turn and inherited specialist deadlines, including approval waits |
 | Attach editor context | Include the active file and selection in prompts and bounded worker briefs |
-| Built-in provider | `router` (default), `kilo`, `custom`, `local` (on-device ONNX); the `onnx` alias is normalized to `local` on load and save, and a legacy/deliberate `auto` is retained. The related model, endpoint, key variable and backend are normalized with the provider |
+| Built-in provider | `router` (default), `kilo`, `custom`, `local` (on-device ONNX); `onnx` normalizes to `local` on load/save; legacy `auto` is retained. Related model, endpoint, key variable and backend normalize with the provider |
 | Maximum agent depth | 1–3 (default 2): root=0, child=1, grandchild=2; every ancestor can impose a smaller cap |
 | Concurrent tasks | 1–8 active tasks (default 4), including waiting coordinators; new delegation fails fast when full |
 | Overwatch stall timeout | 15–600 seconds (default 150); child/approval/plugin waits are exempt from idle detection, not absolute deadlines |
 | Pure generated functions | Enable bounded task-scoped data transformations; no generated code execution |
-| Extended AI toolkit | Expose the 100 extra host tools; write tools are hidden from read-only agents and git tools from `deny` |
+| Extended AI toolkit | Expose the 100 extra host tools; write tools hidden from read-only agents and git tools from `deny` |
 | Toolkit groups | Comma-separated groups (`workspace`, `text`, `buffers`, `edit`, `filesystem`, `search`, `git`, `ui`, `code`, `session`); empty means all. Fewer groups means a shorter tool prompt |
 | Model output token budget | 256–16384 (default 4096), inherited restrictively |
 
 Explicit settings take precedence over environment defaults. Custom provider requests use `Authorization: Bearer <value of api_key_env>`; missing credentials are reported without exposing their value. Custom endpoints use the explicitly chosen model rather than discovering/failing over to unrelated free models.
 
-With `ask`, each shell command asks permission unless you select **Always allow** for the rest of the session or **Never ask**, which also saves `allow` here so later sessions do not ask. `deny` blocks shell commands. `risk_assessed` lets the risk policy auto-allow low-risk commands without asking. `allow` never asks at all. Commands the risk policy marks as destructive remain blocked in every mode. Plugin approval is separate and **always per invocation**.
+With `ask`, each shell command asks permission unless you select **Always allow** for the rest of the session or **Never ask** (saves `allow` so later sessions don't ask). `deny` blocks shell commands. `risk_assessed` lets the risk policy auto-allow low-risk commands without asking. `allow` never asks. Commands the risk policy marks as destructive remain blocked in every mode. Plugin approval is separate and always per invocation.
 
-Commands run through the machine's own shell rather than a hardcoded `sh`: `/bin/sh` on Linux, macOS, the BSDs and Android/Termux; on Windows `sh` when Git for Windows, MSYS2, Cygwin or WSL provides it, otherwise `cmd.exe` (and PowerShell as a last resort). The `bash.exe`/`wsl.exe`/`lxrun.exe` launcher stubs in the Windows system directory (`C:\Windows\System32`, or `/mnt/<drive>/Windows/System32` from inside WSL) are never picked automatically, because they relay to WSL rather than running a shell and fail with `WSL ... ERROR: CreateProcessCommon:...`; an explicit `TERMED_SHELL` can still use them. Set `TERMED_SHELL` to the program and its leading arguments to use something else, for example `TERMED_SHELL="bash -c"`. If no shell can be found the tool reports that instead of failing silently.
+Commands run through the machine's own shell rather than a hardcoded `sh`: `/bin/sh` on Linux, macOS, the BSDs and Android/Termux; on Windows `sh` when Git for Windows, MSYS2, Cygwin or WSL provides it, otherwise `cmd.exe` (PowerShell as last resort). The `bash.exe`/`wsl.exe`/`lxrun.exe` launcher stubs in the Windows system directory are never picked automatically (they relay to WSL rather than running a shell and fail with `WSL ... ERROR: CreateProcessCommon:...`); an explicit `TERMED_SHELL` can still use them. Set `TERMED_SHELL` to the program and its leading arguments, e.g. `TERMED_SHELL="bash -c"`. If no shell can be found, the tool reports that instead of failing silently.
 
 External ACP agents receive configured instructions, selected skills, model selection and an MCP server definition. Provider URLs, built-in step budgets and built-in tool restrictions do not reconfigure or sandbox an external process. An external agent must support ACP MCP servers to use the live editor tools. Use the built-in agent for host-enforced read-only and command restrictions; external agents and plugins remain trusted local programs with your account's filesystem access.
 
@@ -132,9 +121,9 @@ The built-in agent and external MCP clients share these live tools:
 - `report_progress(message)`, `task_status()`, `cancel_task(task_id)`.
 - `define_function(...)`, `list_functions()`, `call_function(name, arguments)`; built-in agents also get each generated `fn_` schema dynamically.
 
-Disabled tools are omitted from schemas **and** rejected at dispatch. Plugin allowlists and explicit denials also apply to delegated workers. Selecting Reject or stopping the turn returns an error to the AI; it does not launch the plugin command. A plugin that exits, times out, reports a JSON-RPC error or emits an error toast is reported as a failure, not a successful process launch.
+Disabled tools are omitted from schemas **and** rejected at dispatch. Plugin allowlists and explicit denials also apply to delegated workers. Selecting Reject or stopping the turn returns an error to the AI — it does not launch the plugin command. A plugin that exits, times out, reports a JSON-RPC error or emits an error toast is reported as a failure, not a successful process launch.
 
-Plugin calls target the explicit workspace file or the active buffer captured when approval was requested. Switching tabs while a plugin is running does not redirect its edits. Changes remain unsaved and undoable, just like manual plugin commands. Results include plugin messages and the resulting buffer (with a size limit). **Read the live buffer after plugin edits; disk reads can still contain the old saved version.** Executable plugins are not sandboxed: inspect their manifests/scripts before enabling them or approving execution.
+Plugin calls target the explicit workspace file or the active buffer captured when approval was requested. Switching tabs while a plugin runs does not redirect its edits. Changes remain unsaved and undoable. Results include plugin messages and the resulting buffer (with a size limit). **Read the live buffer after plugin edits; disk reads can still contain the old saved version.** Executable plugins are not sandboxed — inspect their manifests/scripts before enabling them or approving execution.
 
 Plugin command execution times out after 120 seconds; unanswered plugin approvals expire after five minutes. Stop cancels pending approvals, stops active plugin processes and cancels delegated tasks. Partial plugin edits remain visible and undoable rather than being silently reverted.
 
@@ -147,7 +136,7 @@ For external agents, termed supplies an authenticated **stdio MCP relay** in ACP
 The host advertises 100 additional tools from a single catalog, in ten groups:
 
 | Group | Tools |
-| --- | --- |
+|---|---|
 | `workspace` | `workspace_info`, `list_directory`, `tree_view`, `file_info`, `find_files`, `path_exists`, `workspace_stats`, `recent_files`, `file_checksum`, `directory_sizes` |
 | `text` | `read_lines`, `grep_context`, `todo_scan`, `word_stats`, `line_stats`, `whitespace_report`, `text_diff`, `buffer_disk_diff`, `json_query`, `regex_test` |
 | `buffers` | `list_buffers`, `buffer_info`, `get_selection`, `cursor_info`, `buffer_text`, `selection_count`, `bracket_balance`, `indent_report`, `buffer_changes`, `line_at` |
@@ -159,15 +148,15 @@ The host advertises 100 additional tools from a single catalog, in ten groups:
 | `code` | `detect_language`, `outline_symbols`, `dependency_summary`, `license_check`, `markdown_stats`, `import_summary`, `comment_ratio`, `function_sizes`, `test_map`, `json_validate` |
 | `session` | `list_toolkit`, `describe_tool`, `get_agent_settings`, `list_editor_commands`, `run_editor_command`, `open_palette`, `focus_panel`, `scratchpad_write`, `scratchpad_read`, `session_summary` |
 
-Every tool has a JSON schema, and the same catalog drives what is advertised, what is accepted and what runs, so a disabled or non-permitted tool is not merely hidden: the host rejects the call. Rules:
+Every tool has a JSON schema, and the same catalog drives what is advertised, accepted and what runs — a disabled or non-permitted tool is not merely hidden; the host rejects the call. Rules:
 
-- **Read-only.** `read_only` hides every mutating tool and rejects `run_editor_command` for commands that change content. Git tools are fixed-argv, read-only commands (`status`, `diff`, `log`, `show`, `branch`, `blame`, `log --follow`, `remote`, `stash list`, `tag --list`) with no shell, and they are hidden entirely when command permissions are `deny`.
-- **Live buffers first.** A tool that edits a file which is open in the editor replaces the buffer in one undo step and leaves it unsaved, instead of writing disk content over your unsaved work. `save_buffer`/`save_all_buffers` are the only toolkit calls that write buffers to disk, and `revert_buffer` needs `confirm: "DISCARD"`.
-- **Confirmation tokens.** Destructive calls fail closed without the literal token: `delete_path` requires `confirm: "DELETE"` (and `recursive: true` for a directory), `patch_file` and `replace_in_files` require `confirm: "APPLY"` when they are not dry runs, and `close_buffer` requires `DISCARD` to discard an edited buffer. `create_file`, `write_lines`, `copy_path` and `move_path` refuse to replace an existing path unless `overwrite` is true. `delete_path` also refuses the workspace root, paths inside `.git`, symlinks and files that have an open buffer.
-- **Bounded.** Paths go through the same `workspace_path` resolution as other tools, so `..` escapes, symlink escapes and credential files are rejected. Scans stop after 2,000 files or 512 KiB per file, directory listings and match lists are capped, and returned text is truncated at 96 KiB with an explicit note.
-- **Session notes.** `scratchpad_write`/`scratchpad_read` keep up to 64 keys and 32 KiB of notes for the current editor session. They are memory-only: nothing is written to disk and they disappear when termed exits.
+- **Read-only.** `read_only` hides every mutating tool and rejects `run_editor_command` for commands that change content. Git tools are fixed-argv, read-only commands (`status`, `diff`, `log`, `show`, `branch`, `blame`, `log --follow`, `remote`, `stash list`, `tag --list`) with no shell, and are hidden entirely when command permissions are `deny`.
+- **Live buffers first.** A tool that edits a file open in the editor replaces the buffer in one undo step and leaves it unsaved, instead of writing disk content over your unsaved work. `save_buffer`/`save_all_buffers` are the only toolkit calls that write buffers to disk, and `revert_buffer` needs `confirm: "DISCARD"`.
+- **Confirmation tokens.** Destructive calls fail closed without the literal token: `delete_path` requires `confirm: "DELETE"` (and `recursive: true` for a directory), `patch_file` and `replace_in_files` require `confirm: "APPLY"` when not dry runs, and `close_buffer` requires `DISCARD` to discard an edited buffer. `create_file`, `write_lines`, `copy_path` and `move_path` refuse to replace an existing path unless `overwrite` is true. `delete_path` also refuses the workspace root, paths inside `.git`, symlinks and files with an open buffer.
+- **Bounded.** Paths go through `workspace_path` resolution, so `..` escapes, symlink escapes and credential files are rejected. Scans stop after 2,000 files or 512 KiB per file; listings and match lists are capped; returned text is truncated at 96 KiB with an explicit note.
+- **Session notes.** `scratchpad_write`/`scratchpad_read` keep up to 64 keys and 32 KiB of notes for the current editor session. Memory-only: nothing is written to disk, and notes disappear when termed exits.
 
-Sub-agents inherit the toolkit: a child keeps `toolkit` only if its parent has it and keeps only groups the parent already has, so a specialist can never gain a group its parent lacks.
+Sub-agents inherit the toolkit: a child keeps `toolkit` only if its parent has it, and keeps only groups the parent already has — a specialist can never gain a group its parent lacks.
 
 ## Sub-agents
 
