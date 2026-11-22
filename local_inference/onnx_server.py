@@ -81,12 +81,32 @@ def _open(req: urllib.request.Request, *, timeout: int, label: str,
 
     A dropped TLS connection (WinError 10054 / ECONNRESET, proxy, VPN, or a
     briefly unavailable Hub) used to abort the whole local fallback. These
-    are transient: retry before giving up.
+    are transient: retry before giving up. A definitive 4xx answer (a typo'd
+    repo id, a repo that does not exist) is NOT transient: retrying it
+    wastes minutes, so it raises immediately.
     """
     last: Exception | None = None
     for attempt in range(attempts):
         try:
             return urllib.request.urlopen(req, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429 or exc.code >= 500:
+                # Rate-limited or a broken Hub: try again, like a drop.
+                last = exc
+            else:
+                # A definitive answer — a bad model id or a deleted repo.
+                raise HubError(
+                    f"{label} failed: the Hub answered HTTP {exc.code}. "
+                    f"Check the model id (it must be a Hugging Face repo "
+                    f"id, e.g. onnx-community/SmolLM2-135M-Instruct), or pass "
+                    f"--model with a local directory (see docs/local-inference.md)."
+                ) from exc
+            if attempt + 1 == attempts:
+                break
+            delay = 2 ** attempt
+            log(f"{label} failed ({exc}); retrying in {delay}s "
+                f"[{attempt + 1}/{attempts}]")
+            time.sleep(delay)
         except (urllib.error.URLError, OSError, ValueError) as exc:
             last = exc
             if attempt + 1 == attempts:

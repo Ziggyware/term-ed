@@ -56,7 +56,8 @@ for the listing, 3 per file), because drops like Windows `WinError 10054`
 ("an existing connection was forcibly closed", typical of proxies, VPNs and
 filtering middleboxes) are usually transient. Downloaded files are written as
 `.part` and renamed only when complete, so a retry resumes cleanly and never
-leaves a corrupt cache.
+leaves a corrupt cache. A definitive answer — the Hub answering 400/404 for a
+typo'd model id — is NOT retried; it fails immediately.
 
 If the Hub is blocked outright, point at a mirror or pre-download:
 
@@ -74,6 +75,10 @@ huggingface-cli download onnx-community/SmolLM2-135M-Instruct \
             "config.json" "generation_config.json" \
   --local-dir ~/.config/termed/onnx-models/onnx-community--SmolLM2-135M-Instruct
 ```
+
+A remote model id from the router or another provider (for example
+`free:auto`) is not a Hugging Face repo; in local mode termed loads the
+default model instead of passing the remote id to the server.
 
 On Windows the cache path is
 `%USERPROFILE%\.config\termed\onnx-models\onnx-community--SmolLM2-135M-Instruct`,

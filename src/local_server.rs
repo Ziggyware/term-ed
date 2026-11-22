@@ -232,12 +232,21 @@ fn wait_ready<F: Fn() -> bool, P: Fn(Duration)>(
 }
 
 /// The model to load: the chat model the worker is using, unless it is the
-/// placeholder id or a remote provider's model.
+/// placeholder id or a remote provider's model. Remote model ids (free-tier
+/// aliases and router-forward ids) mean nothing on this machine: an
+/// `owner/name` string that is not a Hugging Face repo id would be mistaken
+/// for one and fail the first-run fetch with a confusing error, so they all
+/// fall back to the default local model.
 pub fn model_for(model: &str) -> String {
     let model = model.trim();
     if model.is_empty()
         || model == crate::provider::LOCAL_MODEL
         || model == crate::provider::ROUTER_MODEL
+        || model == crate::provider::KONO_MODEL
+        || model == crate::builtin_agent::DEFAULT_MODEL
+        || model.ends_with(":free")
+        || model.starts_with("free:")
+        || model == "openrouter/free"
     {
         DEFAULT_MODEL.into()
     } else {
@@ -413,5 +422,28 @@ mod tests {
         assert_eq!(model_for(crate::provider::ROUTER_MODEL), DEFAULT_MODEL);
         assert_eq!(model_for("my-model"), "my-model");
         assert_eq!(model_for("/models/qwen"), "/models/qwen");
+    }
+
+    #[test]
+    fn remote_provider_ids_use_the_default_onnx_model() {
+        // Remote model ids mean nothing on this machine; they are meaningless
+        // Hugging Face repo names, so they must not reach the first-run fetch.
+        for remote in [
+            "free:auto",
+            "free:code",
+            "free:smart",
+            "free:tools",
+            "kilo-auto/free",
+            "openrouter/free",
+            "some-nested/model:free",
+        ] {
+            assert_eq!(model_for(remote), DEFAULT_MODEL, "{remote}");
+        }
+        // Local directory paths and real repo ids pass through untouched.
+        assert_eq!(model_for("~/models/qwen"), "~/models/qwen");
+        assert_eq!(
+            model_for("onnx-community/SmolLM2-135M-Instruct"),
+            "onnx-community/SmolLM2-135M-Instruct"
+        );
     }
 }

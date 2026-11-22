@@ -395,6 +395,10 @@ class HubRetryTests(unittest.TestCase):
                     self.connection.close()
                     return
                 path = self.path
+                if "does-not-exist" in path:
+                    # A definitive 404: the repo is not on the Hub.
+                    self.send_error(404)
+                    return
                 if path.startswith("/api/models/"):
                     body = json.dumps({"siblings": [
                         {"rfilename": "onnx/model.onnx"},
@@ -466,6 +470,14 @@ class HubRetryTests(unittest.TestCase):
         self.assertEqual(again, os.path.join(
             self.cache, self.repo.replace("/", "--")))
         self.assertEqual(self.calls, before)
+
+    def test_a_definitive_4xx_answer_fails_fast_without_retrying(self):
+        # A 404 answers in one request, with no backoff attempts.
+        self.reset_attempts = 0
+        with self.assertRaises(RuntimeError) as error:
+            onnx_server.resolve_model_dir("owner/does-not-exist", self.cache)
+        self.assertIn("HTTP 404", str(error.exception))
+        self.assertEqual(self.calls, 1)
 
 
 class PrewarmTests(unittest.TestCase):
