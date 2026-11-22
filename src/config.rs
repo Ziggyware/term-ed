@@ -159,6 +159,21 @@ impl AgentConfig {
         self.normalize_for_provider("router");
     }
 
+    /// Kono Router (`https://kono-router.onrender.com/v1`): fast free cloud
+    /// routing with tool support and no API key required.
+    pub fn uses_kono(&self) -> bool {
+        !self.uses_local()
+            && (self.provider == "kono"
+                || (!self.endpoint.trim().is_empty()
+                    && crate::provider::custom_endpoint(&self.endpoint)
+                        == crate::provider::KONO_ENDPOINT))
+    }
+
+    pub fn use_kono(&mut self) {
+        self.backend = "builtin".into();
+        self.normalize_for_provider("kono");
+    }
+
     /// On-device ONNX inference: no key, no network. `onnx` is accepted as
     /// an alias for `local` in settings files.
     pub fn uses_local(&self) -> bool {
@@ -183,6 +198,14 @@ impl AgentConfig {
                 self.endpoint = String::new();
                 self.api_key_env = String::new();
                 self.model = crate::provider::ROUTER_MODEL.into();
+            }
+            "kono" => {
+                self.provider = "kono".into();
+                self.endpoint = String::new();
+                if self.api_key_env == crate::credentials::ROUTER_ENV {
+                    self.api_key_env.clear();
+                }
+                self.model = crate::provider::KONO_MODEL.into();
             }
             "local" => {
                 self.provider = "local".into();
@@ -236,7 +259,7 @@ impl AgentConfig {
     /// The providers the built-in agent accepts. Deliberate legacy or
     /// inheritance values (`auto`) are retained; every other value must be
     /// one of these in the settings file.
-    pub const CANONICAL_PROVIDERS: [&str; 4] = ["router", "kilo", "custom", "local"];
+    pub const CANONICAL_PROVIDERS: [&str; 5] = ["router", "kono", "kilo", "custom", "local"];
 
     /// Normalize a provider value to its canonical form: trimmed, lowercased,
     /// with the legacy `onnx` alias mapped to `local`.
@@ -262,7 +285,7 @@ impl AgentConfig {
                 self.provider = "auto".into();
                 Ok(())
             }
-            "router" | "local" | "kilo" | "custom" => {
+            "router" | "kono" | "local" | "kilo" | "custom" => {
                 // Provider settings belong to the built-in agent. An external
                 // ACP backend ignores them entirely (it keeps its own model),
                 // and `auto` selects the first available backend, which the
@@ -285,9 +308,9 @@ impl AgentConfig {
     pub fn validate(&self) -> Result<()> {
         if !matches!(
             self.provider.as_str(),
-            "auto" | "router" | "kilo" | "custom" | "local" | "onnx"
+            "auto" | "router" | "kono" | "kilo" | "custom" | "local" | "onnx"
         ) {
-            bail!("Provider must be router, kilo, custom, local or auto");
+            bail!("Provider must be router, kono, kilo, custom, local or auto");
         }
         if self.provider == "custom" && self.endpoint.trim().is_empty() {
             bail!("Set an API base URL before choosing the custom provider");

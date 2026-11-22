@@ -98,6 +98,8 @@ pub fn spawn_configured_with_agui(
             w.model = options.model.clone();
         } else if options.uses_router() {
             w.model = crate::provider::ROUTER_MODEL.into();
+        } else if options.uses_kono() {
+            w.model = crate::provider::KONO_MODEL.into();
         } else if options.uses_local() {
             w.model = crate::provider::LOCAL_MODEL.into();
         } else if !options.endpoint.is_empty() {
@@ -368,6 +370,15 @@ fn local_load_failure(msg: &str) -> bool {
         || m.contains("not reachable")
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RemoteSource {
+    label: &'static str,
+    endpoint: String,
+    model: String,
+    models: Vec<(String, String)>,
+    use_router_key: bool,
+}
+
 struct Worker {
     cwd: PathBuf,
     options: AgentConfig,
@@ -388,6 +399,9 @@ struct Worker {
     model_selector: ModelSelector,
     decisions: Arc<dyn DecisionEngine>,
     agui: AGUIHub,
+    /// Active remote information source (e.g. Kono Router, NoKey Router, Kilo Gateway)
+    /// selected automatically for speed or failover before falling back to local ONNX.
+    remote_override: Option<RemoteSource>,
     /// Local ONNX server in use after the remote provider returned 5xx.
     /// While set, requests go to the machine, not the network.
     local: Option<crate::config::LocalInference>,
@@ -446,6 +460,7 @@ impl Worker {
             model_selector,
             decisions,
             agui,
+            remote_override: None,
             local: None,
             saved_remote: None,
             local_sticky: false,
@@ -465,8 +480,56 @@ impl Worker {
         self.send(json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"builtin","update":u}}));
     }
 
+    fn status(&self, text: &str) {
+        self.update(json!({"sessionUpdate":"status","text":text}));
+    }
+
     fn notice(&self, text: &str, error: bool) {
         self.update(json!({"sessionUpdate":"notice","severity": if error {"error"} else {"info"},"title":text}));
+    }
+
+    /// True when normal multi-source routing (Kono Router -> NoKey Router ->
+    /// Kilo Gateway -> Local ONNX) is allowed, and false when running against
+    /// a pinned custom endpoint or local test fixture.
+    fn multi_source_enabled(&self) -> bool {
+        std::env::var_os("TERMED_LOCAL_ENDPOINT").is_none()
+            && std::env::var_os("TERMED_ONNX_ENDPOINT").is_none()
+            && std::env::var_os("TERMED_FREE_GATEWAY").is_none()
+            && std::env::var_os("TERMED_OFFLINE").is_none()
+            && self.options.local_endpoint.trim().is_empty()
+            && !(self.options.provider == "custom" && !self.options.uses_kono())
+    }
+
+    /// Ordered remote information sources to try before falling back to the
+    /// slower CPU-based on-device ONNX model.
+    fn candidate_remote_sources(&self) -> Vec<RemoteSource> {
+        let mut out = vec![RemoteSource {
+            label: "Kono Router",
+            endpoint: crate::provider::KONO_ENDPOINT.to_string(),
+            model: crate::provider::KONO_MODEL.to_string(),
+            models: crate::provider::kono_models(),
+            use_router_key: false,
+        }];
+        if crate::credentials::router_key().ok().flatten().is_some() {
+            out.push(RemoteSource {
+                label: "NoKey Router",
+                endpoint: crate::provider::ROUTER_ENDPOINT.to_string(),
+                model: crate::provider::ROUTER_MODEL.to_string(),
+                models: crate::provider::router_models(),
+                use_router_key: true,
+            });
+        }
+        out.push(RemoteSource {
+            label: "Kilo Gateway",
+            endpoint: gateway(),
+            model: DEFAULT_MODEL.to_string(),
+            models: vec![(
+                DEFAULT_MODEL.to_string(),
+                "Auto (best free model)".to_string(),
+            )],
+            use_router_key: false,
+        });
+        out
     }
 
     fn config_options(&self) -> Value {
@@ -494,16 +557,42 @@ impl Worker {
                     self.cwd = PathBuf::from(c);
                 }
                 self.history.clear();
+                if let Some(hist) = p.get("history").and_then(Value::as_array) {
+                    for msg in hist {
+                        let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
+                        let content = msg.get("content").and_then(Value::as_str).unwrap_or("");
+                        if matches!(role, "user" | "assistant") && !content.trim().is_empty() {
+                            self.history
+                                .push(json!({"role": role, "content": content}));
+                        }
+                    }
+                }
                 self.used_tool_ids.clear();
                 self.always_allow_commands = false;
                 // A new session starts on the configured provider again; the
                 // local server stays up and can still serve a 5xx fallback.
+                self.remote_override = None;
                 self.local = None;
                 self.saved_remote = None;
                 self.local_sticky = false;
+                // When Kono Router or other fast cloud sources are available,
+                // prefer them over blocking on slow CPU local ONNX or failing
+                // immediately when no router API key is configured.
+                if self.multi_source_enabled()
+                    && (self.options.uses_local()
+                        || (self.options.uses_router()
+                            && crate::credentials::router_key().ok().flatten().is_none()))
+                    && let Some(src) = self.candidate_remote_sources().into_iter().next()
+                {
+                    self.model = src.model.clone();
+                    self.models = src.models.clone();
+                    self.remote_override = Some(src);
+                }
                 if self.models.is_empty() {
                     self.models = if self.options.uses_router() {
                         crate::provider::router_models()
+                    } else if self.options.uses_kono() {
+                        crate::provider::kono_models()
                     } else if self.options.uses_local() {
                         // On-device inference: start (or attach to) the local
                         // server now so /models reports the model it loaded.
@@ -554,8 +643,14 @@ impl Worker {
                         // picker is only useful if it is fetched there too.
                         let kono = crate::provider::endpoint(&self.options)
                             == crate::provider::KONO_ENDPOINT;
-                        let mut models = Vec::new();
-                        if !self.model.is_empty() {
+                        let mut models = if kono {
+                            crate::provider::kono_models()
+                        } else {
+                            Vec::new()
+                        };
+                        if !self.model.is_empty()
+                            && !models.iter().any(|(v, _)| *v == self.model)
+                        {
                             models.push((self.model.clone(), self.model.clone()));
                         }
                         if models.is_empty() || kono {
@@ -625,9 +720,9 @@ impl Worker {
             "(empty directory)".into()
         } else {
             let total = names.len();
-            names.truncate(40);
-            if total > 40 {
-                names.push(format!("… ({} more)", total - 40));
+            names.truncate(200);
+            if total > 200 {
+                names.push(format!("… ({} more)", total - 200));
             }
             names.join(", ")
         }
@@ -649,8 +744,8 @@ impl Worker {
         }
         let query = combined.to_ascii_lowercase();
         let broad_inspection = [
-            "file", "files", "folder", "directory", "song", "songs", "lyric", "lyrics", "readme",
-            "review", "read", "list", "check", "what", "summary", "summarize",
+            "lyric", "lyrics", "readme", "review", "read", "check", "summary", "summarize",
+            "content", "contents", "inside",
         ]
         .iter()
         .any(|kw| query.contains(kw));
@@ -754,7 +849,9 @@ impl Worker {
         } else {
             std::env::consts::OS
         };
-        if self.local.is_some() || self.options.uses_local() {
+        if self.local.is_some()
+            || (self.options.uses_local() && self.remote_override.is_none())
+        {
             let mut prompt = format!(
                 "You are termed AI running on a local on-device ONNX model inside the termed code editor.\n\
                  Project root: {}\n\
@@ -763,6 +860,7 @@ impl Worker {
                  \n\
                  Rules:\n\
                  - Referenced workspace text files and the active editor file are attached in `<untrusted_workspace_context>` inside the user messages. Read and answer directly from those file contents.\n\
+                 - When asked to list files, always list ALL files from `Workspace files in project root` above, not only the previewed file excerpts.\n\
                  - If you need to read another file from the workspace whose contents are not yet shown, output `<tool_call>{{\"name\": \"read_file\", \"arguments\": {{\"path\": \"filename.ext\"}}}}</tool_call>` and wait for the tool response.\n\
                  - NEVER invent, guess, or fabricate filenames, directory listings, file contents, line counts, or command output.\n\
                  - NEVER claim you read, checked, or verified a file unless its contents are shown in `<untrusted_workspace_context>` or a tool response.\n\
@@ -880,7 +978,20 @@ impl Worker {
             }
         }
         let mut user_content = text.trim().to_string();
-        if (self.local.is_some() || self.options.uses_local()) && self.options.auto_context {
+        if self.options.auto_context
+            && (self.local.is_some()
+                || self.options.uses_local()
+                || self.options.uses_kono()
+                || self.remote_override.is_some())
+        {
+            self.status("Scanning workspace files & attaching project context…");
+            let file_list = format!(
+                "Complete list of workspace files in project root: {}",
+                self.local_workspace_entries()
+            );
+            if !context_notes.iter().any(|existing| existing == &file_list) {
+                context_notes.push(file_list);
+            }
             for snippet in self.local_workspace_file_snippets(&user_content) {
                 if !context_notes.iter().any(|existing| existing == &snippet) {
                     context_notes.push(snippet);
@@ -905,7 +1016,28 @@ impl Worker {
                 self.models = models;
             }
         }
+        if self.multi_source_enabled()
+            && !self.local_sticky
+            && self.remote_override.is_none()
+            && (self.options.uses_local()
+                || (self.options.uses_router()
+                    && crate::credentials::router_key().ok().flatten().is_none()))
+            && let Some(src) = self.candidate_remote_sources().into_iter().next()
+        {
+            self.local = None;
+            self.model = src.model.clone();
+            self.models = src.models.clone();
+            self.remote_override = Some(src);
+            self.send(json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"builtin",
+                "update":{"sessionUpdate":"config_option_update","configOptions":self.config_options()}}}));
+        }
         let mut tried_models = vec![self.model.clone()];
+        let initial_endpoint = match (&self.local, &self.remote_override) {
+            (Some(local), _) => local.endpoint.clone(),
+            (None, Some(remote)) => remote.endpoint.clone(),
+            (None, None) => crate::provider::endpoint(&self.options),
+        };
+        let mut tried_endpoints: HashSet<String> = HashSet::from([initial_endpoint]);
         // Remote provider 5xx (notably 503) switches this turn to the local
         // ONNX server once; its model belongs to a different endpoint, so it
         // is tracked apart from `tried_models`.
@@ -981,7 +1113,7 @@ impl Worker {
                 }
                 // A reset before any response is transport noise, not a busy
                 // model: retry the same model on a fresh connection first.
-                Err(Step::Failed(_, None)) if resets < 2 => {
+                Err(Step::Failed(_, None)) if resets < 2 && !self.multi_source_enabled() => {
                     resets += 1;
                     if !self.backoff(Duration::from_millis(400 << resets)) {
                         return "cancelled";
@@ -989,15 +1121,95 @@ impl Worker {
                 }
                 Err(Step::Failed(msg, status)) => {
                     resets = 0;
-                    // 401/403 mean the provider rejected the key; 5xx means
-                    // it is out of service — in either case, finish this turn
-                    // on the machine instead of retrying a model that cannot
-                    // answer.
+                    // On HTTP 429 rate-limit, try another model on the current
+                    // source first before switching information sources.
+                    let rate_limited = status == Some(429) && self.local.is_none();
+                    if rate_limited {
+                        let busy_set: HashSet<String> = tried_models.iter().cloned().collect();
+                        if let Some(n) = self
+                            .model_selector
+                            .select_fallback(&self.model, &self.models, &busy_set)
+                            .or_else(|| {
+                                self.models
+                                    .iter()
+                                    .map(|(v, _)| v.clone())
+                                    .find(|v| !tried_models.contains(v))
+                            })
+                            .filter(|_| tried_models.len() < 4)
+                        {
+                            self.agui.emit(
+                                "decision:evaluated",
+                                "builtin",
+                                json!({
+                                    "query": "model_failover_choice",
+                                    "selected": n,
+                                    "reason": msg,
+                                    "backend": self.decisions.backend_name()
+                                }),
+                            );
+                            let short = |s: &str| {
+                                s.split('/')
+                                    .next_back()
+                                    .unwrap_or(s)
+                                    .trim_end_matches(":free")
+                                    .to_string()
+                            };
+                            self.status(&format!("Switching model to {}…", short(&n)));
+                            self.notice(
+                                &format!(
+                                    "{} is busy ({msg}). Trying {}…",
+                                    short(&self.model),
+                                    short(&n)
+                                ),
+                                false,
+                            );
+                            self.model = n.clone();
+                            tried_models.push(n);
+                            self.send(json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"builtin",
+                                "update":{"sessionUpdate":"config_option_update","configOptions":self.config_options()}}}));
+                            continue;
+                        }
+                    }
+                    // Try fast alternative remote information sources (Kono Router,
+                    // NoKey Router, Kilo Gateway) before falling back to slow local ONNX.
+                    if self.multi_source_enabled()
+                        && !self.local_sticky
+                        && matches!(status, None | Some(401 | 403 | 404 | 408 | 429 | 500..=599))
+                        && let Some(src) = self
+                            .candidate_remote_sources()
+                            .into_iter()
+                            .find(|s| !tried_endpoints.contains(&s.endpoint))
+                    {
+                        tried_endpoints.insert(src.endpoint.clone());
+                        self.status(&format!(
+                            "Switching information source to {} ({})…",
+                            src.label, src.model
+                        ));
+                        self.notice(
+                            &format!(
+                                "Source unavailable ({msg}). Switching to {} ({})…",
+                                src.label, src.model
+                            ),
+                            false,
+                        );
+                        self.local = None;
+                        self.model = src.model.clone();
+                        self.models = src.models.clone();
+                        tried_models = vec![self.model.clone()];
+                        self.remote_override = Some(src);
+                        self.send(json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"builtin",
+                            "update":{"sessionUpdate":"config_option_update","configOptions":self.config_options()}}}));
+                        continue;
+                    }
+                    // 401/403 mean the provider rejected the key; 5xx or unreachable
+                    // means remote sources are out of service — finish this turn
+                    // on the machine with local ONNX inference.
                     if !local_fallback_tried
-                        && !self.options.uses_local()
-                        && matches!(status, Some(401 | 403 | 500..=599))
+                        && (!self.options.uses_local() || self.remote_override.is_some())
+                        && matches!(status, None | Some(401 | 403 | 500..=599))
                     {
                         local_fallback_tried = true;
+                        self.remote_override = None;
                         let cancel = self.cancel.clone();
                         if self.switch_to_local(&msg, move || cancel.load(Ordering::SeqCst)) {
                             continue;
@@ -1040,6 +1252,7 @@ impl Worker {
                                     .trim_end_matches(":free")
                                     .to_string()
                             };
+                            self.status(&format!("Trying model {}…", short(&n)));
                             self.notice(
                                 &format!(
                                     "{} is busy ({msg}). Trying {}…",
@@ -1159,15 +1372,18 @@ impl Worker {
     /// One model call. Ok(true) = tools ran, call the model again. `finalize`
     /// withholds tools and demands an answer; it never returns Ok(true).
     fn step(&mut self, finalize: bool) -> Result<bool, Step> {
-        if self.options.uses_local() && self.local.is_none() {
+        if self.options.uses_local() && self.local.is_none() && self.remote_override.is_none() {
             let endpoint = crate::provider::local_endpoint(&self.options);
             let cancel = self.cancel.clone();
             let out = self.out.clone();
+            self.status("Starting local ONNX server on this machine…");
             let waiting = move |elapsed: Duration| {
                 let title = format!(
                     "Waiting for the local ONNX server ({}s); the first run downloads the model.",
                     elapsed.as_secs()
                 );
+                out(json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"builtin",
+                    "update":{"sessionUpdate":"status","text":title}}}));
                 out(json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"builtin",
                     "update":{"sessionUpdate":"notice","severity":"info","title":title}}}));
             };
@@ -1186,6 +1402,7 @@ impl Worker {
             self.model = model;
         }
         if self.model.is_empty() {
+            self.status("Discovering available models from provider…");
             self.models = custom_models(&self.http, &self.options)?;
             self.model = self.models[0].0.clone();
         }
@@ -1222,7 +1439,7 @@ impl Worker {
             body["stream_options"] = stream_options;
         }
         // Some providers reject an empty tools array, so omit the key instead.
-        // Local ONNX inference does not execute tools, so omit the schema there too.
+        // Local ONNX inference uses <tool_call> tags rather than schema arrays.
         if !finalize && !schemas.is_empty() && self.local.is_none() {
             body["tools"] = json!(schemas);
         }
@@ -1230,21 +1447,48 @@ impl Worker {
         if body.len() > 480 * 1024 {
             return Err(Step::Failed("Context exceeds the safe request budget. Split this task or shorten instructions/attached skills; no instructions or current objective were silently removed.".into(), Some(413)));
         }
-        let (endpoint, key) = match &self.local {
+        let (endpoint, key, source_label) = match (&self.local, &self.remote_override) {
             // The local ONNX server needs no credentials and takes the model
             // id it advertised.
-            Some(local) => (
+            (Some(local), _) => (
                 local.endpoint.clone(),
                 Ok::<_, String>(None),
+                "Local ONNX",
             ),
-            None => {
+            (None, Some(remote)) => {
+                let key = if remote.use_router_key {
+                    crate::credentials::router_key()
+                        .map_err(|e| e.to_string())?
+                        .map(Some)
+                        .ok_or_else(|| "Router API key is not configured".to_string())
+                } else {
+                    Ok(None)
+                };
+                (remote.endpoint.clone(), key, remote.label)
+            }
+            (None, None) => {
                 let endpoint = crate::provider::endpoint(&self.options);
                 let key = crate::provider::authorization(&self.options, &endpoint);
-                (endpoint, key)
+                let label = if self.options.uses_kono() || endpoint == crate::provider::KONO_ENDPOINT {
+                    "Kono Router"
+                } else if self.options.uses_router() {
+                    "NoKey Router"
+                } else if self.options.uses_local() {
+                    "Local ONNX"
+                } else if endpoint == gateway() {
+                    "Kilo Gateway"
+                } else {
+                    "Provider"
+                };
+                (endpoint, key, label)
             }
         };
         let key = key
             .map_err(|e| Step::Failed(e, Some(401)))?;
+        self.status(&format!(
+            "Querying {source_label} ({}) — waiting for first token…",
+            self.model
+        ));
         let clean = |s: &str| crate::provider::sanitize(s, key.as_ref());
         let stall = self.options.stall_timeout_secs;
         let mut request = self
@@ -1308,6 +1552,15 @@ impl Worker {
         let mut response = crate::model_response::ModelResponse::default();
         response.allow_truncation(self.local.is_some());
         let mut reader = BufReader::new(resp.into_body().into_reader());
+        let save_partial_on_cancel = |history: &mut Vec<Value>, resp: &crate::model_response::ModelResponse| {
+            let partial = resp.partial_content().trim_end();
+            if !partial.trim().is_empty() {
+                history.push(json!({
+                    "role": "assistant",
+                    "content": format!("{partial}\n[generation stopped before completion]")
+                }));
+            }
+        };
         if is_json {
             let mut text = String::new();
             std::io::Read::take(&mut reader, 2 * 1024 * 1024 + 1)
@@ -1325,6 +1578,7 @@ impl Worker {
                 ));
             }
             if self.cancel.load(Ordering::SeqCst) {
+                save_partial_on_cancel(&mut self.history, &response);
                 return Err(Step::Cancelled);
             }
             let value: Value = serde_json::from_str(&text)
@@ -1334,18 +1588,21 @@ impl Worker {
             let mut bytes = 0;
             loop {
                 if self.cancel.load(Ordering::SeqCst) {
+                    save_partial_on_cancel(&mut self.history, &response);
                     return Err(Step::Cancelled);
                 }
                 let mut line = String::new();
                 let read = std::io::Read::take(&mut reader, 512 * 1024 + 1)
                     .read_line(&mut line)
                     .map_err(|_| {
+                        save_partial_on_cancel(&mut self.history, &response);
                         Step::Failed(
                             "Connection lost while reading a model response".into(),
                             None,
                         )
                     })?;
                 if self.cancel.load(Ordering::SeqCst) {
+                    save_partial_on_cancel(&mut self.history, &response);
                     return Err(Step::Cancelled);
                 }
                 if read == 0 {
@@ -2210,6 +2467,7 @@ impl Worker {
                             self.saved_remote =
                                 Some((std::mem::take(&mut self.model), std::mem::take(&mut self.models)));
                         }
+                        self.remote_override = None;
                         self.local_sticky = true;
                         self.models = crate::provider::local_models();
                         if !self.models.iter().any(|(id, _)| *id == model) {
@@ -2515,11 +2773,43 @@ mod configured_tests {
         assert!(joined.contains("Normalize audio with loudnorm."), "{joined}");
         assert!(!joined.contains("track01.mp3"), "{joined}");
 
+        // Asking only to list files must not dump partial 6-file excerpts that
+        // could be mistaken for the complete workspace file list.
+        let list_only = w.local_workspace_file_snippets("list the files");
+        assert!(list_only.is_empty(), "{list_only:?}");
+
+        let sources = w.candidate_remote_sources();
+        assert_eq!(sources[0].label, "Kono Router");
+        assert_eq!(sources[0].endpoint, crate::provider::KONO_ENDPOINT);
+        assert_eq!(sources[0].model, crate::provider::KONO_MODEL);
+
         let sys = w.system_prompt();
         assert!(sys.contains("<tool_call>"), "{sys}");
         assert!(
             !sys.contains("cannot execute tools, run shell commands, or read files"),
             "{sys}"
+        );
+
+        // Restoring history in session/new preserves prior user and assistant turns.
+        w.handle(json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "session/new",
+            "params": {
+                "cwd": dir.to_string_lossy(),
+                "history": [
+                    {"role": "user", "content": "list the files"},
+                    {"role": "assistant", "content": "1. track01.lyrics\n[generation stopped before completion]"}
+                ]
+            }
+        }));
+        assert_eq!(w.history.len(), 2);
+        assert_eq!(w.history[0]["content"], "list the files");
+        assert!(
+            w.history[1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("track01.lyrics")
         );
 
         let _ = std::fs::remove_dir_all(&dir);

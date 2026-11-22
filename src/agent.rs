@@ -284,6 +284,8 @@ pub struct Agent {
     pub embedded_context: bool,
     pub auth_hint: Option<String>,
     pub turn_started: Option<Instant>,
+    /// Live activity description shown while a turn is running.
+    pub status_text: Option<String>,
     // UI state for the input box and transcript.
     pub input: String,
     pub cursor: usize,
@@ -339,6 +341,7 @@ impl Agent {
             embedded_context: false,
             auth_hint: None,
             turn_started: None,
+            status_text: None,
             input: String::new(),
             cursor: 0,
             scroll: 0,
@@ -372,9 +375,11 @@ impl Agent {
         options.validate().map_err(|e| e.to_string())?;
         let available = detect_agents();
         let spec = match options.backend.as_str() {
-            // Local ONNX inference is served by the built-in worker too, so a
-            // missing external agent never blocks it.
-            "auto" if options.uses_router() || options.uses_local() => Some(builtin_spec()),
+            // Local ONNX inference and Kono are served by the built-in worker too,
+            // so a missing external agent never blocks them.
+            "auto" if options.uses_router() || options.uses_kono() || options.uses_local() => {
+                Some(builtin_spec())
+            }
             "auto" => available.first().cloned(),
             "builtin" => Some(builtin_spec()),
             "custom" => {
@@ -572,10 +577,48 @@ impl Agent {
         self.local_events.clear();
         self.session_id = None;
         self.sent_instructions = None;
+        self.status_text = None;
         self.pending.clear();
         if self.state != State::NoAgent {
             self.state = State::Idle;
         }
+    }
+
+    /// Reconstruct prior conversation messages (`Entry::User` and `Entry::Agent`)
+    /// from the visible transcript so that stopping a turn or restarting a
+    /// session never drops earlier context.
+    pub fn session_history(&self, exclude_trailing_user: bool) -> Vec<Value> {
+        let mut end = self.entries.len();
+        if exclude_trailing_user
+            && let Some(pos) = self.entries.iter().rposition(|e| matches!(e, Entry::User(_)))
+            && self.entries[pos + 1..]
+                .iter()
+                .all(|e| !matches!(e, Entry::Agent(_)))
+        {
+            end = pos;
+        }
+        let slice = &self.entries[..end];
+        let mut out: Vec<Value> = Vec::new();
+        for (idx, entry) in slice.iter().enumerate() {
+            match entry {
+                Entry::User(text) if !text.trim().is_empty() => {
+                    out.push(json!({ "role": "user", "content": text }));
+                }
+                Entry::Agent(text) if !text.trim().is_empty() => {
+                    let stopped_after = slice[idx + 1..].iter().take_while(|e| !matches!(e, Entry::User(_) | Entry::Agent(_))).any(|e| {
+                        matches!(e, Entry::Notice { text, .. } if text.starts_with("Stopped") || text.starts_with("Overwatch"))
+                    });
+                    let content = if stopped_after {
+                        format!("{}\n[generation stopped before completion]", text.trim_end())
+                    } else {
+                        text.clone()
+                    };
+                    out.push(json!({ "role": "assistant", "content": content }));
+                }
+                _ => {}
+            }
+        }
+        out
     }
 
     /// Switch to another detected agent (restarts the session).
@@ -603,6 +646,7 @@ impl Agent {
         self.scroll = 0;
         self.reported.clear();
         self.sent_instructions = None;
+        self.status_text = None;
         if self.running() && self.session_id.is_some() {
             self.session_id = None;
             self.state = State::Starting;
@@ -619,6 +663,7 @@ impl Agent {
         if text.is_empty() {
             return;
         }
+        let prior_history = self.session_history(false);
         self.entries.push(Entry::User(text.to_string()));
         self.scroll = 0;
         let mut blocks = Vec::new();
@@ -639,10 +684,26 @@ impl Agent {
                 }));
                 self.sent_instructions = Some(instructions);
             }
+            if self.session_id.is_none() && !prior_history.is_empty() {
+                let mut transcript = String::new();
+                for m in &prior_history {
+                    let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
+                    let content = m.get("content").and_then(Value::as_str).unwrap_or("");
+                    transcript.push_str(&format!("{role}: {content}\n\n"));
+                }
+                blocks.push(json!({
+                    "type": "text",
+                    "text": format!(
+                        "<conversation_history>\nPrior conversation in this session before the turn was interrupted:\n\n{}\n</conversation_history>",
+                        transcript.trim()
+                    )
+                }));
+            }
         }
         blocks.push(json!({ "type": "text", "text": text }));
         blocks.extend(context);
         self.turn_started = Some(Instant::now());
+        self.status_text = Some("Preparing request & attaching workspace context…".into());
         if self.session_id.is_some() && self.state == State::Ready {
             self.send_prompt(blocks);
         } else {
@@ -775,10 +836,11 @@ impl Agent {
 
     fn new_session(&mut self) {
         let cwd = self.cwd.to_string_lossy().into_owned();
+        let history = self.session_history(self.queued.is_some());
         self.sent_instructions = None;
         self.request(
             "session/new",
-            json!({ "cwd": cwd, "mcpServers": self.mcp_servers }),
+            json!({ "cwd": cwd, "mcpServers": self.mcp_servers, "history": history }),
             Pending::NewSession,
         );
     }
@@ -1095,6 +1157,7 @@ impl Agent {
                     }
                 }
                 self.turn_started = None;
+                self.status_text = None;
                 events.push(AgentEvent::TurnEnded);
             }
             Pending::SetModel => self.read_models(&r),
@@ -1119,10 +1182,12 @@ impl Agent {
                 }
                 self.state = State::Failed(text);
                 self.queued = None;
+                self.status_text = None;
             }
             Pending::Prompt => {
                 self.state = State::Ready;
                 self.turn_started = None;
+                self.status_text = None;
                 self.entries.push(Entry::Notice {
                     text: msg,
                     error: true,
@@ -1223,12 +1288,30 @@ impl Agent {
             }
         };
         match kind {
+            "status" => {
+                self.status_text = u
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .map(String::from);
+            }
             "agent_message_chunk" => {
                 let t = text_of(u);
-                match self.entries.last_mut() {
-                    Some(Entry::Agent(s)) => s.push_str(&t),
-                    _ => self.entries.push(Entry::Agent(t)),
-                }
+                let len = match self.entries.last_mut() {
+                    Some(Entry::Agent(s)) => {
+                        s.push_str(&t);
+                        s.len()
+                    }
+                    _ => {
+                        let l = t.len();
+                        self.entries.push(Entry::Agent(t));
+                        l
+                    }
+                };
+                let label = self
+                    .model_label()
+                    .unwrap_or_else(|| self.name());
+                self.status_text = Some(format!("Streaming reply from {label} ({len} chars)…"));
             }
             "agent_thought_chunk" => {
                 let t = text_of(u);
@@ -1236,6 +1319,10 @@ impl Agent {
                     Some(Entry::Thought(s)) => s.push_str(&t),
                     _ => self.entries.push(Entry::Thought(t)),
                 }
+                let label = self
+                    .model_label()
+                    .unwrap_or_else(|| self.name());
+                self.status_text = Some(format!("Reasoning with {label}…"));
             }
             "tool_call" | "tool_call_update" => {
                 let id = u
@@ -1275,6 +1362,9 @@ impl Agent {
                         "failed" => ToolStatus::Failed,
                         _ => ToolStatus::Pending,
                     };
+                }
+                if t.status == ToolStatus::Running && !t.title.is_empty() {
+                    self.status_text = Some(format!("Running tool {}…", t.title));
                 }
                 if let Some(locs) = u.get("locations").and_then(Value::as_array)
                     && !locs.is_empty()

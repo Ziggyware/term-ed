@@ -1583,7 +1583,7 @@ impl App {
                 self.agent.cancel();
                 self.cancel_automation();
                 self.agent.stop();
-                self.agent.entries.push(agent::Entry::Notice{text:"Stopped this task tree. Partial edits were kept for review; no side effects were automatically retried. Provider session reset: restate essential context before continuing.".into(),error:false});
+                self.agent.entries.push(agent::Entry::Notice{text:"Stopped this task tree. Partial edits were kept for review; no side effects were automatically retried. Conversation context is preserved—type 'continue' or ask a follow-up to resume.".into(),error:false});
             }
             AgentModel => {
                 if self.agent.models.is_empty() {

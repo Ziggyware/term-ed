@@ -454,6 +454,14 @@ impl App {
                             Field::Model => format!("{} (default)", crate::provider::ROUTER_MODEL),
                             _ => "(default / empty)".into(),
                         }
+                    } else if !sub && v.is_empty() && config.uses_kono() {
+                        match field {
+                            Field::Endpoint => {
+                                format!("{} (default)", crate::provider::KONO_ENDPOINT)
+                            }
+                            Field::Model => format!("{} (default)", crate::provider::KONO_MODEL),
+                            _ => "(default / empty)".into(),
+                        }
                     } else if !sub && v.is_empty() && config.uses_local() {
                         match field {
                             Field::LocalEndpoint => format!(
@@ -501,6 +509,18 @@ impl App {
                         format!(
                             "Built-in · on-device model via ONNX Runtime · {} · no key, no network; also used automatically when the provider returns 503",
                             crate::provider::local_endpoint(config)
+                        ),
+                    );
+                    row(
+                        if config.uses_kono() {
+                            "Kono Router: active".into()
+                        } else {
+                            "Use Kono Router".into()
+                        },
+                        format!(
+                            "Built-in · {} · {} · fast free cloud router with no API key required",
+                            crate::provider::KONO_MODEL,
+                            crate::provider::KONO_ENDPOINT
                         ),
                     );
                 }
@@ -895,6 +915,13 @@ impl App {
                             prefs.agent.use_local();
                             self.save_preferences(prefs)?;
                             self.toast("Local ONNX inference selected; the server starts on the first prompt",ToastKind::Success);
+                            self.open_palette(mode);
+                        }
+                        5 => {
+                            let mut prefs=self.preferences.clone();
+                            prefs.agent.use_kono();
+                            self.save_preferences(prefs)?;
+                            self.toast("Kono Router selected (free:tools, no API key required)",ToastKind::Success);
                             self.open_palette(mode);
                         }
                         _=>{}

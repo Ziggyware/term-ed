@@ -130,6 +130,11 @@ impl ModelResponse {
         self.truncated
     }
 
+    /// Partial text accumulated so far while streaming.
+    pub fn partial_content(&self) -> &str {
+        &self.content
+    }
+
     pub fn finish(self) -> Result<(String, Vec<ToolCall>), ResponseError> {
         if !self.finished {
             return Err(ResponseError::bad_gateway(
