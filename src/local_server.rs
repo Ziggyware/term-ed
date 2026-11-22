@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 /// Must match `__version__` in `local_inference/onnx_server.py`.
-pub const SERVER_VERSION: &str = "1.2.0";
+pub const SERVER_VERSION: &str = "1.3.0";
 const SERVER_SOURCE: &str = include_str!("../local_inference/onnx_server.py");
 /// Model downloaded on first use when none is configured.
 pub const DEFAULT_MODEL: &str = "onnx-community/SmolLM2-135M-Instruct";

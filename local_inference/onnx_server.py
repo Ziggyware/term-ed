@@ -39,7 +39,7 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 DEFAULT_MODEL = "onnx-community/SmolLM2-135M-Instruct"
 MAX_BODY_BYTES = 2 * 1024 * 1024
 MAX_OUTPUT_TOKENS = 8192
@@ -356,6 +356,36 @@ def _content_text(content) -> str:
     return ""
 
 
+def _message_text(m: dict) -> str:
+    text = _content_text(m.get("content", ""))
+    calls = m.get("tool_calls")
+    if isinstance(calls, list):
+        rendered_calls = []
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            fn = call.get("function") or {}
+            name = fn.get("name")
+            raw_args = fn.get("arguments", "{}")
+            if isinstance(name, str) and name:
+                try:
+                    args = (
+                        json.loads(raw_args)
+                        if isinstance(raw_args, str)
+                        else raw_args
+                    )
+                except ValueError:
+                    args = {}
+                payload = json.dumps({"name": name, "arguments": args})
+                rendered_calls.append(f"<tool_call>{payload}</tool_call>")
+        if rendered_calls:
+            joined = "\n".join(rendered_calls)
+            text = f"{text}\n{joined}".strip() if text else joined
+    if m.get("role") == "tool":
+        return f"<tool_response>\n{text}\n</tool_response>"
+    return text
+
+
 # Stop strings that mark the end of an assistant turn or the start of a
 # hallucinated user/assistant continuation.
 DEFAULT_STOP_STRINGS = (
@@ -381,7 +411,9 @@ def render_chat(messages: list[dict], template: str | None) -> str:
         parts = []
         for i, m in enumerate(messages):
             role = m.get("role", "user")
-            content = _content_text(m.get("content", ""))
+            if role == "tool":
+                role = "user"
+            content = _message_text(m)
             if i == 0 and role == "system" and has_think and "/no_think" not in content:
                 content = f"/no_think\n{content}"
             parts.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
@@ -395,7 +427,7 @@ def render_chat(messages: list[dict], template: str | None) -> str:
         for m in messages:
             parts.append(
                 f"<|start_header_id|>{m.get('role', 'user')}<|end_header_id|>\n\n"
-                f"{_content_text(m.get('content', ''))}<|eot_id|>"
+                f"{_message_text(m)}<|eot_id|>"
             )
         parts.append("<|start_header_id|>assistant<|end_header_id|>\n\n")
         return "".join(parts)
@@ -403,14 +435,14 @@ def render_chat(messages: list[dict], template: str | None) -> str:
         parts = []
         for m in messages:
             role = m.get("role", "user")
-            parts.append(f"<|{role}|>\n{_content_text(m.get('content', ''))}<|end|>\n")
+            parts.append(f"<|{role}|>\n{_message_text(m)}<|end|>\n")
         parts.append("<|assistant|>\n")
         return "".join(parts)
     if template and "[INST]" in template:
         parts = []
         for m in messages:
             role = m.get("role", "user")
-            text = _content_text(m.get("content", ""))
+            text = _message_text(m)
             if role == "assistant":
                 parts.append(f"{text} [/INST]")
             elif role == "system":
@@ -419,7 +451,7 @@ def render_chat(messages: list[dict], template: str | None) -> str:
                 parts.append(f"[INST] {text} [/INST]")
         return "".join(parts)
     lines = [
-        f"{m.get('role', 'user')}: {_content_text(m.get('content', ''))}"
+        f"{m.get('role', 'user')}: {_message_text(m)}"
         for m in messages
     ]
     lines.append("assistant:")
@@ -1039,6 +1071,14 @@ class Handler(BaseHTTPRequestHandler):
                         break
                     continue
                 new_text = new_text.split("</think>", 1)[1].lstrip("\r\n")
+            if "</tool_call>" in new_text:
+                cut = new_text.find("</tool_call>") + len("</tool_call>")
+                text = new_text[:cut]
+                if on_token is not None and len(text) > emitted:
+                    on_token(text[emitted:])
+                    emitted = len(text)
+                finished = "stop"
+                break
             hit_indices = [
                 new_text.find(s) for s in active_stops if s in new_text
             ]
