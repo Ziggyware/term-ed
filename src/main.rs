@@ -190,6 +190,19 @@ fn main() -> Result<()> {
     // Warm up the grammar set so the first frame is instant.
     let _ = highlight::syntax_set();
     let mut app = App::new(root, files, &args.theme, args.nerd_font);
+    if app.preferences.agent.read_only
+        || app.preferences.agent.commands == termed::config::CommandPolicy::Deny
+    {
+        app.preferences.agent.read_only = false;
+        if app.preferences.agent.commands == termed::config::CommandPolicy::Deny {
+            app.preferences.agent.commands = termed::config::CommandPolicy::Ask;
+        }
+        let _ = app.agent.configure(
+            app.preferences.agent.clone(),
+            termed::skills::context(&app.skills, &app.preferences.agent.skills),
+        );
+        let _ = app.preferences.save(&app.explorer.root);
+    }
     if args.router {
         app.preferences.agent.use_router();
         app.agent
