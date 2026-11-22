@@ -14,7 +14,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
@@ -40,6 +40,11 @@ pub const DEFAULT_MODEL: &str = "kilo-auto/free";
 /// Output cap for on-device ONNX inference: small CPU models are slow, and a
 /// runaway reply should not hold the turn open for the whole task budget.
 const LOCAL_MAX_OUTPUT_TOKENS: usize = 1024;
+
+/// Process-wide sequence for governed write orders. Sub-agents run
+/// concurrently on separate workers, so the counter is global: the number
+/// an order is granted is the order writes are issued in.
+static WRITE_ORDER_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Start the agent thread. `out` receives the JSON-RPC messages an external
 /// agent would print; the returned sender takes the messages we'd write to it.
@@ -2143,9 +2148,81 @@ impl Worker {
         })
     }
 
-    fn edit_file(&self, id: &str, path: &str, old: &str, new: &str) -> Result<String, String> {
+    /// Issue a governed write order for `rel` on behalf of this worker.
+    ///
+    /// Every agent file write — the main agent's or a sub-agent's — goes
+    /// through here before it touches disk. The order takes the next global
+    /// sequence number (sub-agents run concurrently on separate workers, so
+    /// the sequence is process-wide: the number an order is granted is the
+    /// order writes are issued in). The permission policy risk-scores the
+    /// target: ordinary files auto-allow, build/CI configuration is put to
+    /// the user, and secrets or VCS internals are blocked outright. The
+    /// order and its verdict are emitted on the AG-UI stream, so every
+    /// write is attributable and auditable.
+    fn govern_write(&mut self, tool_id: &str, rel: &str, kind: &str) -> Result<u64, String> {
+        if self.options.read_only {
+            return Err("Agent is read-only".into());
+        }
+        let seq = WRITE_ORDER_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+        let verdict = self
+            .policy
+            .evaluate_write(rel, kind, &self.cwd.to_string_lossy());
+        let verdict_json = match &verdict {
+            PermissionVerdict::AutoAllow { score, rationale } => {
+                json!({"type": "AutoAllow", "score": score, "rationale": rationale})
+            }
+            PermissionVerdict::PromptUser { score, rationale } => {
+                json!({"type": "PromptUser", "score": score, "rationale": rationale})
+            }
+            PermissionVerdict::Block { score, reason } => {
+                json!({"type": "Block", "score": score, "reason": reason})
+            }
+        };
+        self.agui.emit(
+            "write:ordered",
+            "builtin",
+            json!({
+                "seq": seq,
+                "path": rel,
+                "kind": kind,
+                "verdict": verdict_json.clone(),
+            }),
+        );
+        self.agui.emit(
+            "decision:evaluated",
+            "builtin",
+            json!({
+                "metric": "file_write_risk",
+                "path": rel,
+                "kind": kind,
+                "backend": self.decisions.backend_name(),
+                "verdict": verdict_json,
+            }),
+        );
+        match verdict {
+            PermissionVerdict::AutoAllow { .. } => Ok(seq),
+            PermissionVerdict::Block { score, reason } => Err(format!(
+                "Write order #{seq} blocked by policy (risk {score:.2}): {reason}"
+            )),
+            PermissionVerdict::PromptUser { score, rationale } => {
+                let desc = format!(
+                    "write order #{seq}: {kind} {rel} (risk {score:.2}: {rationale})"
+                );
+                if self.permission(tool_id, &desc) {
+                    Ok(seq)
+                } else {
+                    Err(format!(
+                        "The user rejected write order #{seq} ({kind} {rel})."
+                    ))
+                }
+            }
+        }
+    }
+
+    fn edit_file(&mut self, id: &str, path: &str, old: &str, new: &str) -> Result<String, String> {
         let p = self.resolve(path)?;
         let rel = self.rel(&p);
+        self.govern_write(id, &rel, "edit")?;
         self.tool_start(id, &format!("Edit {rel}"), "edit", Some(&p));
         let (encoding, text) = read_text(&p)?;
         // Tolerate CRLF files when the model sends LF snippets.
@@ -2219,9 +2296,10 @@ impl Worker {
         Ok(format!("Edited {rel}."))
     }
 
-    fn write_file(&self, id: &str, path: &str, content: &str) -> Result<String, String> {
+    fn write_file(&mut self, id: &str, path: &str, content: &str) -> Result<String, String> {
         let p = self.resolve(path)?;
         let rel = self.rel(&p);
+        self.govern_write(id, &rel, "write")?;
         crate::document::ensure_text_target(&p).map_err(|e| e.to_string())?;
         let existing = read_text(&p).ok();
         let old = existing.as_ref().map(|(_, text)| text.clone());
@@ -2999,6 +3077,16 @@ mod tests {
 #[cfg(test)]
 mod configured_tests {
     use super::*;
+
+    fn worker(dir: &Path) -> Worker {
+        let (_tx, rx) = channel();
+        Worker::new(
+            dir.to_path_buf(),
+            Arc::new(|_| {}),
+            rx,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
 
     #[test]
     fn read_only_schemas_and_dispatch_both_restrict_tools() {

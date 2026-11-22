@@ -527,7 +527,11 @@ impl Default for SubAgentConfig {
                 backend: "builtin".into(),
                 // Specialists inherit the parent's provider unless explicitly set.
                 provider: "auto".into(),
-                read_only: true,
+                // Sub-agents have full write access by default; a profile
+                // opts into read_only explicitly when its role demands it.
+                // Writes are governed write orders either way (see
+                // builtin_agent::Worker::govern_write).
+                read_only: false,
                 max_steps: 2000,
                 sub_agents: false,
                 ..Default::default()
@@ -587,24 +591,28 @@ pub struct Preferences {
 
 impl Default for Preferences {
     fn default() -> Self {
+        let worker = SubAgentConfig { id: "worker".into(), name: "Worker".into(),
+            description: "General-purpose implementer with full write access".into(),
+            agent: AgentConfig { instructions: "Implement the delegated task end to end. Edit and create files as needed; your writes are governed write orders under the same policy as the main agent's. Verify your changes (re-read edited files, search for callers, run the checks the brief names) and report exactly which files you changed and what you verified.".into(), ..SubAgentConfig::default().agent },
+            ..Default::default() };
         let reviewer = SubAgentConfig { id: "reviewer".into(), name: "Reviewer".into(),
-            description: "Read-only code review and bug analysis".into(),
+            description: "Code review and bug analysis".into(),
             agent: AgentConfig { instructions: "Review the requested code. Identify concrete bugs, security risks and missing tests; cite files and lines. Do not edit files.".into(), ..SubAgentConfig::default().agent },
             ..Default::default() };
         let tester = SubAgentConfig { id: "tester".into(), name: "Test planner".into(),
-            description: "Read-only test design and coverage analysis".into(),
+            description: "Test design and coverage analysis".into(),
             agent: AgentConfig { instructions: "Inspect the code and propose focused regression tests, edge cases and verification commands. Do not edit or execute commands.".into(), ..SubAgentConfig::default().agent },
             ..Default::default() };
         let coordinator=SubAgentConfig {id:"coordinator".into(),name:"Coordinator".into(),
-            description:"Read-only coordinator that can delegate focused reviews and test planning to grandchildren".into(),
-            agent:AgentConfig{backend:"builtin".into(),provider:"auto".into(),read_only:true,commands:CommandPolicy::Deny,plugins:false,max_steps:18,sub_agents:true,
+            description:"Coordinator that can delegate focused reviews and test planning to grandchildren".into(),
+            agent:AgentConfig{backend:"builtin".into(),provider:"auto".into(),read_only:false,commands:CommandPolicy::Deny,plugins:false,max_steps:18,sub_agents:true,
                 instructions:"Coordinate a focused investigation. When useful, delegate distinct evidence-based tasks to reviewer and tester, passing relevant findings, scope and acceptance criteria. Collect every result before finishing, verify claims, and report disagreements, blockers and checks not run. Do not edit files or execute commands.".into(),..Default::default()},..Default::default()};
         Self {
             version: 2,
             editor: EditorConfig::default(),
             search: SearchConfig::default(),
             agent: AgentConfig::default(),
-            sub_agents: vec![reviewer, tester, coordinator],
+            sub_agents: vec![worker, reviewer, tester, coordinator],
             disabled_skills: Vec::new(),
         }
     }

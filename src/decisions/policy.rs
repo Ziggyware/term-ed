@@ -86,6 +86,53 @@ impl PermissionPolicy {
             }
         }
     }
+
+    /// Evaluates a file write (a "write order" from the main agent or a
+    /// sub-agent) and returns the tiered permission verdict. Same thresholds
+    /// as commands: ordinary source files auto-allow, build/CI configuration
+    /// prompts, and sensitive paths (secrets, git internals) block.
+    pub fn evaluate_write(&self, path: &str, kind: &str, cwd: &str) -> PermissionVerdict {
+        let ctx = DecisionContext {
+            task_id: "file_write_check".into(),
+            working_dir: cwd.into(),
+            session_history_summary: String::new(),
+            metadata: json!({ "path": path, "kind": kind }),
+        };
+
+        let result = self
+            .engine
+            .ask_score("file_write_risk", path, &ctx)
+            .unwrap_or(ScoreResult {
+                score: 0.50,
+                uncertainty: 0.50,
+                flags: vec!["policy_fallback".into()],
+                rationale: Some("Fallback policy applied".into()),
+            });
+
+        let rationale = result
+            .rationale
+            .unwrap_or_else(|| format!("Risk score: {:.2}", result.score));
+
+        if result.score < self.auto_allow_threshold {
+            PermissionVerdict::AutoAllow {
+                score: result.score,
+                rationale,
+            }
+        } else if result.score >= self.block_threshold {
+            PermissionVerdict::Block {
+                score: result.score,
+                reason: format!(
+                    "Write blocked: {} (risk: {:.2})",
+                    rationale, result.score
+                ),
+            }
+        } else {
+            PermissionVerdict::PromptUser {
+                score: result.score,
+                rationale,
+            }
+        }
+    }
 }
 
 /// Intelligent model selection and failover using Jev choice.

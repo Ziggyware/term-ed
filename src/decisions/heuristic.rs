@@ -188,6 +188,10 @@ impl DecisionEngine for LocalHeuristicBackend {
         target_payload: &str,
         _ctx: &DecisionContext,
     ) -> Result<ScoreResult> {
+        // File writes are scored on the target path, not as shell commands.
+        if metric == "file_write_risk" {
+            return Ok(write_risk(target_payload.trim()));
+        }
         let cmd = target_payload.trim();
 
         // Check high risk first
@@ -237,6 +241,72 @@ impl DecisionEngine for LocalHeuristicBackend {
     }
 }
 
+/// Risk score for an agent write order targeting `path` (project-relative).
+/// Secrets and VCS internals block; build/CI configuration prompts; ordinary
+/// source files auto-allow.
+fn write_risk(path: &str) -> ScoreResult {
+    let p = path.replace('\\', "/").to_lowercase();
+    let name = p.rsplit('/').next().unwrap_or("");
+    let sensitive_name = name.starts_with(".env")
+        || matches!(
+            name,
+            "id_rsa"
+                | "id_ed25519"
+                | "id_ecdsa"
+                | "id_dsa"
+                | "credentials"
+                | "credentials.json"
+                | ".npmrc"
+                | ".pypirc"
+                | ".netrc"
+        )
+        || [".pem", ".key", ".p12", ".pfx", ".keystore"]
+            .iter()
+            .any(|e| name.ends_with(e));
+    let sensitive_dir = p
+        .split('/')
+        .any(|seg| matches!(seg, ".git" | ".ssh" | ".aws" | ".gnupg"));
+    if sensitive_name || sensitive_dir {
+        return ScoreResult {
+            score: 0.92,
+            uncertainty: 0.05,
+            flags: vec!["sensitive_path".into()],
+            rationale: Some(format!(
+                "Write target '{path}' is a secret, credential, or VCS-internal path."
+            )),
+        };
+    }
+    let build_config = matches!(
+        name,
+        "cargo.toml"
+            | "cargo.lock"
+            | "package.json"
+            | "package-lock.json"
+            | "pnpm-lock.yaml"
+            | "yarn.lock"
+            | "makefile"
+            | "dockerfile"
+            | "docker-compose.yml"
+            | "docker-compose.yaml"
+    ) || p.contains(".github/workflows/");
+    if build_config {
+        return ScoreResult {
+            score: 0.55,
+            uncertainty: 0.15,
+            flags: vec!["build_config".into()],
+            rationale: Some(format!(
+                "Write target '{path}' is build or CI configuration."
+            )),
+        };
+    }
+    ScoreResult {
+        score: 0.05,
+        uncertainty: 0.05,
+        flags: vec!["source_write".into()],
+        rationale: Some("Ordinary project file write.".into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,6 +336,32 @@ mod tests {
         // Medium commands: PromptUser
         let v5 = policy.evaluate_command("mv a.txt b.txt", ".");
         assert!(matches!(v5, PermissionVerdict::PromptUser { .. }));
+    }
+
+    #[test]
+    fn test_heuristic_write_tiers() {
+        let engine = Arc::new(LocalHeuristicBackend::new());
+        let policy = PermissionPolicy::new(engine);
+
+        // Ordinary source files: AutoAllow
+        let v1 = policy.evaluate_write("src/main.rs", "edit", ".");
+        assert!(matches!(v1, PermissionVerdict::AutoAllow { .. }));
+        let v2 = policy.evaluate_write("docs/notes.md", "write", ".");
+        assert!(matches!(v2, PermissionVerdict::AutoAllow { .. }));
+
+        // Build / CI configuration: PromptUser
+        let v3 = policy.evaluate_write("Cargo.toml", "write", ".");
+        assert!(matches!(v3, PermissionVerdict::PromptUser { .. }));
+        let v4 = policy.evaluate_write(".github/workflows/ci.yml", "write", ".");
+        assert!(matches!(v4, PermissionVerdict::PromptUser { .. }));
+
+        // Secrets and VCS internals: Block
+        let v5 = policy.evaluate_write(".env", "write", ".");
+        assert!(matches!(v5, PermissionVerdict::Block { .. }));
+        let v6 = policy.evaluate_write("keys/prod.pem", "write", ".");
+        assert!(matches!(v6, PermissionVerdict::Block { .. }));
+        let v7 = policy.evaluate_write(".git/hooks/pre-commit", "write", ".");
+        assert!(matches!(v7, PermissionVerdict::Block { .. }));
     }
 
     #[test]
