@@ -58,8 +58,10 @@ pub struct AgentConfig {
     pub command: String,
     /// Empty strings preserve the environment / provider default.
     pub model: String,
-    /// auto (legacy Kilo/custom), router, kilo, custom, or local (on-device
-    /// ONNX inference). Never contains a key.
+    /// The built-in provider: `router` (default), `kilo`, `custom` or `local`
+    /// (on-device ONNX inference). Legacy `onnx` aliases are normalized to
+    /// `local` at load and before saving; deliberate `auto` (first available
+    /// backend) and other retained values are left untouched. Never contains a key.
     pub provider: String,
     pub endpoint: String,
     /// Base URL of the local ONNX inference server. Empty uses the loopback
@@ -154,10 +156,7 @@ impl AgentConfig {
 
     pub fn use_router(&mut self) {
         self.backend = "builtin".into();
-        self.provider = "router".into();
-        self.endpoint = String::new();
-        self.api_key_env = String::new();
-        self.model = crate::provider::ROUTER_MODEL.into();
+        self.normalize_for_provider("router");
     }
 
     /// On-device ONNX inference: no key, no network. `onnx` is accepted as
@@ -168,19 +167,116 @@ impl AgentConfig {
 
     pub fn use_local(&mut self) {
         self.backend = "builtin".into();
-        self.provider = "local".into();
-        self.endpoint = String::new();
-        if self.api_key_env == crate::credentials::ROUTER_ENV {
-            self.api_key_env.clear();
+        self.normalize_for_provider("local");
+    }
+
+    /// The provider-independent fields that move with the provider: router
+    /// credentials and pinned-router URLs never follow a switch to another
+    /// server, and remote model ids never follow a switch to on-device
+    /// inference. The backend is untouched here on purpose; the dedicated
+    /// selectors (`use_router`, `use_local`) set it, while the settings menu
+    /// leaves the user's backend untouched.
+    fn normalize_for_provider(&mut self, provider: &str) {
+        match provider {
+            "router" => {
+                self.provider = "router".into();
+                self.endpoint = String::new();
+                self.api_key_env = String::new();
+                self.model = crate::provider::ROUTER_MODEL.into();
+            }
+            "local" => {
+                self.provider = "local".into();
+                self.endpoint = String::new();
+                if self.api_key_env == crate::credentials::ROUTER_ENV {
+                    self.api_key_env.clear();
+                }
+                // Remote model ids mean nothing on this machine, so fall back
+                // to the local server's default until the user names an ONNX model.
+                let remote = self.model == crate::provider::ROUTER_MODEL
+                    || self.model == crate::builtin_agent::DEFAULT_MODEL
+                    || self.model == crate::provider::KONO_MODEL
+                    || self.model.ends_with(":free");
+                if remote {
+                    self.model.clear();
+                }
+            }
+            "kilo" => {
+                // Kilo is a self-contained gateway: its gateway URL and
+                // default model are used, and a router credential or router
+                // model does not follow the switch. A custom URL stays so the
+                // existing validation can point at it.
+                self.provider = "kilo".into();
+                if self.api_key_env == crate::credentials::ROUTER_ENV {
+                    self.api_key_env.clear();
+                }
+                if self.model == crate::provider::ROUTER_MODEL {
+                    self.model.clear();
+                }
+            }
+            "custom" => {
+                // Custom keeps the user's own endpoint; a router credential or
+                // the pinned router URL does not follow the switch.
+                self.provider = "custom".into();
+                if self.api_key_env == crate::credentials::ROUTER_ENV {
+                    self.api_key_env.clear();
+                }
+                if self.model == crate::provider::ROUTER_MODEL {
+                    self.model.clear();
+                }
+                if crate::provider::pinned_router(self.endpoint.trim()) {
+                    self.endpoint.clear();
+                }
+            }
+            _ => unreachable!("normalize_for_provider called with an unknown provider"),
         }
-        // Remote model ids mean nothing on this machine, so fall back to the
-        // local server's default until the user names an ONNX model.
-        let remote = self.model == crate::provider::ROUTER_MODEL
-            || self.model == crate::builtin_agent::DEFAULT_MODEL
-            || self.model == crate::provider::KONO_MODEL
-            || self.model.ends_with(":free");
-        if remote {
-            self.model.clear();
+    }
+
+    /// The providers the built-in agent accepts. Deliberate legacy or
+    /// inheritance values (`auto`) are retained; every other value must be
+    /// one of these in the settings file.
+    pub const CANONICAL_PROVIDERS: [&str; 4] = ["router", "kilo", "custom", "local"];
+
+    /// Normalize a provider value to its canonical form: trimmed, lowercased,
+    /// with the legacy `onnx` alias mapped to `local`.
+    pub fn canonical_provider(provider: &str) -> String {
+        let value = provider.trim().to_ascii_lowercase();
+        match value.as_str() {
+            "onnx" => "local".into(),
+            _ => value,
+        }
+    }
+
+    /// Normalize and apply a provider selection. The related fields (model,
+    /// endpoint, key variable) move together with the provider, so a file can
+    /// never silently keep e.g. a router credential paired with a custom
+    /// endpoint or a remote model with on-device inference. The backend is
+    /// deliberately NOT changed here: external ACP backends are selected with
+    /// Backend, and `auto` keeps the first-available-backend meaning.
+    /// Deliberately retained `auto` keeps its fields untouched.
+    pub fn set_provider(&mut self, provider: &str) -> Result<()> {
+        let provider = Self::canonical_provider(provider);
+        match provider.as_str() {
+            "auto" => {
+                self.provider = "auto".into();
+                Ok(())
+            }
+            "router" | "local" | "kilo" | "custom" => {
+                // Provider settings belong to the built-in agent. An external
+                // ACP backend ignores them entirely (it keeps its own model),
+                // and `auto` selects the first available backend, which the
+                // router/local fallbacks do too. Only the provider itself is
+                // normalized for external backends.
+                if self.backend != "builtin" && self.backend != "auto" {
+                    self.provider = provider;
+                    return Ok(());
+                }
+                self.normalize_for_provider(&provider);
+                Ok(())
+            }
+            other => bail!(
+                "Unknown provider \"{other}\"; choose from {} or auto (first available backend)",
+                Self::CANONICAL_PROVIDERS.join(", ")
+            ),
         }
     }
 
@@ -189,7 +285,7 @@ impl AgentConfig {
             self.provider.as_str(),
             "auto" | "router" | "kilo" | "custom" | "local" | "onnx"
         ) {
-            bail!("Provider must be auto, router, kilo, custom or local");
+            bail!("Provider must be router, kilo, custom, local or auto");
         }
         if self.provider == "custom" && self.endpoint.trim().is_empty() {
             bail!("Set an API base URL before choosing the custom provider");
@@ -616,6 +712,7 @@ impl Preferences {
         for profile in &mut prefs.sub_agents {
             migrate_removed_backend(&mut profile.agent, false, legacy_schema);
         }
+        canonicalize_providers(&mut prefs);
         prefs.version = 2;
         prefs.validate()?;
         Ok(prefs)
@@ -624,7 +721,12 @@ impl Preferences {
     /// Save to the user configuration directory, regardless of the workspace.
     /// The project argument is retained for existing callers.
     pub fn save(&self, _project: &Path) -> Result<()> {
-        self.validate()?;
+        let prefs = {
+            let mut prefs = self.clone();
+            canonicalize_providers(&mut prefs);
+            prefs
+        };
+        prefs.validate()?;
         let path = user_settings_path();
         let parent = path.parent().context("User settings path has no parent")?;
         let mut directories = std::fs::DirBuilder::new();
@@ -654,7 +756,7 @@ impl Preferences {
         // preserves the previous file on errors and avoids cross-process clashes.
         let result = (|| -> Result<()> {
             let mut file = options.open(&tmp).context("Cannot create user settings")?;
-            serde_json::to_writer_pretty(&mut file, self).context("Cannot write user settings")?;
+            serde_json::to_writer_pretty(&mut file, &prefs).context("Cannot write user settings")?;
             file.write_all(b"\n")?;
             file.sync_all()?;
             drop(file);
@@ -686,6 +788,15 @@ fn prepare_legacy_overlay(overlay: &mut Value) {
                     .or_insert_with(|| Value::String("auto".into()));
             }
         }
+    }
+}
+
+/// Normalize every stored provider value in place (legacy aliases never
+/// persist). Deliberately retained values (`auto`) pass through untouched.
+fn canonicalize_providers(prefs: &mut Preferences) {
+    prefs.agent.provider = AgentConfig::canonical_provider(&prefs.agent.provider);
+    for profile in &mut prefs.sub_agents {
+        profile.agent.provider = AgentConfig::canonical_provider(&profile.agent.provider);
     }
 }
 
@@ -766,6 +877,115 @@ pub fn workspace_path(root: &Path, input: &str) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod command_policy_tests {
     use super::*;
+
+    #[test]
+    fn canonical_provider_maps_aliases_and_normalizes() {
+        assert_eq!(AgentConfig::canonical_provider("onnx"), "local");
+        assert_eq!(AgentConfig::canonical_provider(" ONNX "), "local");
+        assert_eq!(AgentConfig::canonical_provider("local"), "local");
+        assert_eq!(AgentConfig::canonical_provider(" Router "), "router");
+        assert_eq!(AgentConfig::canonical_provider("custom"), "custom");
+    }
+
+    #[test]
+    fn set_provider_normalizes_the_related_fields() {
+        let mut router_first = AgentConfig {
+            endpoint: String::new(),
+            api_key_env: crate::credentials::ROUTER_ENV.into(),
+            model: crate::provider::ROUTER_MODEL.into(),
+            ..Default::default()
+        };
+        router_first.set_provider("local").unwrap();
+        assert_eq!(router_first.provider, "local");
+        assert_eq!(router_first.backend, "builtin");
+        assert!(router_first.endpoint.is_empty());
+        assert!(router_first.api_key_env.is_empty());
+        assert!(router_first.model.is_empty());
+        router_first.validate().unwrap();
+
+        let mut custom = AgentConfig {
+            api_key_env: crate::credentials::ROUTER_ENV.into(),
+            model: crate::provider::ROUTER_MODEL.into(),
+            endpoint: crate::provider::ROUTER_ENDPOINT.into(),
+            ..Default::default()
+        };
+        custom.set_provider("custom").unwrap();
+        assert_eq!(custom.provider, "custom");
+        assert!(custom.api_key_env.is_empty());
+        assert!(custom.model.is_empty());
+        assert!(custom.endpoint.is_empty());
+
+        let mut kilo = AgentConfig {
+            api_key_env: crate::credentials::ROUTER_ENV.into(),
+            model: crate::provider::ROUTER_MODEL.into(),
+            ..Default::default()
+        };
+        kilo.set_provider("kilo").unwrap();
+        assert_eq!(kilo.provider, "kilo");
+        assert!(kilo.api_key_env.is_empty());
+        assert!(kilo.model.is_empty());
+
+        // A custom URL survives switching to kilo; the existing validation
+        // then does its job.
+        let mut kilo_with_url = kilo.clone();
+        kilo_with_url.endpoint = "https://one.example.com/v1".into();
+        kilo_with_url.set_provider("kilo").unwrap();
+        assert_eq!(kilo_with_url.endpoint, "https://one.example.com/v1");
+
+        let mut local_again = AgentConfig {
+            model: "onnx-community/SmolLM2-135M-Instruct".into(),
+            ..Default::default()
+        };
+        local_again.use_local();
+        local_again.set_provider("onnx").unwrap();
+        assert_eq!(local_again.provider, "local");
+        assert_eq!(local_again.model, "onnx-community/SmolLM2-135M-Instruct");
+
+        assert!(AgentConfig::default().set_provider("bogus").is_err());
+    }
+
+    #[test]
+    fn provider_edits_leave_external_backends_alone() {
+        // Provider settings belong to the built-in agent; an external ACP
+        // backend must keep its own model, endpoint and backend untouched.
+        let mut external = AgentConfig {
+            backend: "external-agent".into(),
+            model: "some-model".into(),
+            endpoint: "https://ext.example.com/v1".into(),
+            ..Default::default()
+        };
+        external.set_provider("local").unwrap();
+        assert_eq!(external.backend, "external-agent");
+        assert_eq!(external.provider, "local");
+        assert_eq!(external.model, "some-model");
+        assert_eq!(external.endpoint, "https://ext.example.com/v1");
+    }
+
+    #[test]
+    fn canonicalize_providers_drops_aliases_and_keeps_deliberate_auto() {
+        let mut prefs = Preferences {
+            agent: AgentConfig {
+                provider: "ONNX".into(),
+                ..Default::default()
+            },
+            sub_agents: vec![SubAgentConfig {
+                agent: AgentConfig {
+                    provider: "onnx".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        canonicalize_providers(&mut prefs);
+        assert_eq!(prefs.agent.provider, "local");
+        assert_eq!(prefs.sub_agents[0].agent.provider, "local");
+
+        let mut deliberate = Preferences::default();
+        deliberate.agent.provider = "auto".into();
+        canonicalize_providers(&mut deliberate);
+        assert_eq!(deliberate.agent.provider, "auto");
+    }
 
     #[test]
     fn never_ask_round_trips_through_settings_json() {

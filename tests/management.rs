@@ -964,3 +964,36 @@ fn dirty_legacy_settings_are_not_silently_migrated() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     assert!(!user_settings_path().exists());
 }
+
+#[test]
+fn provider_field_edit_normalizes_aliases_and_related_fields() {
+    if common::isolate(
+        "provider_field_edit_normalizes_aliases_and_related_fields",
+    ) {
+        return;
+    }
+    let root = project("provider-field-edit");
+    let mut a = app(&root);
+    a.run(Command::AgentSettings);
+    choose(&mut a, "Built-in provider:");
+    type_value(&mut a, "onnx");
+    assert_eq!(a.agent.options.provider, "local");
+    assert!(a.agent.options.uses_local());
+    // The router's default model and credential never follow the switch.
+    assert!(a.agent.options.model.is_empty());
+    assert!(a.agent.options.api_key_env.is_empty());
+    assert!(a.agent.options.endpoint.is_empty());
+    let settings = std::fs::read_to_string(user_settings_path()).unwrap();
+    assert!(settings.contains("\"provider\": \"local\""), "{settings}");
+    assert!(!settings.contains("onnx"), "{settings}");
+
+    // An unknown provider is rejected with the supported values named.
+    choose(&mut a, "Built-in provider:");
+    type_value(&mut a, "definitely-not-a-provider");
+    assert!(a.toasts.iter().any(|t| t.text.contains("Unknown provider")));
+    assert_eq!(a.agent.options.provider, "local");
+
+    // Reloading the file resolves the canonical provider.
+    let b = app(&root);
+    assert!(b.agent.options.uses_local());
+}

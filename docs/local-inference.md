@@ -102,7 +102,7 @@ Logs go to `$XDG_CONFIG_HOME/termed/onnx-server.log`.
 
 | Setting | Meaning |
 | --- | --- |
-| Built-in provider | `local` (alias `onnx`) runs every turn on this machine; `router`, `auto`, `kilo` and `custom` keep their remote/ACP meaning |
+| Built-in provider | `local` runs every turn on this machine (the `onnx` alias is normalized to `local` on load and save); `router`, `auto`, `kilo` and `custom` keep their remote/ACP meaning |
 | Local ONNX endpoint | Local server base URL; empty uses `http://127.0.0.1:8080/v1`. Also `--local-endpoint` or `TERMED_LOCAL_ENDPOINT` |
 | Model | ONNX repo id or local model directory; empty loads the default model |
 
