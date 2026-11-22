@@ -13,6 +13,15 @@ key. It is used in two ways:
   agent configuration**, set `"provider": "local"` in settings JSON, or start
   termed with `--local`. Every turn then runs on this machine.
 
+The built-in AI chat can also download and run the local model by itself,
+without changing the configured provider, when you ask it to use on-device
+inference. It has a `local_inference` tool: `status` reports whether the
+server is running, `download` fetches the model into the local cache (no
+ONNX Runtime required), and `start` starts the embedded server and switches
+this session to on-device inference. If it fails, the chat reports the fix
+(install the dependencies, check `~/.config/termed/onnx-server.log`, or run
+`termed --local-serve`).
+
 If local inference also fails, the turn returns to the configured provider,
 and if that fails too one message explains both. Local inference never
 receives the router key, and no prompt leaves the machine.
