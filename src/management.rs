@@ -221,7 +221,7 @@ fn hint(field: Field) -> &'static str {
             "Attach the open file and selection to prompts and descendant task briefs"
         }
         Field::Provider => {
-            "auto (legacy Kilo/custom), router (pinned authenticated NoKey Router), kilo, custom, or local (on-device ONNX, no key or network); does not change external ACP providers"
+            "router (NoKey Router, default), kilo, custom (your own API base URL) or local (on-device ONNX, no key or network); auto keeps the first available backend; external ACP providers are set with Backend"
         }
         Field::MaxDepth => {
             "1–3; root = 0, child = 1, grandchild = 2. Restrictions and deadline propagate at every level"
@@ -1174,7 +1174,7 @@ impl App {
 fn set_field(a: &mut AgentConfig, field: Field, input: &str) -> Result<()> {
     match field {
         Field::Backend => a.backend = input.into(),
-        Field::Provider => a.provider = input.into(),
+        Field::Provider => a.set_provider(input)?,
         Field::MaxDepth => {
             a.max_agent_depth = input
                 .parse()

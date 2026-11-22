@@ -72,7 +72,7 @@ The agent configuration menu exposes:
 | Delegations per turn | 1–32 total tasks for the whole root tree (default 4); descendants share this budget |
 | Task timeout | 10–1800 seconds (default 300) for the root turn and inherited absolute specialist deadlines, including approval waits |
 | Attach editor context | Include the active file and selection in prompts and bounded worker briefs |
-| Built-in provider | `router` (default), `auto` (legacy Kilo/custom), `kilo`, `custom`, `local` (on-device ONNX, alias `onnx`); external ACP processes configure their own providers |
+| Built-in provider | `router` (default), `kilo`, `custom`, `local` (on-device ONNX); the `onnx` alias is normalized to `local` on load and save, and a legacy/deliberate `auto` is retained. The related model, endpoint, key variable and backend are normalized with the provider |
 | Maximum agent depth | 1–3 (default 2): root=0, child=1, grandchild=2; every ancestor can impose a smaller cap |
 | Concurrent tasks | 1–8 active tasks (default 4), including waiting coordinators; new delegation fails fast when full |
 | Overwatch stall timeout | 15–600 seconds (default 150); child/approval/plugin waits are exempt from idle detection, not absolute deadlines |
