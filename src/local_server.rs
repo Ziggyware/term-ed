@@ -99,6 +99,13 @@ fn health(http: &ureq::Agent, endpoint: &str) -> Option<Value> {
     serde_json::from_str(&text).ok()
 }
 
+/// Health/status probe used by the agent's `local_inference` tool: reads the
+/// server's `/healthz` body without starting (or waiting on) anything.
+/// Returns `None` when nothing is answering on the endpoint.
+pub fn probe(http: &ureq::Agent, endpoint: &str) -> Option<serde_json::Value> {
+    health(http, endpoint)
+}
+
 /// Port of a loopback `http://` endpoint, for `--local-serve`.
 pub fn endpoint_port(endpoint: &str) -> Option<u16> {
     loopback_host_port(endpoint).map(|(_, port)| port)
@@ -226,7 +233,7 @@ fn wait_ready<F: Fn() -> bool, P: Fn(Duration)>(
 
 /// The model to load: the chat model the worker is using, unless it is the
 /// placeholder id or a remote provider's model.
-fn model_for(model: &str) -> String {
+pub fn model_for(model: &str) -> String {
     let model = model.trim();
     if model.is_empty()
         || model == crate::provider::LOCAL_MODEL

@@ -11,7 +11,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::util::{bold, ellipsize, fgbg, fill, put, width, wrap_text};
 use crate::agent::{Entry, PlanStatus, State, ToolStatus};
-use crate::app::{AgentTarget, App, Focus, is_free_model};
+use crate::app::{AgentSelection, AgentTarget, App, Focus, is_free_model};
 use crate::theme::{Palette, mix};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -44,6 +44,64 @@ impl Row {
     fn blank() -> Self {
         Row::default()
     }
+}
+
+/// The display columns `[lo, hi)` of a row inside the selection, in display
+/// column units.
+fn selection_cols(sel: AgentSelection, abs_row: usize, tw: u16) -> Option<(u16, u16)> {
+    let (lo, hi) = sel.ordered();
+    if lo.0 == hi.0 {
+        if abs_row != lo.0 || lo.1 == hi.1 {
+            return None;
+        }
+        Some((lo.1, hi.1))
+    } else if abs_row == lo.0 {
+        Some((lo.1.min(tw), tw))
+    } else if abs_row == hi.0 {
+        Some((0, hi.1.min(tw)))
+    } else if abs_row > lo.0 && abs_row < hi.0 {
+        Some((0, tw))
+    } else {
+        None
+    }
+}
+
+/// Slice a row's plain text from display column `col_start` to `col_end`
+/// (display columns, not characters or bytes).
+fn slice_by_cols(text: &str, col_start: usize, col_end: usize) -> String {
+    let mut out = String::new();
+    let mut w = 0usize;
+    for ch in text.chars() {
+        if w >= col_end {
+            break;
+        }
+        if w >= col_start {
+            out.push(ch);
+        }
+        w += UnicodeWidthChar::width(ch).unwrap_or(0);
+    }
+    out
+}
+
+/// Plain text of the current transcript selection.
+fn selection_text(rows: &[Row], sel: AgentSelection, tw: usize) -> String {
+    let (lo, hi) = sel.ordered();
+    let mut lines = Vec::new();
+    for abs in lo.0..=hi.0 {
+        let Some(row) = rows.get(abs) else { continue };
+        let text: String = row.spans.iter().map(|(s, _)| s.as_str()).collect();
+        let (c_start, c_end) = if abs == lo.0 && abs == hi.0 {
+            (lo.1 as usize, hi.1 as usize)
+        } else if abs == lo.0 {
+            (lo.1 as usize, tw)
+        } else if abs == hi.0 {
+            (0, hi.1 as usize)
+        } else {
+            (0, tw)
+        };
+        lines.push(slice_by_cols(&text, c_start, c_end));
+    }
+    lines.join("\n")
 }
 
 /// Split styled segments into words and greedily wrap them to `w` columns.
@@ -412,10 +470,14 @@ fn build_rows(app: &App, w: usize, panel_bg: Color) -> Vec<Row> {
             bold(Style::default().fg(pal.fg)),
         ));
         rows.push(Row::blank());
-        for l in wrap_text(
-            "It can read and edit your project. Its edits show up in the editor with change bars, and Ctrl+Z (↶) undoes them.",
-            w,
-        ) {
+        let desc = if a.options.read_only {
+            "It can inspect and analyze your project. It cannot edit, create files, run commands or start software while read-only."
+        } else if a.spec.as_ref().is_some_and(|s| s.builtin) {
+            "It can read and edit your project, create folders and whole programs, and find and run software on this machine. Its edits show up in the editor with change bars, and Ctrl+Z (↶) undoes them."
+        } else {
+            "It can read and edit your project. Its edits show up in the editor with change bars, and Ctrl+Z (↶) undoes them."
+        };
+        for l in wrap_text(desc, w) {
             rows.push(Row::text(l, dim));
         }
         if a.spec.as_ref().is_some_and(|s| s.builtin) {
@@ -893,11 +955,20 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
     let max_scroll = rows.len().saturating_sub(h);
     app.agent.scroll = app.agent.scroll.min(max_scroll);
     let start = max_scroll - app.agent.scroll;
+    app.layout.agent_body = body;
+    app.layout.agent_rows_start = start;
+    app.layout.agent_rows_total = rows.len();
+    let selection = app.agent_selection;
+    app.agent_selection_text = match selection {
+        Some(s) if s.start != s.end => selection_text(&rows, s, tw),
+        _ => String::new(),
+    };
     for (k, row) in rows.iter().skip(start).take(h).enumerate() {
         let y = body.y + k as u16;
         let rx0 = body.x + 1;
         let full = Rect::new(body.x, y, body.width, 1);
         let bg = row.bg.unwrap_or(panel_bg);
+        let sel_cols = selection.and_then(|s| selection_cols(s, start + k, tw as u16));
         if row.bg.is_some() {
             fill(buf, full, bg);
         }
@@ -905,6 +976,15 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
         for (s, st) in &row.spans {
             let st = if st.bg.is_none() { st.bg(bg) } else { *st };
             cx = put(buf, cx, y, s, st, body.right().saturating_sub(1));
+        }
+        // Selection: repaint the selected cell backgrounds in place so the
+        // glyphs and styles stay intact.
+        if let Some((lo, hi)) = sel_cols {
+            for x in (rx0 + lo)..(rx0 + hi) {
+                if let Some(c) = buf.cell_mut((x, y)) {
+                    c.set_bg(pal.selection);
+                }
+            }
         }
         if let Some(t) = &row.target {
             app.layout.agent_targets.push((full, t.clone()));
@@ -1048,6 +1128,24 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_text_slices_columns_across_rows() {
+        let rows = vec![
+            Row::text("abcdefghijkl", Style::default()),
+            Row::blank(),
+            Row::text("hijklm", Style::default()),
+        ];
+        let sel = AgentSelection { start: (0, 4), end: (2, 3) };
+        assert_eq!(selection_text(&rows, sel, 10), "efghij\n\nhij");
+
+        let sel = AgentSelection { start: (2, 2), end: (2, 4) };
+        assert_eq!(selection_text(&rows, sel, 10), "jk");
+
+        // Backwards drags select the same text.
+        let sel = AgentSelection { start: (2, 1), end: (0, 2) };
+        assert_eq!(selection_text(&rows, sel, 10), "cdefghij\n\nh");
+    }
 
     #[test]
     fn wrap_styled_preserves_indent_across_long_hard_broken_tokens() {

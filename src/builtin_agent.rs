@@ -275,15 +275,21 @@ fn tools_schema(options: &AgentConfig) -> Value {
         ),
         f(
             "write_file",
-            "Create a new text file or overwrite an existing text file completely.",
+            "Create a new text file or overwrite an existing text file completely. Parent directories are created automatically, so you can create files, folders and whole programs (any language, multi-file projects included) this way.",
             json!({"path":{"type":"string"},"content":{"type":"string"}}),
             &["path", "content"],
         ),
         f(
             "run_command",
-            "Run a build, test, or git command in a stateless subshell rooted at the project directory. NEVER use `run_command` for `cd`, `ls`, `cat`, `grep`, `find`, or file edits: standalone `cd` has no effect across calls, and paths outside the workspace root (`..`) are forbidden.",
+            "Run a build, test, or git command in a stateless subshell rooted at the project directory. NEVER use `run_command` for `cd`, `ls`, `cat`, `grep`, `find`, or file edits: standalone `cd` has no effect across calls, and paths outside the workspace root (`..`) are forbidden. This also finds and runs software on the user's machine: locate installed software (`which <tool>`, `where <tool>`, `command -v <tool>` or the platform equivalent) before assuming it is available, then run it (e.g. `cargo build`, `npx <tool>`, `python <script>`, `<tool> --version`). Absolute paths and PATH-resolved executables both work.",
             json!({"command":{"type":"string"}}),
             &["command"],
+        ),
+        f(
+            "local_inference",
+            "Download and run the on-device ONNX AI (local inference, no network and no API key). action=status reports whether the local server is running; action=download fetches the model into the local cache (a few hundred MB the first time, no ONNX Runtime required); action=start downloads if needed, starts the embedded ONNX server and switches this session to on-device inference. Use it when the user asks to use the local/on-device ONNX model.",
+            json!({"action":{"type":"string","enum":["status","download","start"]},"model":{"type":"string","description":"Hugging Face repo id or local model directory; default is the built-in first-run model"}}),
+            &["action"],
         ),
     ];
     tools.retain(|tool| {
@@ -291,7 +297,8 @@ fn tools_schema(options: &AgentConfig) -> Value {
             .pointer("/function/name")
             .and_then(Value::as_str)
             .unwrap_or("");
-        !(options.read_only && matches!(name, "edit_file" | "write_file" | "run_command")
+        !(options.read_only
+            && matches!(name, "edit_file" | "write_file" | "run_command" | "local_inference")
             || options.commands == CommandPolicy::Deny && name == "run_command")
     });
     tools.extend(crate::tool_bridge::tools(options).into_iter().map(|t| {
@@ -362,6 +369,10 @@ struct Worker {
     local: Option<crate::config::LocalInference>,
     /// Remote model and model list to return to if local inference fails.
     saved_remote: Option<(String, Vec<(String, String)>)>,
+    /// True when on-device inference was requested by the user (via the
+    /// local_inference tool) rather than by a 5xx fallback: keep it across
+    /// turns instead of reverting to the remote provider.
+    local_sticky: bool,
     /// Host replies that arrived while a different request was being awaited.
     stashed: HashMap<u64, Value>,
 }
@@ -413,6 +424,7 @@ impl Worker {
             agui,
             local: None,
             saved_remote: None,
+            local_sticky: false,
             stashed: HashMap::new(),
         }
     }
@@ -464,6 +476,7 @@ impl Worker {
                 // local server stays up and can still serve a 5xx fallback.
                 self.local = None;
                 self.saved_remote = None;
+                self.local_sticky = false;
                 if self.models.is_empty() {
                     self.models = if self.options.uses_router() {
                         crate::provider::router_models()
@@ -564,6 +577,11 @@ impl Worker {
         } else {
             std::env::consts::OS
         };
+        let capabilities = if self.options.read_only {
+            "\n\n<capabilities>\n- Inspection only: you cannot create or modify files, run commands or invoke plugins. Inspect with list_files/read_file/search and report evidence; never claim an action ran.\n</capabilities>"
+        } else {
+            "\n\n<capabilities>\n- Whole programs: you can create files, folders and entire programs (any language, multi-file projects included) with write_file, which creates parent directories automatically. Verify the program by building and running it with run_command.\n- Software on the user's machine: you run on the user's real machine with its installed software. Never assume a tool is installed — locate software first (`which <tool>`, `where <tool>`, `command -v <tool>` or the platform equivalent), then run it via run_command (e.g. `cargo build`, `npx <tool>`, `python <script>`, `<tool> --version`). Absolute paths and PATH-resolved executables both work.\n- On-device ONNX AI: if the user asks to use the local/on-device ONNX model (no network, no API key), use the local_inference tool. action=status checks it, action=download fetches the model into ~/.config/termed/onnx-models/, action=start serves it and switches this session to on-device inference. On failure, say so and name the fix (`pip install -r local_inference/requirements.txt` for missing dependencies, see ~/.config/termed/onnx-server.log or run termed --local-serve).\n</capabilities>"
+        };
         let mode_rules = if self.options.read_only {
             "- Read-Only Mode: Do NOT modify files, create files, run shell commands, or invoke mutating plugins. Focus strictly on inspection, analysis, and evidence-backed reporting."
         } else {
@@ -585,9 +603,10 @@ impl Worker {
              - Path Convention: All tool paths are relative to the project root (`{}`). Never use `..` to access parent directories.\n\
              {mode_rules}\n\
              - Completion Contract: Before finishing your turn, verify that every constraint and acceptance criterion in the user's request and active instructions is satisfied. Reply concisely in Markdown summarizing what you changed (or found), the evidence/checks performed, and why.\n\
-             </execution_contract>",
+             </execution_contract>{}",
             self.cwd.display(),
-            self.cwd.display()
+            self.cwd.display(),
+            capabilities
         );
         let configured = crate::skills::format_instructions(&self.options, &self.skill_context);
         if !configured.is_empty() {
@@ -653,7 +672,7 @@ impl Worker {
         // A fallback covers one outage, not the rest of the session: retry
         // the configured provider each turn, and fall back again if it is
         // still failing. The local server stays warm either way.
-        if self.local.is_some() && !self.options.uses_local() {
+        if self.local.is_some() && !self.options.uses_local() && !self.local_sticky {
             self.local = None;
             if let Some((model, models)) = self.saved_remote.take() {
                 self.model = model;
@@ -1230,7 +1249,7 @@ impl Worker {
         if self.options.read_only
             && matches!(
                 name,
-                "edit_file" | "write_file" | "run_command" | "run_plugin"
+                "edit_file" | "write_file" | "run_command" | "run_plugin" | "local_inference"
             )
         {
             self.tool_start(id, name, "other", None);
@@ -1239,7 +1258,7 @@ impl Worker {
                 false,
                 vec![Self::text_block("Denied: this agent is read-only")],
             );
-            return "Error: this agent is read-only; do not attempt file edits, commands, or plugins.".into();
+            return "Error: this agent is read-only; do not attempt file edits, commands, plugins, or on-device inference.".into();
         }
         if name == "run_command" && self.options.commands == CommandPolicy::Deny {
             self.tool_start(id, name, "execute", None);
@@ -1257,6 +1276,7 @@ impl Worker {
             "edit_file" => self.edit_file(id, &s("path"), &s("old_text"), &s("new_text")),
             "write_file" => self.write_file(id, &s("path"), &s("content")),
             "run_command" => self.run_command(id, &s("command")),
+            "local_inference" => self.local_inference(id, &s("action"), &s("model")),
             host if crate::tool_bridge::tools(&self.options)
                 .iter()
                 .any(|t| t.name == host)
@@ -1808,6 +1828,129 @@ impl Worker {
         );
         Ok(format!("{code}\n{out}"))
     }
+
+    /// Download and run the on-device ONNX AI. `status` probes the embedded
+    /// server without starting anything; `download` fetches the model into
+    /// the local cache (no ONNX Runtime needed); `start` starts the server
+    /// and switches this session to on-device inference.
+    fn local_inference(&mut self, id: &str, action: &str, model: &str) -> Result<String, String> {
+        let (title, tool_kind) = match action {
+            "status" => ("Local ONNX status", "read"),
+            "download" => ("Download ONNX model", "fetch"),
+            "start" => ("Start ONNX server", "execute"),
+            _ => ("Local ONNX", "other"),
+        };
+        self.tool_start(id, title, tool_kind, None);
+        let endpoint = crate::provider::local_endpoint(&self.options);
+
+        let requested = {
+            let m = model.trim();
+            if !m.is_empty() {
+                m.to_string()
+            } else if self.options.uses_local() {
+                // The configured local model only makes sense for the local provider;
+                // anything else is a remote model id and must not be read as an ONNX id.
+                self.model.clone()
+            } else {
+                String::new()
+            }
+        };
+
+        match action {
+            "status" => {
+                let out = match crate::local_server::probe(&self.http, &endpoint) {
+                    Some(info) => {
+                        let status = info.get("status").and_then(Value::as_str).unwrap_or("?");
+                        let loaded = info.get("model").and_then(Value::as_str).unwrap_or("?");
+                        let detail = match info.get("error").and_then(Value::as_str) {
+                            Some(error) => format!(" ({error})"),
+                            None => String::new(),
+                        };
+                        format!(
+                            "Local ONNX server at {endpoint}: status {status} (model {loaded}){detail}"
+                        )
+                    }
+                    None => format!(
+                        "Local ONNX server is not running (nothing answers at {endpoint}). \
+                         Use action 'download' to fetch the model and action 'start' to run it."
+                    ),
+                };
+                self.tool_end(id, true, vec![Self::text_block(&out)]);
+                Ok(out)
+            }
+            "download" => {
+                self.notice(
+                    "Downloading the ONNX model (first run may take a few minutes)…",
+                    false,
+                );
+                match crate::local_server::prefetch(&requested) {
+                    Ok(()) => {
+                        let name = crate::local_server::model_for(&requested);
+                        let out = format!(
+                            "Downloaded {name} to ~/.config/termed/onnx-models/. \
+                             Use action 'start' to run the local ONNX AI."
+                        );
+                        self.tool_end(id, true, vec![Self::text_block(&out)]);
+                        Ok(out)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            "start" => {
+                let wait_requested = requested;
+                let cancel = self.cancel.clone();
+                let waiting = |elapsed: Duration| {
+                    self.notice(
+                        &format!(
+                            "Waiting for the local ONNX server ({}s); the first run downloads the model.",
+                            elapsed.as_secs()
+                        ),
+                        false,
+                    )
+                };
+                self.notice(
+                    "Starting the local ONNX server (the first run downloads the model and can take a few minutes)…",
+                    false,
+                );
+                match crate::local_server::ensure_running(
+                    &self.http,
+                    &endpoint,
+                    &wait_requested,
+                    move || cancel.load(Ordering::SeqCst),
+                    waiting,
+                ) {
+                    Ok(model) => {
+                        self.notice(
+                            &format!("Local ONNX server is running ({model}). Using on-device inference for this session."),
+                            false,
+                        );
+                        // The user asked for on-device inference, so keep it
+                        // across turns instead of reverting to the provider.
+                        if self.local.is_none() {
+                            self.saved_remote =
+                                Some((std::mem::take(&mut self.model), std::mem::take(&mut self.models)));
+                        }
+                        self.local_sticky = true;
+                        self.models = crate::provider::local_models();
+                        if !self.models.iter().any(|(id, _)| *id == model) {
+                            self.models.insert(0, (model.clone(), format!("Local ONNX · {model}")));
+                        }
+                        let out = format!(
+                            "Local ONNX server is running ({model}). On-device inference is now active for this session."
+                        );
+                        self.model = model.clone();
+                        self.local = Some(crate::config::LocalInference { endpoint, model });
+                        self.send(json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"builtin",
+                            "update":{"sessionUpdate":"config_option_update","configOptions":self.config_options()}}}));
+                        self.tool_end(id, true, vec![Self::text_block(&out)]);
+                        Ok(out)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            other => Err(format!("unknown local_inference action '{other}' (expected status, download or start)")),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1926,6 +2069,7 @@ mod configured_tests {
             "write_file",
             "run_command",
             "run_plugin",
+            "local_inference",
             "delegate_task",
         ] {
             assert!(
@@ -1944,7 +2088,7 @@ mod configured_tests {
             Arc::new(AtomicBool::new(false)),
         );
         worker.options = options;
-        for name in ["edit_file", "write_file", "run_command", "run_plugin"] {
+        for name in ["edit_file", "write_file", "run_command", "run_plugin", "local_inference"] {
             assert!(
                 worker
                     .run_tool("denied", name, &json!({}))
@@ -1958,6 +2102,40 @@ mod configured_tests {
                 .run_tool("denied", "run_command", &json!({"command":"echo never"}))
                 .contains("disabled")
         );
+    }
+
+    #[test]
+    fn full_schema_exposes_local_inference_and_creation_awareness() {
+        let options = AgentConfig::default();
+        let tools = tools_schema(&options);
+        let names: Vec<&str> = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .collect();
+        assert!(names.contains(&"local_inference"));
+        assert!(names.contains(&"write_file"));
+        assert!(names.contains(&"run_command"));
+        let write_file = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["function"]["name"] == "write_file")
+            .unwrap();
+        let desc = write_file["function"]["description"].as_str().unwrap();
+        assert!(desc.contains("whole programs"), "{desc}");
+        let run_command = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["function"]["name"] == "run_command")
+            .unwrap();
+        let desc = run_command["function"]["description"].as_str().unwrap();
+        assert!(desc.contains("software"), "{desc}");
+        // local_inference is available in read-only-looking schemas only via
+        // the non-read-only branch; the read-only branch is checked above.
+        assert!(!options.read_only);
     }
 }
 

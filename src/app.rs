@@ -419,6 +419,32 @@ pub struct Layout {
     pub agent_panel: Rect,
     pub agent_input: Rect,
     pub agent_targets: Vec<(Rect, AgentTarget)>,
+    /// Transcript body rect and the absolute transcript row it starts at
+    /// (render-time values used for transcript selection).
+    pub agent_body: Rect,
+    pub agent_rows_start: usize,
+    pub agent_rows_total: usize,
+}
+
+/// Text selected in the AI chat transcript. Rows are absolute transcript
+/// rows (0 = top of the transcript); columns are `u16` offsets relative to
+/// the start of the drawn text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AgentSelection {
+    pub start: (usize, u16),
+    pub end: (usize, u16),
+}
+
+impl AgentSelection {
+    /// The (lo, hi) endpoints of the selection in reading order, regardless
+    /// of drag direction.
+    pub(crate) fn ordered(&self) -> ((usize, u16), (usize, u16)) {
+        if self.start < self.end {
+            (self.start, self.end)
+        } else {
+            (self.end, self.start)
+        }
+    }
 }
 
 /// Tappable things in the agent panel.
@@ -447,6 +473,7 @@ enum Drag {
     SidebarResize,
     ExplorerScrollbar,
     SearchScrollbar,
+    AgentSelection,
 }
 
 pub struct Settings {
@@ -495,6 +522,10 @@ pub struct App {
     /// Latched modifiers from the touch toolbar.
     pub mods: StickyMods,
     pub agent: Agent,
+    /// Text selected in the AI chat transcript (absolute transcript rows).
+    pub agent_selection: Option<AgentSelection>,
+    /// Plain text of the current transcript selection, rebuilt each frame.
+    pub agent_selection_text: String,
     /// External plugin processes (see `plugin.rs`).
     pub plugins: PluginHost,
     pub show_agent: bool,
@@ -578,6 +609,8 @@ impl App {
             compact: false,
             mods: StickyMods::default(),
             agent: Agent::new(root.clone()),
+            agent_selection: None,
+            agent_selection_text: String::new(),
             plugins: PluginHost::new(root.clone()),
             show_agent: false,
             toolbar_page: 0,
@@ -1525,6 +1558,9 @@ impl App {
                 }
             }
             AgentNewChat => {
+                self.agent_selection = None;
+                self.agent_selection_text = String::new();
+                self.drag = None;
                 self.cancel_automation();
                 self.agent.cancel();
                 self.agent.new_chat();
@@ -1671,6 +1707,11 @@ impl App {
             Undo | Redo | Cut | Copy | Paste | SelectAll | SelectLine | SelectNextOccurrence
             | ToggleComment | Indent | Outdent | MoveLineUp | MoveLineDown | DuplicateLineDown
             | DuplicateLineUp | DeleteLine | InsertLineBelow | InsertLineAbove => {
+                if matches!(cmd, Cut | Copy) && self.focus == Focus::Agent {
+                    // Nothing in the transcript can be cut; copy only.
+                    self.agent_copy_selection();
+                    return;
+                }
                 self.edit_command(cmd)
             }
             // Code intelligence: editor-independent flows (context menu,
@@ -4363,6 +4404,8 @@ impl App {
                 } else if l.agent_panel.contains(pos) {
                     let a = &mut self.agent;
                     a.scroll = (a.scroll as isize - d).max(0) as usize;
+                    self.agent_selection = None;
+                    self.agent_selection_text = String::new();
                 } else if l.sidebar.contains(pos) {
                     let max = self
                         .explorer
@@ -4486,13 +4529,23 @@ impl App {
         }
         if l.agent_panel.contains(pos) {
             if let Some((_, t)) = l.agent_targets.iter().find(|(r, _)| r.contains(pos)) {
+                self.agent_selection = None;
+                self.agent_selection_text = String::new();
                 self.agent_target(t.clone());
-            } else {
-                self.focus = Focus::Agent;
-                if l.agent_input.contains(pos) {
-                    // Tap in the input: move the caret to the end (simple and predictable on touch).
-                    self.agent.cursor = self.agent.input.chars().count();
-                }
+                return;
+            }
+            self.focus = Focus::Agent;
+            if l.agent_body.contains(pos) && l.agent_body.height > 0 {
+                // Drag across the transcript to select text.
+                let p = self.agent_body_point(pos);
+                self.agent_selection = Some(AgentSelection { start: p, end: p });
+                self.agent_selection_text = String::new();
+                self.drag = Some(Drag::AgentSelection);
+                return;
+            }
+            if l.agent_input.contains(pos) {
+                // Tap in the input: move the caret to the end (simple and predictable on touch).
+                self.agent.cursor = self.agent.input.chars().count();
             }
             return;
         }
@@ -4766,11 +4819,53 @@ impl App {
             }
             Some(Drag::SearchScrollbar) => self.search_scroll_to(pos.y),
             Some(Drag::ExplorerScrollbar) => self.explorer_scroll_to(pos.y),
+            Some(Drag::AgentSelection) => {
+                let body = l.agent_body;
+                if body.width > 2 && body.height > 0 {
+                    let y = pos.y.clamp(body.y, body.y + body.height - 1);
+                    let x = pos.x.clamp(
+                        body.x + 1,
+                        (body.x + body.width.saturating_sub(2)).max(body.x + 1),
+                    );
+                    let p = self.agent_body_point(Position::new(x, y));
+                    if let Some(sel) = self.agent_selection.as_mut() {
+                        sel.end = p;
+                        self.agent_selection_text = String::new();
+                    }
+                }
+            }
             Some(Drag::SidebarResize) => {
                 self.sidebar_width = pos.x.saturating_sub(l.sidebar.x).clamp(16, 80);
             }
             None => {}
         }
+    }
+
+    /// (absolute transcript row, column) from a position inside the transcript body.
+    fn agent_body_point(&self, pos: Position) -> (usize, u16) {
+        let l = &self.layout;
+        let row = pos.y.saturating_sub(l.agent_body.y) as usize + l.agent_rows_start;
+        let row = if l.agent_rows_total == 0 {
+            0
+        } else {
+            row.min(l.agent_rows_total.saturating_sub(1))
+        };
+        let max_col = l.agent_body.width.saturating_sub(2);
+        let col = pos.x.saturating_sub(l.agent_body.x + 1).min(max_col);
+        (row, col)
+    }
+
+    /// Copy the transcript selection to the clipboard.
+    fn agent_copy_selection(&mut self) {
+        let Some(sel) = self.agent_selection else { return };
+        if sel.start == sel.end {
+            return;
+        }
+        let text = self.agent_selection_text.clone();
+        if text.trim().is_empty() {
+            return;
+        }
+        self.clipboard.set(text, false);
     }
 
     /// (line, display column) under a screen position; the column may lie
@@ -5077,8 +5172,19 @@ impl App {
     }
 
     fn agent_key(&mut self, code: KeyCode, ctrl: bool, shift: bool, alt: bool) {
+        // Esc clears a transcript selection before it stops the task.
+        if code == KeyCode::Esc && self.agent_selection.is_some() {
+            self.agent_selection = None;
+            self.agent_selection_text = String::new();
+            return;
+        }
         if code == KeyCode::Esc && (self.agent.is_working() || self.automation.busy()) {
             self.run(Command::AgentStop);
+            return;
+        }
+        // Ctrl+C copies the transcript selection (nothing to cut).
+        if ctrl && !alt && code == KeyCode::Char('c') {
+            self.agent_copy_selection();
             return;
         }
         // Number keys answer a pending permission request.
@@ -5150,10 +5256,26 @@ impl App {
             KeyCode::Right => a.cursor = (a.cursor + 1).min(a.input.chars().count()),
             KeyCode::Home => a.cursor = 0,
             KeyCode::End => a.cursor = a.input.chars().count(),
-            KeyCode::Up => a.scroll += 1,
-            KeyCode::Down => a.scroll = a.scroll.saturating_sub(1),
-            KeyCode::PageUp => a.scroll += 10,
-            KeyCode::PageDown => a.scroll = a.scroll.saturating_sub(10),
+            KeyCode::Up => {
+                a.scroll += 1;
+                self.agent_selection = None;
+                self.agent_selection_text = String::new();
+            }
+            KeyCode::Down => {
+                a.scroll = a.scroll.saturating_sub(1);
+                self.agent_selection = None;
+                self.agent_selection_text = String::new();
+            }
+            KeyCode::PageUp => {
+                a.scroll += 10;
+                self.agent_selection = None;
+                self.agent_selection_text = String::new();
+            }
+            KeyCode::PageDown => {
+                a.scroll = a.scroll.saturating_sub(10);
+                self.agent_selection = None;
+                self.agent_selection_text = String::new();
+            }
             KeyCode::Char(c) if !ctrl && !alt => {
                 a.input.insert(byte_at(&a.input, a.cursor), c);
                 a.cursor += 1;
