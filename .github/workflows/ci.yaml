@@ -1,0 +1,9 @@
+# .github/workflows/ci.yml
+on: [push, pull_request]
+jobs:
+  build:
+    runs-on: windows-latest   # the target that kept breaking
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --release
+      - run: cargo test

@@ -5195,10 +5195,10 @@ impl App {
             AgentTarget::CopyAll => {
                 let text = self.agent_transcript_text.trim().to_string();
                 if text.is_empty() {
-                    self.toast("Nothing to copy".into(), ToastKind::Info);
+                    self.toast("Nothing to copy", ToastKind::Info);
                 } else {
                     self.clipboard.set(text, false);
-                    self.toast("Transcript copied to clipboard".into(), ToastKind::Success);
+                    self.toast("Transcript copied to clipboard", ToastKind::Success);
                 }
             }
             AgentTarget::Expand => self.toggle_agent_expanded(),
