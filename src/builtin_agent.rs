@@ -595,12 +595,74 @@ impl Worker {
         }
     }
 
+    fn local_workspace_entries(&self) -> String {
+        let Ok(read_dir) = std::fs::read_dir(&self.cwd) else {
+            return "(unreadable)".into();
+        };
+        let mut names = Vec::new();
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if crate::credentials::is_private_path(&path) {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if matches!(
+                name,
+                ".git" | ".termed" | "target" | "node_modules" | "__pycache__"
+            ) {
+                continue;
+            }
+            if path.is_dir() {
+                names.push(format!("{name}/"));
+            } else {
+                names.push(name.to_string());
+            }
+        }
+        names.sort();
+        if names.is_empty() {
+            "(empty directory)".into()
+        } else {
+            let total = names.len();
+            names.truncate(40);
+            if total > 40 {
+                names.push(format!("… ({} more)", total - 40));
+            }
+            names.join(", ")
+        }
+    }
+
     fn system_prompt(&self) -> String {
         let platform = if cfg!(target_os = "android") {
             "Android (Termux)"
         } else {
             std::env::consts::OS
         };
+        if self.local.is_some() || self.options.uses_local() {
+            let mut prompt = format!(
+                "You are termed AI running on a local on-device ONNX model inside the termed code editor.\n\
+                 Project root: {}\n\
+                 Platform: {platform}\n\
+                 Workspace files in project root: {}\n\
+                 \n\
+                 Rules:\n\
+                 - Answer strictly from the conversation, the workspace file list above, and any file contents shown in the messages.\n\
+                 - You cannot execute tools, run shell commands, or read files from disk on your own in local ONNX mode.\n\
+                 - NEVER invent, guess, or fabricate filenames, directory listings, file contents, line counts, or command output.\n\
+                 - NEVER claim you read, checked, or verified a file unless its contents are shown verbatim in the conversation.\n\
+                 - If a file's contents are not shown in the conversation, name the real file from the workspace list and ask the user to open or select it in the editor.\n\
+                 - Give one direct, concise assistant reply and stop. Never write 'user:' or 'assistant:' dialogue turns.",
+                self.cwd.display(),
+                self.local_workspace_entries()
+            );
+            let configured = crate::skills::format_instructions(&self.options, &self.skill_context);
+            if !configured.is_empty() {
+                prompt.push_str("\n\n");
+                prompt.push_str(&configured);
+            }
+            return prompt;
+        }
         let capabilities = if self.options.read_only {
             "\n\n<capabilities>\n- Inspection only: you cannot create or modify files, run commands or invoke plugins. Inspect with list_files/read_file/search and report evidence; never claim an action ran.\n</capabilities>"
         } else {
@@ -637,13 +699,6 @@ impl Worker {
             prompt.push_str("\n\n");
             prompt.push_str(&configured);
         }
-        // Small on-device models are far weaker at tool calling than the
-        // remote provider, so state the limitation and how to reply.
-        if self.local.is_some() || self.options.uses_local() {
-            prompt.push_str(
-                "\n\n<local_inference>\n                 You are running on a small on-device model without reliable tool calling.\n                 - Answer from the conversation and files already shown above.\n                 - If you call a tool, call one at a time and wait for its result.\n                 - Be brief and concrete. If you cannot verify something, say so and name the file or command the user should run.\n                 </local_inference>",
-            );
-        }
         prompt
     }
 
@@ -673,7 +728,17 @@ impl Worker {
                         .strip_prefix(&self.cwd)
                         .map(|p| p.display().to_string())
                         .unwrap_or(path.to_string());
-                    context_notes.push(format!("Active editor file: {rel}"));
+                    if (self.local.is_some() || self.options.uses_local())
+                        && let Ok(safe) = crate::config::workspace_path(&self.cwd, &rel)
+                        && let Ok(content) = std::fs::read_to_string(&safe)
+                    {
+                        let snippet: String = content.chars().take(4096).collect();
+                        context_notes.push(format!(
+                            "Active editor file ({rel}):\n```\n{snippet}\n```"
+                        ));
+                    } else {
+                        context_notes.push(format!("Active editor file: {rel}"));
+                    }
                 }
                 Some("resource") => {
                     let r = b.get("resource").cloned().unwrap_or(Value::Null);
@@ -1020,7 +1085,8 @@ impl Worker {
             body["stream_options"] = stream_options;
         }
         // Some providers reject an empty tools array, so omit the key instead.
-        if !finalize && !schemas.is_empty() {
+        // Local ONNX inference does not execute tools, so omit the schema there too.
+        if !finalize && !schemas.is_empty() && self.local.is_none() {
             body["tools"] = json!(schemas);
         }
         let body = body.to_string();

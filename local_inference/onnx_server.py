@@ -39,7 +39,7 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 DEFAULT_MODEL = "onnx-community/SmolLM2-135M-Instruct"
 MAX_BODY_BYTES = 2 * 1024 * 1024
 MAX_OUTPUT_TOKENS = 8192
@@ -243,6 +243,25 @@ def path_like(model: str) -> bool:
     )
 
 
+def _find_installed_local_model(cache_dir: str) -> str | None:
+    """Locate an already-downloaded ONNX model on this machine when the Hub is unreachable."""
+    roots = [
+        cache_dir,
+        os.path.expanduser("~/.cache/aigallery"),
+    ]
+    for base in roots:
+        if not os.path.isdir(base):
+            continue
+        for root, dirs, files in os.walk(base):
+            depth = root[len(base):].count(os.sep)
+            if depth > 4:
+                dirs[:] = []
+                continue
+            if "tokenizer.json" in files and find_onnx_file(root):
+                return root
+    return None
+
+
 def resolve_model_dir(model: str, cache_dir: str) -> str:
     """Return a local directory containing the ONNX model + tokenizer."""
     if os.path.isdir(model):
@@ -271,15 +290,23 @@ def resolve_model_dir(model: str, cache_dir: str) -> str:
     if find_onnx_file(cache) and os.path.isfile(os.path.join(cache, "tokenizer.json")):
         return cache
     log(f"fetching model {model} into {cache}")
-    resolved_repo, wanted = _resolve_hf_repo(model)
-    if not any(n.endswith(".onnx") for n in wanted):
-        raise RuntimeError(f"model {model!r} has no .onnx files")
-    if "tokenizer.json" not in [os.path.basename(n) for n in wanted]:
-        raise RuntimeError(f"model {model!r} has no tokenizer.json")
-    for name in wanted:
-        dest = os.path.join(cache, name)
-        if not os.path.isfile(dest):
-            _download(f"{HUB}/{resolved_repo}/resolve/main/{name}", dest)
+    try:
+        resolved_repo, wanted = _resolve_hf_repo(model)
+        if not any(n.endswith(".onnx") for n in wanted):
+            raise RuntimeError(f"model {model!r} has no .onnx files")
+        if "tokenizer.json" not in [os.path.basename(n) for n in wanted]:
+            raise RuntimeError(f"model {model!r} has no tokenizer.json")
+        for name in wanted:
+            dest = os.path.join(cache, name)
+            if not os.path.isfile(dest):
+                _download(f"{HUB}/{resolved_repo}/resolve/main/{name}", dest)
+    except HubError as exc:
+        if model == DEFAULT_MODEL and HUB.startswith("https://"):
+            fallback = _find_installed_local_model(cache_dir)
+            if fallback:
+                log(f"Hub unreachable ({exc}); using installed local model {fallback}")
+                return fallback
+        raise
     return cache
 
 
@@ -329,15 +356,39 @@ def _content_text(content) -> str:
     return ""
 
 
+# Stop strings that mark the end of an assistant turn or the start of a
+# hallucinated user/assistant continuation.
+DEFAULT_STOP_STRINGS = (
+    "<|im_end|>",
+    "<|im_start|>",
+    "<|eot_id|>",
+    "<|end|>",
+    "<|endoftext|>",
+    "</local_inference>",
+    "<local_inference>",
+    "\nuser:",
+    "\nUser:",
+    "\nhuman:",
+    "\nHuman:",
+    "\nassistant:",
+    "\nAssistant:",
+)
+
+
 def render_chat(messages: list[dict], template: str | None) -> str:
     if template and "<|im_start|>" in template:
+        has_think = "<think>" in template
         parts = []
-        for m in messages:
-            parts.append(
-                f"<|im_start|>{m.get('role', 'user')}\n"
-                f"{_content_text(m.get('content', ''))}<|im_end|>\n"
-            )
-        parts.append("<|im_start|>assistant\n")
+        for i, m in enumerate(messages):
+            role = m.get("role", "user")
+            content = _content_text(m.get("content", ""))
+            if i == 0 and role == "system" and has_think and "/no_think" not in content:
+                content = f"/no_think\n{content}"
+            parts.append(f"<|im_start|>{role}\n{content}<|im_end|>\n")
+        if has_think:
+            parts.append("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+        else:
+            parts.append("<|im_start|>assistant\n")
         return "".join(parts)
     if template and "<|start_header_id|>" in template:
         parts = ["<|begin_of_text|>"]
@@ -347,6 +398,13 @@ def render_chat(messages: list[dict], template: str | None) -> str:
                 f"{_content_text(m.get('content', ''))}<|eot_id|>"
             )
         parts.append("<|start_header_id|>assistant<|end_header_id|>\n\n")
+        return "".join(parts)
+    if template and "<|user|>" in template:
+        parts = []
+        for m in messages:
+            role = m.get("role", "user")
+            parts.append(f"<|{role}|>\n{_content_text(m.get('content', ''))}<|end|>\n")
+        parts.append("<|assistant|>\n")
         return "".join(parts)
     if template and "[INST]" in template:
         parts = []
@@ -459,53 +517,104 @@ class OnnxEngine:
         log(f"model ready: {onnx_path} (past_key_values: {len(self.past_names)})")
 
     def _chat_template(self, model_dir: str) -> str | None:
-        path = os.path.join(model_dir, "tokenizer_config.json")
-        try:
-            with open(path, encoding="utf-8") as fh:
-                data = json.load(fh)
-            template = data.get("chat_template")
-            return template if isinstance(template, str) else None
-        except (OSError, ValueError):
-            return None
+        template: str | None = None
+        jinja_path = os.path.join(model_dir, "chat_template.jinja")
+        if os.path.isfile(jinja_path):
+            try:
+                with open(jinja_path, encoding="utf-8") as fh:
+                    template = fh.read()
+            except OSError:
+                pass
+        if not template:
+            for name in ("chat_template.json", "tokenizer_config.json", "genai_config.json"):
+                path = os.path.join(model_dir, name)
+                try:
+                    with open(path, encoding="utf-8") as fh:
+                        data = json.load(fh)
+                    raw = data.get("chat_template")
+                    if isinstance(raw, str) and raw.strip():
+                        template = raw
+                        break
+                    if isinstance(raw, list):
+                        for item in raw:
+                            if isinstance(item, dict) and isinstance(item.get("template"), str):
+                                template = item["template"]
+                                break
+                        if template:
+                            break
+                except (OSError, ValueError):
+                    continue
+        if not template:
+            # Infer the template format from the tokenizer's special tokens
+            # when an Olive / AI Gallery export omits `tokenizer_config.json`.
+            for marker in ("<|im_start|>", "<|start_header_id|>", "<|user|>"):
+                if self.tokenizer.token_to_id(marker) is not None:
+                    template = marker
+                    break
+        if (
+            template
+            and "<|im_start|>" in template
+            and "<think>" not in template
+            and self.tokenizer.get_vocab_size() > 256
+            and self.tokenizer.token_to_id("<think>") is not None
+            and self.tokenizer.token_to_id("</think>") is not None
+        ):
+            template = f"{template}\n<think></think>"
+        return template
 
     def _eos_ids(self, model_dir: str) -> list[int]:
         ids: list[int] = []
-        for name in ("config.json", "generation_config.json"):
+        for name in ("config.json", "generation_config.json", "genai_config.json"):
             try:
                 with open(os.path.join(model_dir, name), encoding="utf-8") as fh:
                     data = json.load(fh)
-                value = data.get("eos_token_id")
-                if isinstance(value, int):
-                    ids.append(value)
-                elif isinstance(value, list):
-                    ids.extend(v for v in value if isinstance(v, int))
+                for candidate in (
+                    data.get("eos_token_id"),
+                    (data.get("model") or {}).get("eos_token_id")
+                    if isinstance(data.get("model"), dict)
+                    else None,
+                ):
+                    if isinstance(candidate, int):
+                        ids.append(candidate)
+                    elif isinstance(candidate, list):
+                        ids.extend(v for v in candidate if isinstance(v, int))
             except (OSError, ValueError):
                 continue
         if not ids:
             eos = getattr(self.tokenizer, "eos_token_id", None)
             if isinstance(eos, int):
                 ids.append(eos)
+        if not ids or self.tokenizer.get_vocab_size() > 256:
+            for tok in ("<|im_end|>", "<|endoftext|>", "<|eot_id|>", "<|end|>", "</s>"):
+                tid = self.tokenizer.token_to_id(tok)
+                if isinstance(tid, int):
+                    ids.append(tid)
         return sorted(set(ids))
 
     def _past_shape(self, node_arg, model_dir: str) -> tuple[int, int, int, int]:
         shape = list(node_arg.shape or [])
         kv_heads = head_dim = None
-        try:
-            with open(os.path.join(model_dir, "config.json"), encoding="utf-8") as fh:
-                cfg = json.load(fh)
-            attn_heads = cfg.get("num_attention_heads")
-            kv_heads = cfg.get("num_key_value_heads") or attn_heads
-            hidden = cfg.get("hidden_size")
-            head_dim = cfg.get("head_dim")
-            if (
-                not isinstance(head_dim, int)
-                and attn_heads
-                and hidden
-                and hidden % attn_heads == 0
-            ):
-                head_dim = hidden // attn_heads
-        except (OSError, ValueError):
-            pass
+        for name in ("config.json", "genai_config.json"):
+            try:
+                with open(os.path.join(model_dir, name), encoding="utf-8") as fh:
+                    cfg = json.load(fh)
+                if isinstance(cfg.get("model"), dict):
+                    cfg = cfg["model"].get("decoder") or cfg["model"]
+                attn_heads = cfg.get("num_attention_heads")
+                kv_heads = cfg.get("num_key_value_heads") or attn_heads
+                hidden = cfg.get("hidden_size")
+                head_dim = cfg.get("head_dim") or cfg.get("head_size")
+                if (
+                    not isinstance(head_dim, int)
+                    and attn_heads
+                    and hidden
+                    and hidden % attn_heads == 0
+                ):
+                    head_dim = hidden // attn_heads
+                if kv_heads and head_dim:
+                    break
+            except (OSError, ValueError):
+                continue
 
         def dim(index: int, fallback: int | None) -> int:
             if index < len(shape) and isinstance(shape[index], int) and shape[index] >= 0:
@@ -538,10 +647,21 @@ class OnnxEngine:
     def decode(self, ids: list[int]) -> str:
         return self.tokenizer.decode(ids, skip_special_tokens=True)
 
-    def _pick(self, logits, temperature: float, top_p: float) -> int:
+    def _pick(
+        self,
+        logits,
+        temperature: float,
+        top_p: float,
+        seen_ids: list[int] | None = None,
+    ) -> int:
         np = self.np
         last = logits[0, -1, :] if getattr(logits, "ndim", 3) == 3 else logits[0, :]
-        row = last.astype(np.float64)
+        row = last.astype(np.float64).copy()
+        if seen_ids and row.shape[0] > 256:
+            penalty = 1.1
+            for tid in set(seen_ids[-64:]):
+                if 0 <= tid < row.shape[0]:
+                    row[tid] = row[tid] / penalty if row[tid] > 0 else row[tid] * penalty
         if temperature <= 0:
             return int(np.argmax(row))
         row = row / max(temperature, 1e-6)
@@ -569,6 +689,7 @@ class OnnxEngine:
         """Yield generated token ids one at a time."""
         np = self.np
         ids = list(prompt_ids)
+        prompt_len = len(prompt_ids)
         past: dict[str, object] = {}
         past_len = 0
         use_cache = bool(self.past_pairs)
@@ -612,7 +733,7 @@ class OnnxEngine:
                     for i, (in_name, _out_name) in enumerate(self.past_pairs)
                 }
                 past_len = total
-            token = self._pick(logits, temperature, top_p)
+            token = self._pick(logits, temperature, top_p, ids[prompt_len:])
             if token in self.eos_ids:
                 return
             ids.append(token)
@@ -899,32 +1020,56 @@ class Handler(BaseHTTPRequestHandler):
                        stop_strings, on_token=None):
         engine = state.engine
         assert engine is not None
+        active_stops = list(dict.fromkeys([
+            *(s for s in stop_strings if s),
+            *DEFAULT_STOP_STRINGS,
+        ]))
         generated: list[int] = []
+        emitted = 0
         text = ""
         finished = "length"
         for token in engine.generate_tokens(
             prompt_ids, max_tokens, temperature, top_p
         ):
             generated.append(token)
+            new_text = engine.decode(generated)
+            if new_text.lstrip().startswith("<think>"):
+                if "</think>" not in new_text:
+                    if len(generated) >= max_tokens:
+                        break
+                    continue
+                new_text = new_text.split("</think>", 1)[1].lstrip("\r\n")
+            hit_indices = [
+                new_text.find(s) for s in active_stops if s in new_text
+            ]
+            if hit_indices:
+                cut = min(hit_indices)
+                text = new_text[:cut]
+                if on_token is not None and len(text) > emitted:
+                    on_token(text[emitted:])
+                    emitted = len(text)
+                finished = "stop"
+                break
+            text = new_text
             if on_token is not None:
-                # Decode only the completion: the prompt must never be
-                # echoed back, and re-decoding it each token is wasteful.
-                new_text = engine.decode(generated)
-                delta = new_text[len(text):] if new_text.startswith(text) else new_text
-                text = new_text
-                if delta:
-                    on_token(delta)
+                hold = 0
+                for s in active_stops:
+                    max_k = min(len(s) - 1, len(text) - emitted)
+                    for k in range(max_k, 0, -1):
+                        if text.endswith(s[:k]):
+                            if k > hold:
+                                hold = k
+                            break
+                safe_end = len(text) - hold
+                if safe_end > emitted:
+                    on_token(text[emitted:safe_end])
+                    emitted = safe_end
             if len(generated) >= max_tokens:
                 break
         else:
             finished = "stop"
-        if on_token is None:
-            text = engine.decode(generated)
-        for stop in stop_strings:
-            if stop and stop in text:
-                text = text.split(stop, 1)[0]
-                finished = "stop"
-                break
+        if on_token is not None and len(text) > emitted:
+            on_token(text[emitted:])
         return text, finished, len(generated)
 
     def _complete(self, state, completion_id, created, prompt_ids,
