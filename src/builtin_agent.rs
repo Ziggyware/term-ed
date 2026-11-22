@@ -1480,9 +1480,11 @@ impl Worker {
             (None, Some(remote)) => {
                 let key = if remote.use_router_key {
                     crate::credentials::router_key()
-                        .map_err(|e| e.to_string())?
-                        .map(Some)
-                        .ok_or_else(|| "Router API key is not configured".to_string())
+                        .map_err(|e| e.to_string())
+                        .and_then(|k| {
+                            k.map(Some)
+                                .ok_or_else(|| "Router API key is not configured".to_string())
+                        })
                 } else {
                     Ok(None)
                 };
