@@ -608,7 +608,7 @@ impl Default for Preferences {
             agent:AgentConfig{backend:"builtin".into(),provider:"auto".into(),read_only:false,commands:CommandPolicy::Deny,plugins:false,max_steps:18,sub_agents:true,
                 instructions:"Coordinate a focused investigation. When useful, delegate distinct evidence-based tasks to reviewer and tester, passing relevant findings, scope and acceptance criteria. Collect every result before finishing, verify claims, and report disagreements, blockers and checks not run. Do not edit files or execute commands.".into(),..Default::default()},..Default::default()};
         Self {
-            version: 2,
+            version: 3,
             editor: EditorConfig::default(),
             search: SearchConfig::default(),
             agent: AgentConfig::default(),
@@ -657,7 +657,7 @@ pub fn valid_id(id: &str) -> bool {
 
 impl Preferences {
     pub fn validate(&self) -> Result<()> {
-        if !matches!(self.version, 1 | 2) {
+        if !matches!(self.version, 1 | 2 | 3) {
             bail!("Unsupported settings version {}", self.version);
         }
         self.agent.validate()?;
@@ -689,6 +689,7 @@ impl Preferences {
         let mut value = serde_json::to_value(Self::default())?;
         let mut selected_in_file = false;
         let mut legacy_schema = false;
+        let mut file_version = 3;
         // Existing per-project preferences are a migration source only. Once
         // user settings exist, old workspace files cannot override or break
         // the preferences chosen for all folders.
@@ -716,6 +717,10 @@ impl Preferences {
             legacy_schema = overlay
                 .get("version")
                 .is_none_or(|version| version.as_u64() == Some(1));
+            file_version = overlay
+                .get("version")
+                .and_then(Value::as_u64)
+                .unwrap_or(1) as u32;
             selected_in_file = overlay
                 .get("agent")
                 .and_then(Value::as_object)
@@ -742,15 +747,18 @@ impl Preferences {
             prefs.agent.provider = "auto".into();
             environment_agent = true;
         }
-        if !matches!(prefs.version, 1 | 2) {
+        if !matches!(prefs.version, 1 | 2 | 3) {
             bail!("Unsupported settings version {}", prefs.version);
         }
         migrate_removed_backend(&mut prefs.agent, !environment_agent, legacy_schema);
         for profile in &mut prefs.sub_agents {
             migrate_removed_backend(&mut profile.agent, false, legacy_schema);
         }
+        if file_version < 3 {
+            refresh_builtin_sub_agents(&mut prefs);
+        }
         canonicalize_providers(&mut prefs);
-        prefs.version = 2;
+        prefs.version = 3;
         prefs.validate()?;
         Ok(prefs)
     }
@@ -826,6 +834,24 @@ fn prepare_legacy_overlay(overlay: &mut Value) {
             }
         }
     }
+}
+
+/// Settings v3: sub-agents gained full write access. Settings files written
+/// by earlier versions carry a complete saved copy of the old read-only
+/// built-in profiles, and the settings merge replaces the profile list
+/// wholesale — without this refresh the new defaults would never reach
+/// existing installs. Built-in profile ids are reset to the current
+/// defaults exactly once, at the v2→v3 boundary; user-defined profiles are
+/// preserved, and edits to built-ins made afterwards persist as usual.
+fn refresh_builtin_sub_agents(prefs: &mut Preferences) {
+    let defaults = Preferences::default().sub_agents;
+    let mut refreshed: Vec<SubAgentConfig> = defaults.clone();
+    for p in &prefs.sub_agents {
+        if !defaults.iter().any(|d| d.id == p.id) {
+            refreshed.push(p.clone());
+        }
+    }
+    prefs.sub_agents = refreshed;
 }
 
 /// Normalize every stored provider value in place (legacy aliases never
@@ -1036,6 +1062,30 @@ mod command_policy_tests {
         deliberate.agent.provider = "auto".into();
         canonicalize_providers(&mut deliberate);
         assert_eq!(deliberate.agent.provider, "auto");
+    }
+
+    #[test]
+    fn v3_refresh_replaces_saved_read_only_builtins_and_keeps_custom_profiles() {
+        // Simulate a v2 settings file: the built-ins as they shipped
+        // (read-only, no worker profile) plus one user-defined profile.
+        let mut prefs = Preferences::default();
+        for p in &mut prefs.sub_agents {
+            p.agent.read_only = true;
+        }
+        prefs.sub_agents.retain(|p| p.id != "worker");
+        prefs.sub_agents.push(SubAgentConfig {
+            id: "mine".into(),
+            name: "Mine".into(),
+            ..Default::default()
+        });
+        refresh_builtin_sub_agents(&mut prefs);
+        assert_eq!(prefs.sub_agents.len(), 5);
+        assert_eq!(prefs.sub_agents[0].id, "worker");
+        for id in ["worker", "reviewer", "tester", "coordinator"] {
+            let p = prefs.sub_agents.iter().find(|p| p.id == id).unwrap();
+            assert!(!p.agent.read_only, "{id} must be writable after refresh");
+        }
+        assert!(prefs.sub_agents.iter().any(|p| p.id == "mine"));
     }
 
     #[test]
