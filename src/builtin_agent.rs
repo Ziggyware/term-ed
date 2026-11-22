@@ -282,7 +282,13 @@ fn tools_schema(options: &AgentConfig) -> Value {
         ),
         f(
             "write_file",
-            "Create a new text file or overwrite an existing text file completely. Parent directories are created automatically, so you can create files, folders and whole programs (any language, multi-file projects included) this way.",
+            "Create a new text file or overwrite an existing text file completely. Parent directories are created automatically, so you can create files, folders and whole programs (any language, multi-file projects included) this way. Keep content to at most ~6,000 characters per call: for a larger file, write the first chunk with write_file and add the rest with append_file, one chunk per call.",
+            json!({"path":{"type":"string"},"content":{"type":"string"}}),
+            &["path", "content"],
+        ),
+        f(
+            "append_file",
+            "Append content to the end of an existing text file, exactly as given (no newline is added). Use it to build a large file in chunks of at most ~6,000 characters: write_file for the first chunk, append_file for each following chunk. The file must already exist; use write_file to create it.",
             json!({"path":{"type":"string"},"content":{"type":"string"}}),
             &["path", "content"],
         ),
@@ -318,7 +324,7 @@ fn tools_schema(options: &AgentConfig) -> Value {
         !(options.read_only
             && matches!(
                 name,
-                "edit_file" | "write_file" | "run_command" | "run_code" | "local_inference"
+                "edit_file" | "write_file" | "append_file" | "run_command" | "run_code" | "local_inference"
             )
             || options.commands == CommandPolicy::Deny
                 && matches!(name, "run_command" | "run_code"))
@@ -925,6 +931,7 @@ impl Worker {
              - Stateless Subshell & Workspace Boundary: Every `run_command` executes in a fresh subshell fixed at the project root. Standalone `cd` commands do nothing, and navigating above the project root (`cd ..` or `../`) is strictly forbidden.\n\
              - Read Before Edit: Always read the target file with `read_file` (or `read_editor` for unsaved buffers) before calling `edit_file`.\n\
              - Surgical Edits: Prefer `edit_file` with a minimal, unique `old_text` (including 2-3 surrounding context lines) over rewriting whole files with `write_file`.\n\
+             - Chunked Output: Each of your replies has a hard output-token cap, and a reply that is cut off mid-tool-call is discarded whole. Fit output into smaller calls from the start: keep every write_file/append_file content to at most ~6,000 characters, building large files chunk by chunk (write_file first, then append_file), and prefer several small edit_file changes over one whole-file rewrite.\n\
              - Live Buffer Discipline: Plugin tools (`run_plugin`) mutate live unsaved editor buffers. Always inspect their returned buffer or call `read_editor`; never overwrite live plugin edits with stale disk content.\n\
              - Specialist & Skill Discovery: Use `list_skills`/`read_skill` when relevant domain skills exist, and `list_sub_agents`/`delegate_task` for focused parallel or specialist sub-tasks."
         };
@@ -1847,6 +1854,7 @@ impl Worker {
                 name,
                 "edit_file"
                     | "write_file"
+                    | "append_file"
                     | "run_command"
                     | "run_code"
                     | "run_plugin"
@@ -1878,6 +1886,7 @@ impl Worker {
             "search" => self.search(id, &s("pattern"), &s("path")),
             "edit_file" => self.edit_file(id, &s("path"), &s("old_text"), &s("new_text")),
             "write_file" => self.write_file(id, &s("path"), &s("content")),
+            "append_file" => self.append_file(id, &s("path"), &s("content")),
             "run_command" => self.run_command(id, &s("command")),
             "run_code" => self.run_code(id, a),
             "local_inference" => self.local_inference(id, &s("action"), &s("model")),
@@ -2320,6 +2329,33 @@ impl Worker {
             .map_err(|e| e.to_string())?;
         self.tool_end(id, true, vec![json!({"type":"diff","path":p.display().to_string(),"oldText":old,"newText":content})]);
         Ok(format!("Wrote {rel} ({} lines).", content.lines().count()))
+    }
+
+    /// Append one chunk to an existing file — the second half of the
+    /// chunked-write pattern (write_file creates chunk one, append_file
+    /// adds the rest), so a large file never has to fit in a single reply.
+    /// Governed like every other write.
+    fn append_file(&mut self, id: &str, path: &str, content: &str) -> Result<String, String> {
+        let p = self.resolve(path)?;
+        let rel = self.rel(&p);
+        self.govern_write(id, &rel, "append")?;
+        crate::document::ensure_text_target(&p).map_err(|e| e.to_string())?;
+        let (encoding, text) = read_text(&p).map_err(|e| {
+            if e.contains("No such file") || e.contains("cannot find") {
+                format!("append_file needs an existing file; use write_file to create {rel}")
+            } else {
+                e
+            }
+        })?;
+        self.tool_start(id, &format!("Append to {rel}"), "edit", Some(&p));
+        let updated = format!("{text}{content}");
+        std::fs::write(&p, crate::text_encoding::encode(encoding, &updated))
+            .map_err(|e| e.to_string())?;
+        self.tool_end(id, true, vec![json!({"type":"diff","path":p.display().to_string(),"oldText":text,"newText":updated})]);
+        Ok(format!(
+            "Appended {} lines to {rel}.",
+            content.lines().count()
+        ))
     }
 
     /// Ask the user (through the panel) to approve something.
@@ -3012,6 +3048,50 @@ mod tests {
     }
 
     #[test]
+    fn chunked_write_then_append_builds_a_file() {
+        let dir =
+            std::env::temp_dir().join(format!("termed-builtin-append-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut w = worker(&dir);
+        let r = w.run_tool(
+            "a1",
+            "write_file",
+            &json!({"path":"big.md","content":"# Title\n\nchunk one\n"}),
+        );
+        assert!(r.starts_with("Wrote"), "{r}");
+        let r = w.run_tool(
+            "a2",
+            "append_file",
+            &json!({"path":"big.md","content":"chunk two\n"}),
+        );
+        assert!(r.starts_with("Appended"), "{r}");
+        let r = w.run_tool(
+            "a3",
+            "append_file",
+            &json!({"path":"big.md","content":"chunk three\n"}),
+        );
+        assert!(r.starts_with("Appended"), "{r}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("big.md")).unwrap(),
+            "# Title\n\nchunk one\nchunk two\nchunk three\n"
+        );
+        // Appending to a file that does not exist points at write_file.
+        let r = w.run_tool(
+            "a4",
+            "append_file",
+            &json!({"path":"nope.md","content":"x"}),
+        );
+        assert!(r.contains("write_file"), "{r}");
+        // Appends are governed write orders: sensitive paths block.
+        let r = w.run_tool(
+            "a5",
+            "append_file",
+            &json!({"path":".env","content":"x"}),
+        );
+        assert!(r.contains("blocked by policy"), "{r}");
+    }
+
+    #[test]
     fn utf16_files_read_edit_and_write_preserve_encoding() {
         let dir = std::env::temp_dir().join(format!(
             "termed-builtin-utf16-{}",
@@ -3148,7 +3228,7 @@ mod configured_tests {
             Arc::new(AtomicBool::new(false)),
         );
         worker.options = options;
-        for name in ["edit_file", "write_file", "run_command", "run_plugin", "local_inference"] {
+        for name in ["edit_file", "write_file", "append_file", "run_command", "run_plugin", "local_inference"] {
             assert!(
                 worker
                     .run_tool("denied", name, &json!({}))
