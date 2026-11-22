@@ -633,6 +633,121 @@ impl Worker {
         }
     }
 
+    fn local_workspace_file_snippets(&self, prompt_text: &str) -> Vec<String> {
+        let mut combined = prompt_text.to_string();
+        for msg in self.history.iter().rev().take(4) {
+            if msg.get("role").and_then(Value::as_str) == Some("user")
+                && let Some(content) = msg.get("content").and_then(Value::as_str)
+            {
+                let user_part = content
+                    .split("<untrusted_workspace_context>")
+                    .next()
+                    .unwrap_or(content);
+                combined.push('\n');
+                combined.push_str(user_part);
+            }
+        }
+        let query = combined.to_ascii_lowercase();
+        let broad_inspection = [
+            "file", "files", "folder", "directory", "song", "songs", "lyric", "lyrics", "readme",
+            "review", "read", "list", "check", "what", "summary", "summarize",
+        ]
+        .iter()
+        .any(|kw| query.contains(kw));
+
+        let Ok(read_dir) = std::fs::read_dir(&self.cwd) else {
+            return Vec::new();
+        };
+        let mut candidates: Vec<(u32, String, PathBuf)> = Vec::new();
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if crate::credentials::is_private_path(&path) || !path.is_file() {
+                continue;
+            }
+            let Ok(meta) = path.metadata() else {
+                continue;
+            };
+            if meta.len() == 0 || meta.len() > 512 * 1024 {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let lower = name.to_ascii_lowercase();
+            let ext = Path::new(&lower)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            if matches!(
+                ext,
+                "mp3" | "mp4" | "wav" | "flac" | "ogg" | "m4a" | "aac" | "wma" | "avi" | "mkv"
+                    | "mov" | "webm" | "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico"
+                    | "pdf" | "zip" | "tar" | "gz" | "7z" | "rar" | "exe" | "dll" | "so"
+                    | "dylib" | "pdb" | "obj" | "o" | "a" | "lib" | "onnx" | "bin" | "pt"
+                    | "pth" | "safetensors" | "gguf" | "db" | "sqlite" | "sqlite3" | "wasm"
+                    | "pyc" | "class"
+            ) {
+                continue;
+            }
+            let mut score = 0u32;
+            if query.contains(&lower) {
+                score += 120;
+            }
+            for part in lower.split(|c: char| !c.is_ascii_alphanumeric()) {
+                if part.len() >= 3
+                    && !matches!(part, "txt" | "json" | "toml" | "yaml" | "yml" | "file")
+                    && query.contains(part)
+                {
+                    score += 45;
+                }
+            }
+            if broad_inspection
+                && matches!(
+                    ext,
+                    "md" | "lyrics" | "txt" | "rst" | "toml" | "json" | "yaml" | "yml" | "csv"
+                        | "ini" | "cfg" | "py" | "rs" | "js" | "ts" | "sh"
+                )
+            {
+                score += if matches!(ext, "md" | "lyrics" | "txt") {
+                    15
+                } else {
+                    5
+                };
+            }
+            if score > 0 {
+                candidates.push((score, name.to_string(), path));
+            }
+        }
+        candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+        let mut snippets = Vec::new();
+        let mut budget = 12_000usize;
+        for (score, name, path) in candidates.into_iter().take(6) {
+            if budget == 0 {
+                break;
+            }
+            let mut buf = Vec::new();
+            let Ok(file) = std::fs::File::open(&path) else {
+                continue;
+            };
+            if file.take(8192).read_to_end(&mut buf).is_err() || buf.contains(&0) {
+                continue;
+            }
+            let Ok(text) = String::from_utf8(buf) else {
+                continue;
+            };
+            let text = text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            let per_file_cap = if score >= 45 { 6000 } else { 2500 }.min(budget);
+            let excerpt: String = text.chars().take(per_file_cap).collect();
+            budget = budget.saturating_sub(excerpt.len());
+            snippets.push(format!("File contents (`{name}`):\n```\n{excerpt}\n```"));
+        }
+        snippets
+    }
+
     fn system_prompt(&self) -> String {
         let platform = if cfg!(target_os = "android") {
             "Android (Termux)"
@@ -647,11 +762,10 @@ impl Worker {
                  Workspace files in project root: {}\n\
                  \n\
                  Rules:\n\
-                 - Answer strictly from the conversation, the workspace file list above, and any file contents shown in the messages.\n\
-                 - You cannot execute tools, run shell commands, or read files from disk on your own in local ONNX mode.\n\
+                 - Referenced workspace text files and the active editor file are attached in `<untrusted_workspace_context>` inside the user messages. Read and answer directly from those file contents.\n\
+                 - If you need to read another file from the workspace whose contents are not yet shown, output `<tool_call>{{\"name\": \"read_file\", \"arguments\": {{\"path\": \"filename.ext\"}}}}</tool_call>` and wait for the tool response.\n\
                  - NEVER invent, guess, or fabricate filenames, directory listings, file contents, line counts, or command output.\n\
-                 - NEVER claim you read, checked, or verified a file unless its contents are shown verbatim in the conversation.\n\
-                 - If a file's contents are not shown in the conversation, name the real file from the workspace list and ask the user to open or select it in the editor.\n\
+                 - NEVER claim you read, checked, or verified a file unless its contents are shown in `<untrusted_workspace_context>` or a tool response.\n\
                  - Give one direct, concise assistant reply and stop. Never write 'user:' or 'assistant:' dialogue turns.",
                 self.cwd.display(),
                 self.local_workspace_entries()
@@ -660,6 +774,22 @@ impl Worker {
             if !configured.is_empty() {
                 prompt.push_str("\n\n");
                 prompt.push_str(&configured);
+            }
+            if self.options.auto_context
+                && self
+                    .history
+                    .last()
+                    .and_then(|m| m.get("content"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|c| !c.contains("File contents (`"))
+            {
+                let snippets = self.local_workspace_file_snippets("");
+                if !snippets.is_empty() {
+                    prompt.push_str(&format!(
+                        "\n\n<untrusted_workspace_context>\n{}\n</untrusted_workspace_context>",
+                        snippets.join("\n\n")
+                    ));
+                }
             }
             return prompt;
         }
@@ -750,6 +880,13 @@ impl Worker {
             }
         }
         let mut user_content = text.trim().to_string();
+        if (self.local.is_some() || self.options.uses_local()) && self.options.auto_context {
+            for snippet in self.local_workspace_file_snippets(&user_content) {
+                if !context_notes.iter().any(|existing| existing == &snippet) {
+                    context_notes.push(snippet);
+                }
+            }
+        }
         if !context_notes.is_empty() {
             user_content.push_str(&format!(
                 "\n\n<untrusted_workspace_context>\n{}\n</untrusted_workspace_context>",
@@ -2341,6 +2478,51 @@ mod configured_tests {
         // local_inference is available in read-only-looking schemas only via
         // the non-read-only branch; the read-only branch is checked above.
         assert!(!options.read_only);
+    }
+
+    #[test]
+    fn local_mode_attaches_referenced_workspace_text_files_and_skips_binaries() {
+        let dir = std::env::temp_dir().join(format!(
+            "termed-local-snippets-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("ffmpeg.readme.md"),
+            "# FFmpeg Audio Guide\nNormalize audio with loudnorm.",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("track01.lyrics"),
+            "Verse 1: Walking through the neon rain",
+        )
+        .unwrap();
+        std::fs::write(dir.join("track01.mp3"), b"\x00\x01\x02binary-mp3").unwrap();
+
+        let mut w = worker(&dir);
+        w.options.provider = "local".to_string();
+
+        let snippets = w.local_workspace_file_snippets("Please review the ffmpeg.readme.md file");
+        let joined = snippets.join("\n\n");
+        assert!(
+            joined.contains("File contents (`ffmpeg.readme.md`):"),
+            "{joined}"
+        );
+        assert!(joined.contains("Normalize audio with loudnorm."), "{joined}");
+        assert!(!joined.contains("track01.mp3"), "{joined}");
+
+        let sys = w.system_prompt();
+        assert!(sys.contains("<tool_call>"), "{sys}");
+        assert!(
+            !sys.contains("cannot execute tools, run shell commands, or read files"),
+            "{sys}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

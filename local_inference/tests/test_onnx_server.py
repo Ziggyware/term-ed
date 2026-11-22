@@ -745,6 +745,67 @@ class UnitTests(unittest.TestCase):
         # Generation stopped at ':' (index 7 -> 8 tokens), never running the tail.
         self.assertEqual(count, 8)
 
+    def test_render_chat_formats_tool_calls_and_tool_responses(self):
+        out = onnx_server.render_chat(
+            [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "read readme"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": '{"path":"ffmpeg.readme.md"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": "# FFmpeg README",
+                },
+            ],
+            "",
+        )
+        self.assertIn(
+            '<tool_call>{"name": "read_file", "arguments": {"path": "ffmpeg.readme.md"}}</tool_call>',
+            out,
+        )
+        self.assertIn("<tool_response>\n# FFmpeg README\n</tool_response>", out)
+
+    def test_generate_text_stops_after_closing_tool_call_tag(self):
+        pieces = [
+            '<tool_call>{"name": "read_file", ',
+            '"arguments": {"path": "ffmpeg.readme.md"}}',
+            "</tool_call>",
+            "\nhallucinated trailing text",
+        ]
+
+        class FakeEngine:
+            def generate_tokens(self, _prompt_ids, max_tokens, _temp, _top_p):
+                for i in range(min(max_tokens, len(pieces))):
+                    yield i
+
+            def decode(self, ids):
+                return "".join(pieces[i] for i in ids)
+
+        state = onnx_server.State("fake")
+        state.engine = FakeEngine()
+        handler = onnx_server.Handler.__new__(onnx_server.Handler)
+        text, finish, count = handler._generate_text(
+            state, [1], 20, 0.0, 1.0, []
+        )
+        self.assertEqual(
+            text,
+            '<tool_call>{"name": "read_file", "arguments": {"path": "ffmpeg.readme.md"}}</tool_call>',
+        )
+        self.assertEqual(finish, "stop")
+        self.assertEqual(count, 3)
+
 
 if __name__ == "__main__":
     unittest.main()
