@@ -12,125 +12,88 @@ A terminal code editor that looks and feels like the Visual Studio C# editor, fo
 
 Press `Ctrl+K A`, click **✦ Agent** in the title bar, or tap **✦** on a phone. Then ask in plain words, or tap one of the suggestions ("Find bugs in calc.py"). The agent can read and edit your project:
 
-- **Built-in by default, nothing to install.** termed AI is written in Rust and uses the [NoKey Router](https://nokey-router.ziggyware.deno.net) at its pinned `/v1` endpoint, with `free:code` as the default model. The client needs a router API key: choose **Settings → AI agent configuration → Save Router API Key** or run `termed --router-login` locally. See [router setup](docs/router-and-supervision.md). The agent can list, read, search, edit, create files and folders, and build whole programs. It also knows how to find installed software on the machine and run it (e.g. `cargo build`, `python`, `npx`), checking what is installed before assuming. Commands ask for your approval by default. Drag across the transcript to select text and copy it with Ctrl+C (Esc clears; the **📋** button copies the whole transcript). The **⤢** button expands the panel to fill the main window; Tab returns to the editor. Files are read as UTF-8 or UTF-16 (BOM-marked or detected), as are edits, search and writes — UTF-16 files keep their encoding on save.
-- **Settings follow you.** Menu changes save to your user configuration directory, so the same built-in AI, model and preferences are used when you open another folder. Legacy workspace settings are imported only if no user settings exist; read the [migration and safety notes](docs/agent-configuration.md#user-settings-and-migration).
-- **Local fallback when the router is down.** If the provider answers HTTP 503 (or another 5xx) — or rejects its key (HTTP 401/403) — the turn continues on an **on-device ONNX model** instead of failing: install `pip install -r local_inference/requirements.txt` once and the small default model runs through ONNX Runtime on your machine, with no key and no network. You can also ask the agent to download and start the local model for you (`local_inference`), or choose **Use Local ONNX Inference** or `termed --local` to use it all the time, `termed --local-serve` to run the server yourself, and `termed --local-prefetch` to download the model ahead of time. See [local ONNX inference](docs/local-inference.md).
-- **Free models are busy sometimes.** Availability, rate limits and tool support depend on the router and its upstreams. The agent reports provider failures; a model request fails only after the stall timeout passes with no bytes received (150 s default) or the task timeout elapses (5 min default); long streamed replies are not cut. Agent shell commands share the task timeout. Overwatch enforces a 150-second idle limit and a five-minute root deadline by default. Waiting for children or approval is not an idle stall. Tap the model name to choose another supported model.
-- **Privacy.** Your prompt, the open file and the files the agent reads are sent to the free model's provider. Free models may log or train on what they receive, so don't use them with secrets or confidential code.
-- **You stay in control.** The agent's edits appear in your open files as normal edits with change bars, and one Ctrl+Z (↶) reverts an edit. Diffs show inline in the chat, and tapping a change opens the file at that spot. If the agent asks permission to run a command, you tap Allow, Always allow, Reject or Never ask (or press 1–4). **Never ask** stops the prompts for the rest of the session and saves `allow` to your agent settings so later sessions do not ask either; commands the risk policy marks as destructive are still blocked. You can also set it directly with *Settings → AI agent configuration → Command permissions*.
-- **100 extra tools, still gated.** Beyond the six core tools, the built-in agent and MCP clients can call an extended toolkit of 100 schema-described host tools grouped as workspace, text, buffers, edit, filesystem, search, git, UI, code and session. They obey the same permissions: read-only agents never receive write tools, git tools disappear under `deny`, and destructive calls need a literal confirm token (`DELETE`, `APPLY` or `DISCARD`). Choose groups under *Settings → AI agent configuration → Toolkit groups*; empty means all ten and fewer groups means a shorter prompt. Edits to an open file change the live buffer, so they stay unsaved and undoable, and an agent can call `list_toolkit` to see exactly what it has.
-- **Context is automatic.** The open file, and your selection if there is one, are attached to every message (shown as `@ file.py:12-20` above the prompt). Unsaved files are saved first so the agent sees your latest code.
+- **Built-in by default.** Uses Kono Router `/v1` with `free:code` model; set API key in Settings or run `termed --router-login`. Agent can list, read, search, edit, create files and folders, and run commands. Files are UTF-8 or UTF-16.
+- **Settings follow you.** Settings save to your user config directory and are used across folders. Legacy workspace settings import only if no user settings exist.
+- **Local fallback when the router is down.** On HTTP 5xx or 401/403, the turn continues on an on-device ONNX model instead of failing: `pip install -r local_inference/requirements.txt` once, then run `termed --local` or use **Use Local ONNX Inference**.
+- **Free models are busy sometimes.** Availability and rate limits depend on the router. Requests fail after a 150 s stall timeout or 5 min task timeout; long streams aren't cut. Tap the model name to choose another.
+- **Privacy.** Your prompt, open file and files the agent reads are sent to the provider. Free models may log or train on what they receive, so don't use them with secrets or confidential code.
+- **You stay in control.** Edits appear with change bars; Ctrl+Z reverts. Command permissions: Allow, Always allow, Reject, Never ask (destructive commands still blocked).
+- **100 extra tools.** Extended host tools (10 groups: workspace, text, buffers, edit, filesystem, search, git, UI, code, session) with permission gating. Read-only agents get no write tools; destructive calls need a confirm token.
+- **Context is automatic.** The open file and selection attach to every message (shown as `@ file.py:12-20`).
 - **Esc or ■ stops the agent and its task tree.** Partial edits remain for review; Stop resets the provider session, so restate essential context before continuing. + New starts a fresh chat.
-- **Other agents work too.** Installed Gemini CLI (`gemini --acp`), Claude Code (`claude-agent-acp`) and Codex (`codex-acp`) can be selected with *Agent: Choose Agent*; they are not chosen automatically over the built-in agent and may require their own sign-in. Other ACP agents can be configured as a custom command. `TERMED_AGENT="command args"` supplies an explicit command when settings have not already selected a backend/provider.
+- **Other agents work too.** Gemini CLI, Claude Code and Codex can be selected via *Agent: Choose Agent*; they are not automatic and may need sign-in.
 - **On a phone** the panel is a full-screen sheet above the touch keyboard ([screenshot](docs/agent-phone.png)).
 
 ## On a phone
 
 ![termed on a 46-column phone screen: explorer drawer, wrapped C#, find, command palette](docs/mobile.png)
 
-termed adapts to phone terminals such as Termux, Blink, Termius and iSH. Below 80 columns it switches to a compact layout automatically; `--mobile` (or `TERMED_MOBILE=1`) forces it at any size. Rotating the device or resizing the window re-lays out the screen immediately.
+termed adapts to phone terminals (Termux, Blink, Termius, iSH). Below 80 columns it switches to compact layout automatically; `--mobile` forces it at any size. Resizing re-lays out immediately.
 
-- **Word wrap.** Long lines wrap, so you never scroll sideways. Wrapped rows keep the line's indent and get a `↪` marker in the gutter, and long expressions break at spaces, commas, brackets or before a `.`. `Alt+Z` or the **Wrap** button toggles it.
-- **Touch keyboard.** A fixed 2×9 grid of the keys a phone keyboard lacks, laid out like a laptop: modifiers on the left and an arrow cluster with ↑ above ↓ and ← → beside it. Every key always sits in the same place, so you can build muscle memory. **Fn** switches to an actions page (Copy, Cut, Paste, Save, Find, Replace, go to line, all commands, select all/line/word, comment, duplicate, move line, wrap). The keyboard stays on in Termux, Blink and a-Shell even in landscape; `--no-toolbar` hides it.
+- **Word wrap.** Long lines wrap so you never scroll sideways; `Alt+Z` toggles it.
+- **Touch keyboard.** A fixed 2×9 grid of laptop-style keys (modifiers left, arrows right). `--no-toolbar` hides it.
 
-  ![Touch keyboard states: one-shot Ctrl, locked Shift selecting, box selection, Fn page](docs/touch-keys.png)
-
-- **Sticky Ctrl / Alt / Shift.** A soft keyboard can't hold a modifier while you press another key, so the toolbar modifiers latch:
-  - **Tap once** and the key is tinted and underlined, and the status bar shows `CTRL+`. It applies to the **next key only**, whether you tap a toolbar key, type on the soft keyboard or tap the text.
-  - **Tap twice** and it is **locked** (solid) until you tap it again or press Esc.
-  - Modifiers combine. For example, Ctrl+Shift+→ selects a word, Alt+↑ moves the line up, Ctrl+`s` (typed on the soft keyboard) saves, and Ctrl locked lets you press → → → to jump word by word.
-  - **Locked Shift is selection mode** (status `SELECT`). Arrows, Home/End and taps extend the selection. Typing replaces the selection and ends the mode, and Copy or Cut also ends it.
-- **Box (column) selection.** Tap **Box**, which locks Alt+Shift, then use the arrows or tap a corner to draw a rectangle. The status bar shows `BOX 4×6`, and the box may extend past the end of short lines. Typing, Tab, Backspace and Delete apply to **every line** at once; short lines are padded with spaces. Copy and cut take the column, and pasting a column puts one line on each row. Tap **Box** or Esc to leave. On a hardware keyboard, use Visual Studio's `Alt+Shift+arrows` or Alt+drag with the mouse.
-- **Selection by touch.** Double-tap selects a word and triple-tap a line. Shift+tap (Shift latched, then tap) extends the selection to the tapped point.
-- **Explorer drawer.** ☰ slides the file tree over the editor. Tapping a file opens it and closes the drawer, and tapping outside dismisses it.
-- **Compact chrome.** The title bar has large ☰, ⌕ (open file) and ⋯ (commands) buttons, and tapping the file name opens quick open. The tab row appears only when more than one file is open. Breadcrumbs, the minimap and keyboard hints are hidden. The status bar drops lower-priority items first.
-- **Phone-sized overlays.** The command palette is edge to edge, the find/replace bar spans the full width, and dialog text wraps; dialog buttons stack when they don't fit side by side. The welcome screen is a list of large buttons.
-- **Gestures and keyboards.** Swipes scroll, a tap moves the cursor (including on wrapped rows), and you can drag the scrollbar. Keyboards that send LF for Return work as Enter.
+- **Sticky modifiers.** Tap once: modifier applies to next key only. Tap twice: locked until tapped again or Esc.
+- **Box selection.** Tap **Box**, lock Alt+Shift, draw a rectangle; typing/Tab/Delete apply to every line at once. Hardware keyboard: `Alt+Shift+arrows` or Alt+drag.
+- **Selection by touch.** Double-tap selects a word; triple-tap selects a line. Shift+tap extends selection.
+- **Explorer drawer.** ☰ slides the file tree over the editor; tapping outside dismisses it.
+- **Compact chrome.** Title bar shows ☰, ⌕ and ⋯ buttons; tab row appears only with multiple files; breadcrumbs, minimap and hints hidden.
+- **Phone-sized overlays.** Command palette and find/replace span full width; dialog buttons stack when needed; welcome screen is large buttons.
+- **Gestures and keyboards.** Swipes scroll, tap moves cursor, drag scrollbar; keyboards sending LF for Return work as Enter.
 
 ## Features
 
 **Visual Studio look**
-- A *Visual Studio Dark* theme with the VS 2022 C# editor colors (blue keywords, teal types, purple control flow, salmon strings, green comments, teal line numbers). The colors are mapped to TextMate scopes, so every language gets the same look.
-- Bracket-pair colorization (gold, orchid, blue) that ignores brackets inside strings and comments, plus matching-bracket highlight.
-- Indent guides, with the guide for the current block highlighted.
-- Change-tracking margin: green, blue and red bars mark lines added, modified or deleted since the last save.
-- Highlight references: other occurrences of the identifier under the caret are tinted.
-- A braille-dot **minimap** in syntax colors, and a scrollbar that doubles as an overview ruler showing find hits, changes and the caret.
-- Current-line highlight, a thin bar caret, selections that extend past end of line, and whitespace rendering inside selections.
-- Chrome: a title bar with a quick-open box, a Solution-Explorer style tree with file icons, tabs with dirty markers, breadcrumbs that show the enclosing class or function, and a clickable status bar.
-- Floating panels with rounded borders and drop shadows: command palette, quick open, theme picker with live preview, language picker, go-to-line, a save dialog and toast notifications.
-- 15 themes: Visual Studio Dark, Termed Studio (a layered, contrast-tested navy workbench), Termed Neon (a phosphor-green hacker theme), Dracula, Catppuccin, One Half Dark, Nord, Gruvbox, Solarized, Monokai and more.
+- *Visual Studio Dark* theme mapped to TextMate scopes; bracket-pair colorization; indent guides; change-tracking margin; highlight references; minimap; current-line highlight; change bars; whitespace rendering.
+- Chrome: title bar with quick-open, file tree, tabs, breadcrumbs, clickable status bar; floating panels with rounded borders and shadows.
+- 15 themes: Visual Studio Dark, Termed Studio, Termed Neon, Dracula, Catppuccin, One Half Dark, Nord, Gruvbox, Solarized, Monokai and more.
 **Editing**
-- Highlighting for 192 languages (C#, C/C++, Rust, Go, Python, TypeScript, Java, Kotlin, Swift, SQL, YAML, Markdown and more; run `termed --list-languages` for the full list).
-- Auto-indent, smart block expansion when you press Enter between braces, and auto-closing brackets and quotes with type-over.
-- Smart Home, word navigation, Ctrl+D to select the next occurrence, line move and duplicate, toggle comment for each language, and block indent and outdent.
-- Box (column) selection like Visual Studio: Alt+Shift+arrows or Alt+drag. Typing, Tab, Backspace and Delete edit every line of the column, and copy/paste work per line.
-- Undo and redo that group typing into words, like VS.
-- Find and replace with match case, whole word and regex options (including `$1` capture groups), plus replace-one and replace-all.
-- **Find in files** (`Ctrl+Shift+I`) and **Replace in Files** (`Ctrl+Shift+H`): pick the folder to search in the *root* box (empty = the project, `~/code/app` and `../other` work too), then filter with the *dirs* box (`src` scopes the search, `!bin;!obj` skips folders and everything under them) and the *files* box (`*.cs;!*.csproj`; `*`, `?`, `[...]` and `**` globs). Results are grouped by file with highlighted hits; `↑`/`↓` walk them, `Enter` opens one, clicking a file header collapses it. Replace All edits open files in memory (so `Ctrl+Z` undoes it and they stay unsaved) and writes the rest to disk; `$1` groups work in regex mode and `⇄` replaces a single hit. `.gitignore` is honored and binary or >2 MB files are skipped.
-- Copy with no selection copies the whole line, and pasting it inserts the line above, as in VS.
-- Clipboard works through OSC 52 (over SSH and in tmux) and through `wl-copy`, `xclip`, `xsel` or `pbcopy`.
-- Full mouse support: click, drag-select, double-click a word, triple-click a line, click the gutter to select a line, scroll, use tabs and the tree, drag the minimap or scrollbar, and resize the sidebar.
-- Large files stay responsive. Highlighting is incremental and runs within a time budget, so jumping to the end of a 100k-line file is instant: provisional colors appear first and exact colors fill in over the next frames.
+- Highlighting for 192 languages (`termed --list-languages` for the full list). Auto-indent, smart block expansion, auto-closing brackets/quotes, smart Home, word navigation, Ctrl+D for next occurrence, line move/duplicate, toggle comment, block indent/outdent.
+- Box selection (Alt+Shift+arrows or Alt+drag); undo/redo grouped into words; find/replace with case/whole word/regex (`$1` capture groups), replace-one/replace-all.
+- Find in files (`Ctrl+Shift+I`) and Replace in Files (`Ctrl+Shift+H`): root/dirs/files filters, `.gitignore` honored, results grouped by file, binary/>2 MB files skipped. Limit default 10,000 (max 100,000).
+- Copy with no selection copies whole line; paste inserts above (VS-style). Clipboard via OSC 52, wl-copy, xclip, xsel, pbcopy.
+- Full mouse support; incremental highlighting keeps large files responsive.
 
 ### Images, ZIPs and a richer interface
 
 ![Termed Studio displaying an image from inside an expanded ZIP](docs/studio-assets.png)
 
-- **Real image previews:** PNG, JPEG, GIF, WebP, BMP and ICO open on a read-only, theme-aware canvas with transparency, fit/zoom/pan and original-byte export. `+` / `-` zoom, arrows pan, `0` fits, `1` shows actual pixels (1:1); the controls also work by click/tap. SVG stays editable source. Kitty and iTerm2 terminals get native-resolution graphics; other terminals use the portable half-block renderer, whose resolution follows the terminal grid.
-- **ZIPs as folders and files:** expand a ZIP in Explorer to browse its virtual folders, edit text members and view image members without extracting. `Ctrl+S` saves a text member with a temporary-file rebuild and conflict checks. Select the ZIP and press **Shift+Enter** to open its read-only overview; Save As copies the archive itself. Text members can also be exported or saved as new members.
-- **Termed Studio:** an optional professional palette with layered navy surfaces, a restrained cool accent and readable secondary text. Try `termed -t "Termed Studio" .`, or choose it in the theme picker. Existing defaults are unchanged.
+- **Real image previews:** PNG, JPEG, GIF, WebP, BMP and ICO open read-only on a theme-aware canvas. SVG stays editable source. Kitty/iTerm2 get native graphics; other terminals use half-block rendering.
+- **ZIPs as folders:** expand a ZIP in Explorer, edit text members and view image members without extracting. `Ctrl+S` saves text members; Shift+Enter opens read-only overview.
+- **Termed Studio:** optional professional navy palette. `termed -t "Termed Studio" .` or choose in theme picker.
 
 See [images, archive safety, controls and UI/UX research](docs/assets-and-interface.md) for supported operations and limits, including encrypted/symlink archives, metadata caveats and native-graphics limitations. The screenshot is an actual headless application frame.
 
 ### Find in files
 
-`Ctrl+Shift+I` (or **Find in Files** in the command palette) opens the panel above the editor. Search runs asynchronously: the editor stays responsive, a live progress line shows scanned files/matches/skips and the current path, and **Stop** (or `Esc`) cancels. Results stream in as they are found, include unsaved editor buffers (even new or ignored files with a path), and are grouped by file: click a file header to collapse it, click a hit to open it. The result list is virtualized and capped by a configurable **Limit** (default 10,000, max 100,000) instead of a hidden per-file cap.
+`Ctrl+Shift+I` opens the find panel. Search runs asynchronously with live progress; **Stop** (`Esc`) cancels. Results group by file, click to open; virtualized list capped at configurable Limit (default 10,000, max 100,000).
 
-The targets are independently selectable: **Content**, **File names** and **Directory names** (`Alt+1` / `Alt+2` / `Alt+3`). **Skip binary (NUL)** (`Alt+b`) ignores any file containing a zero byte for content scans; file/directory-name targets still match those paths. The limit is persisted in user preferences (`search.max_results`) and can be edited in the panel (`Alt+l`), where an invalid value is rejected instead of silently clamped.
+Targets: Content, File names, Directory names (`Alt+1`/`Alt+2`/`Alt+3`). Skip binary NUL (`Alt+b`). Fields cycled with Tab: query, replace, root, dirs, files, limit.
 
-The fields are cycled with `Tab`: **query**, optional **replace**, **root** (empty means the project folder; absolute paths, `~` and relative paths such as `../other` are accepted), **dirs** (`src` searches only that folder, `!bin;!obj;!node_modules` skips those folders at any depth), **files** (`*.cs;!*.csproj`, with `*`, `?`, `[...]` and `**`) and **limit**. Directories are matched against the folder path, files against the name and the path tail, so `src/*.rs` works where it appears.
+Key table: `Tab`/`Shift+Tab` cycle fields; `↑`/`↓` move hits; `Enter` opens/replaces; `Ctrl+Enter` replace all; `Alt+Enter` replace in file; `Esc` stop or close.
 
-| Key | Action |
-| --- | --- |
-| `Tab` / `Shift+Tab` | Next / previous field |
-| `↑` / `↓`, `PgUp` / `PgDn` | Move through the hits |
-| `Enter` | Open the selected hit (in the replace box: replace it) |
-| `Ctrl+Enter` | Replace every hit |
-| `Ctrl+Shift+Enter` | Replace only the selected hit |
-| `Alt+Enter` | Replace every hit in the selected file |
-| `Alt+1` / `Alt+2` / `Alt+3` | Toggle content / file-name / directory-name targets |
-| `Alt+B` | Toggle skip-binary (NUL) |
-| `Alt+L` | Edit the result limit |
-| `Alt+C` / `Alt+W` / `Alt+R` | Toggle case sensitivity, whole word, regex |
-| `F5` | Re-run the search after changes made behind the panel |
-| `Esc` | Stop a running search, otherwise close the panel |
-
-Directory scopes also work below intermediate folders (`src`, `**/src`, `packages/*/src`). Explicit filters still apply to open buffers. Missing/inaccessible roots and filesystem errors are reported instead of silently returning an unexplained empty result. **Search** in the desktop title bar is an alternative to `Ctrl+Shift+I` for terminals that cannot distinguish shifted Ctrl keys.
-
-Regex mode supports capture groups in the replacement (`$1`, `${name}`). Matches inside a folder excluded by the filter are never touched, even by Replace All. Replacement requires a completed **Content** search and refuses truncated result lists; raise the limit or narrow the filters first. Content files are bounded to 16 MiB (2 MiB for replacement) and oversized files are reported as skips rather than silently searched.
+Regex supports `$1`/`${name}` capture groups; replacement requires completed Content search; files bounded to 16 MiB (2 MiB for replacement); oversized files reported as skips.
 
 ### Settings, AI configuration, sub-agents and skills
 
-Open **Settings** in the desktop title bar or press **Ctrl+,**. The command palette also has **Agent: Configure AI Agent**, **Agent: Manage Sub-agents** and **Skills: Manage Skills**; on a phone, open them through **⋯**. The agent panel's **⚙** button opens AI settings.
+Open **Settings** via title bar or `Ctrl+,`; command palette has Agent: Configure AI Agent, Manage Sub-agents, Skills: Manage Skills.
 
-- **Persistent user preferences:** display options plus AI backend, model, OpenAI-compatible API URL, API-key environment variable, instructions, context, step budgets and command/plugin permissions. Menu changes save to `$XDG_CONFIG_HOME/termed/settings.json` (normally `~/.config/termed/settings.json`) across folders.
-- **NoKey Router:** save the key through **Save Router API Key** in AI settings; this also selects the built-in router in user settings. The key stays in a separate private user-local file and is sent only to the pinned HTTPS router. Alternatively, run `termed --router-login` locally; `--router` is a launch-only override.
-- **On-the-fly functions:** agents can define schema-validated pure JSON/text transformation functions and call them immediately. These are task-scoped, resource-bounded implementations, not arbitrary generated code execution.
-- **AI plugin tools:** the AI can discover permitted plugins and request an exact command. Every invocation asks for approval, waits for the real result and returns messages plus live-buffer state. Edits stay undoable and unsaved. External ACP agents receive an authenticated stdio MCP bridge when they support MCP servers.
-- **Extended AI toolkit:** 100 host tools beyond read/edit/run, in ten switchable groups. `list_toolkit`, `describe_tool` and `session_summary` let an agent discover its own schemas and limits; `scratchpad_read`/`scratchpad_write` keep bounded notes for one editor session. Workspace paths are confined to the project, files open in the editor are edited as live buffers, and every scan, listing and response is size- and count-bounded.
-- **Configurable sub-agents:** create and manage isolated built-in specialists with their own role, model, skills, budgets and permissions. Reviewer, Test planner and Coordinator start read-only. The coordinator can delegate to grandchildren within depth, task and deadline limits; the visible overwatch ledger tracks every result and cancels orphaned subtrees.
-- **Managed skills:** create/edit, enable/disable, attach and remove Markdown instruction skills in `.termed/skills/<id>/SKILL.md`; user skills are discovered too. Enabled skills can be attached per agent or read on demand.
+- **Persistent user preferences:** AI backend, model, API URL, API key env var, instructions, context, budgets, permissions. Saved to `~/.config/termed/settings.json`.
+- **NoKey Router:** save key via **Save Router API Key**; key stays private and goes only to the pinned HTTPS router. Or run `termed --router-login`; `--router` is launch-only override.
+- **On-the-fly functions:** agents define schema-validated JSON/text transforms; task-scoped and resource-bounded, not arbitrary code execution.
+- **AI plugin tools:** AI discovers plugins and requests commands; every invocation asks approval; edits undoable/unsaved. External ACP agents get authenticated stdio MCP bridge.
+- **Extended AI toolkit:** 100 host tools in ten groups; `list_toolkit`/`describe_tool`/`session_summary` discover schemas; `scratchpad_read`/`scratchpad_write` keep notes; paths confined to project; edits are live buffers.
+- **Configurable sub-agents:** Reviewer, Test planner, Coordinator start read-only; coordinator delegates within depth/deadline limits; overwatch ledger tracks results and cancels orphaned subtrees.
+- **Managed skills:** create/edit/enable/disable Markdown skills in `.termed/skills/<id>/SKILL.md`; enabled skills attach per agent.
 
-See [router setup, supervised task trees and generated functions](docs/router-and-supervision.md), [local ONNX inference](docs/local-inference.md), [code intelligence](docs/code-intelligence.md), and [the configuration and safety guide](docs/agent-configuration.md) for settings JSON, provider setup, scope and limits. External ACP agents and plugins are trusted local processes, **not an OS sandbox**. [Ten additional feature proposals](docs/feature-roadmap.md) describe recommended next steps, not features implemented here.
+See [router setup](docs/router-and-supervision.md), [local ONNX](docs/local-inference.md), [code intelligence](docs/code-intelligence.md) and [configuration/safety](docs/agent-configuration.md). External ACP agents and plugins are trusted local processes, **not an OS sandbox**.
 
 ### Plugins
 
-- Add commands with a folder and a script, in any language. A plugin is a manifest plus a program that speaks JSON-RPC over stdin/stdout, so a Python, Node, Go or Rust script is a plugin; the palette gets its commands and the manifest can claim keybindings. The **Plugins** title-bar menu or `Ctrl+Alt+P` opens the plugin manager (commands, reload, reinstall the bundled set, enable/disable and AI access).
-- Reads VS Code extension manifests (`package.json` with `contributes.commands`), so `prettier-vscode`, `eslint` and friends appear in the manager with a clear reason when they need a bridge — and a one-line adapter makes them runnable.
-- **Code intelligence without a language server.** `Ctrl+Shift+Space` opens a context menu for the symbol under the caret: go to definition (`F12`), find all references (`Shift+F12`), inspect it (`Ctrl+F2`), rename it (`F2`, refused rather than guessed when ambiguous), extract the enclosing block, or sort/dedupe the selection. Nothing is installed and no daemon runs. See [code intelligence](docs/code-intelligence.md).
-- **Semantic and unattended search.** `Ctrl+Alt+F` ranks the project against your selection using an on-device ONNX encoder, so you find code that *does* the thing when you cannot remember its name. **Agent: Review the Project for Obvious Bugs** lists duplicate blocks, swallowed errors, unbalanced brackets and `TODO` markers — and applies nothing without approval; only high-confidence fixes can ever be applied unattended, and only if you opt in. See [code intelligence](docs/code-intelligence.md).
-- Five plugins ship in the binary: **markdown-preview** (**Markdown: Preview in Browser** renders the live buffer to a dark-mode page and opens it, or **Preview Here** shows it read-only in the editor), **text-tools** (`Ctrl+Alt+L` sorts lines, plus de-duplicate, trim, case, format/minify JSON), **todo** (`Ctrl+Alt+T` lists `TODO`/`FIXME` markers across the project), **stats** (words/characters/lines) and **git-info** (`Ctrl+Alt+G` branch and status). See [docs/plugins.md](docs/plugins.md).
+- **Add commands** with a manifest plus a JSON-RPC-over-stdio program; Python, Node, Go or Rust scripts are plugins. Plugin manager via title bar or `Ctrl+Alt+P`. VS Code manifests (`package.json` with `contributes.commands`) are supported with a one-line adapter.
+- **Code intelligence** without a language server: `Ctrl+Shift+Space` context menu for go to definition (`F12`), find references (`Shift+F12`), inspect (`Ctrl+F2`), rename (`F2`), extract block, sort/dedupe selection.
+- **Semantic search** (`Ctrl+Alt+F`) ranks the project via on-device ONNX encoder. **Agent: Review the Project for Obvious Bugs** lists duplicates, swallowed errors, unbalanced brackets, TODOs — applies nothing without approval.
+- Five bundled plugins: **markdown-preview** (preview browser/here), **text-tools** (`Ctrl+Alt+L`: sort, dedupe, trim, case, JSON format/minify), **todo** (`Ctrl+Alt+T`), **stats** (words/characters/lines), **git-info** (`Ctrl+Alt+G`).
 
 ## Install
 
@@ -143,101 +106,76 @@ termed -t "Termed Studio" release.zip/src/main.rs # open a ZIP member
 termed --mobile src/main.rs # force the phone layout
 ```
 
-On Android, install [Termux](https://termux.dev), run `pkg install rust git clang`, then `cargo install --path .`. The built-in AI agent also works there after router key setup.
+On Android: install [Termux](https://termux.dev), run `pkg install rust git clang`, then `cargo install --path .`. The built-in AI agent also works there after router key setup.
 
-Commands the AI runs use the machine's own shell: `/bin/sh` on Linux, macOS, the BSDs and Android/Termux, and on Windows `sh` when Git for Windows, MSYS2, Cygwin or WSL provides it, otherwise `cmd.exe`. The `bash.exe`/`wsl.exe` launcher stubs in `C:\Windows\System32` are never picked automatically — they relay to WSL instead of running a shell and fail with `WSL ... ERROR: CreateProcessCommon:...`. Set `TERMED_SHELL` to choose another one, for example `TERMED_SHELL="bash -c"` or `TERMED_SHELL="wsl bash -c"`.
+Commands the AI runs use the machine's own shell (`/bin/sh` on Linux/macOS, `sh` on Windows via Git Bash/MSYS2/Cygwin/WSL, else `cmd.exe`). Set `TERMED_SHELL` to choose another.
 
-You need a terminal with truecolor support to get the full look (Windows Terminal, iTerm2, WezTerm, kitty, Alacritty, GNOME Terminal and others). termed detects `COLORTERM=truecolor` and falls back to 256 colors when it isn't set; set `TERMED_TRUECOLOR=1` to force truecolor. Pass `--nerd-font` (or set `TERMED_NERD_FONT=1`) to use Nerd Font file icons.
+You need a terminal with truecolor support (Windows Terminal, iTerm2, WezTerm, kitty, Alacritty, GNOME Terminal and others); set `TERMED_TRUECOLOR=1` to force truecolor. Pass `--nerd-font` or set `TERMED_NERD_FONT=1` for Nerd Font file icons.
 
 ## Keybindings
 
 | Action | Keys |
 |---|---|
-| Quick open file | `Ctrl+P` |
+| Quick open | `Ctrl+P` |
 | Command palette | `Ctrl+Shift+P`, `F1` |
-| Save / save as / save all | `Ctrl+S` / `Ctrl+Alt+S` / `Ctrl+K S` |
+| Save / save all | `Ctrl+S` / `Ctrl+K S` |
 | New file / close tab / quit | `Ctrl+N` / `Ctrl+W` / `Ctrl+Q` |
-| Next / previous tab, tab *n* | `Ctrl+PgDn` / `Ctrl+PgUp`, `Alt+1…9` |
+| Next / previous tab | `Ctrl+PgDn` / `Ctrl+PgUp` |
 | Toggle / focus explorer | `Ctrl+B` / `Ctrl+E` |
-| ZIP: expand / open as file (Explorer) | `Enter` or `Right` / `Shift+Enter` |
-| Image: zoom / pan / fit | `+` and `-` / arrows / `0` or `Home` |
-| Find / replace / next / previous | `Ctrl+F` / `Ctrl+H` / `F3` / `Shift+F3` |
-| Find / replace in files | `Ctrl+Shift+I` / `Ctrl+Shift+H` |
+| Find / replace | `Ctrl+F` / `Ctrl+H` / `F3` / `Shift+F3` |
+| Find in files | `Ctrl+Shift+I` / `Ctrl+Shift+H` |
 | Plugin manager | `Ctrl+Alt+P` |
 | Settings | `Ctrl+,` |
-| Bundled plugins: sort lines / TODOs / git status | `Ctrl+Alt+L` / `Ctrl+Alt+T` / `Ctrl+Alt+G` |
+| Bundled plugins: sort / TODOs / git status | `Ctrl+Alt+L` / `Ctrl+Alt+T` / `Ctrl+Alt+G` |
 | Markdown: preview in browser / preview here | `Ctrl+Shift+M` / command palette |
-| Find options: case, word, regex | `Alt+C`, `Alt+W`, `Alt+R` |
-| Go to line (`line:col`) | `Ctrl+G` |
-| Go to matching bracket | `Ctrl+\` |
-| Context menu (refactor, inspect, definitions) | `Ctrl+Shift+Space` |
-| Go to definition / find references | `F12` / `Shift+F12` |
-| Rename symbol / inspect symbol | `F2` / `Ctrl+F2` |
-| Find related code (semantic) | `Ctrl+Alt+F` |
-| Undo / redo | `Ctrl+Z` / `Ctrl+Y`, `Ctrl+Shift+Z` |
-| Cut / copy / paste | `Ctrl+X` / `Ctrl+C` / `Ctrl+V`, `Shift+Insert`, or `Alt+V` |
-| Select all / line / next occurrence | `Ctrl+A` / `Ctrl+L` / `Ctrl+D` |
-| Toggle comment | `Ctrl+/` |
-| Move line(s) up / down | `Alt+Up` / `Alt+Down` |
-| Duplicate line(s) | `Ctrl+Shift+D` |
-| Box (column) selection | `Alt+Shift+arrows`, Alt+drag |
-| Delete line | `Ctrl+Shift+K` |
-| Insert line below / above | `Ctrl+Enter` / `Ctrl+Shift+Enter` |
-| Indent / outdent | `Tab` / `Shift+Tab`, `Ctrl+]` / `Ctrl+[` |
-| Delete word left / right | `Ctrl+Backspace` or `Alt+Backspace` / `Ctrl+Delete` |
-| Color theme picker / next theme | `Ctrl+K T` / `F8` |
-| Language mode | `Ctrl+K Ctrl+M` |
-| Toggle minimap / whitespace / indent guides / line numbers | `Ctrl+K M` / `W` / `I` / `L` |
-| Toggle word wrap | `Alt+Z` |
 | AI agent panel | `Ctrl+K A` |
 
-In the command menu (`F1`), press `Alt` plus a highlighted letter to run its action. For example, `Alt+O` opens Go to File, `Alt+S` saves, and `Alt+A` opens AI settings. Typing the letter alone still searches the menu. For multiline paste, use `Alt+V` if your terminal intercepts `Ctrl+V` and sends pasted text as individual keystrokes instead of a bracketed paste.
+In the command menu (`F1`), press `Alt` plus a highlighted letter to run its action. For example, `Alt+O` opens Go to File, `Alt+S` saves, and `Alt+A` opens AI settings. Typing the letter alone still searches the menu.
 
-Some combinations (Ctrl+Shift+…, Ctrl+Enter, Ctrl+[) can only be told apart in terminals that support the kitty keyboard protocol, which termed turns on when it is available. In other terminals, Ctrl+Backspace arrives as Ctrl+H (Replace), so use Alt+Backspace to delete a word. Every command can also be run from the command palette.
+Some Ctrl+Shift+ combinations work only with kitty keyboard protocol support; in other terminals Ctrl+Backspace arrives as Ctrl+H (Replace). Use Alt+Backspace to delete a word. Every command runs from the command palette too.
 
-## Architecture: the library behind each part
+## Architecture
 
-| Concern | Library | Why |
-|---|---|---|
-| Rendering | [ratatui](https://ratatui.rs) | Diffed cell-buffer rendering, so only changed cells are redrawn. The editor paints straight into the buffer to control every cell. |
-| Terminal I/O | [crossterm](https://github.com/crossterm-rs/crossterm) | Cross-platform; supports mouse, bracketed paste, the kitty keyboard protocol and caret shape. |
-| Text buffer | [ropey](https://github.com/cessen/ropey) | Rope with O(log n) edits and line indexing, the same structure Helix uses. |
-| Syntax highlighting | [syntect](https://github.com/trishume/syntect) + [two-face](https://github.com/CosmicHorrorDev/two-face) | Sublime Text / TextMate grammars with bat's extended set of 192 languages, the same grammar format VS Code uses. |
-| Fuzzy matching | [nucleo-matcher](https://github.com/helix-editor/nucleo) | The fzf-quality matcher from Helix, used for quick open and the palette. |
-| File tree | [ignore](https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore) | ripgrep's walker; respects `.gitignore`. |
-| Image preview | [image](https://github.com/image-rs/image) | Bounded decoding, EXIF orientation, premultiplied viewport sampling, native Kitty/iTerm2 graphics with half-block fallback. |
-| ZIP folders | [zip](https://github.com/zip-rs/zip2) | Virtual member paths, bounded reads and atomic container replacement. |
-| Change margin | [similar](https://github.com/mitsuhiko/similar) | Fast line diff against the saved file. |
-| Find / replace | [regex](https://github.com/rust-lang/regex) + [ignore](https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore) + [memchr](https://github.com/BurntSushi/memchr) | Parallel cancellable walk, batched streaming results, SIMD NUL detection and linear-time regex replacement. |
-| AI agents | [Agent Client Protocol](https://agentclientprotocol.com) + [serde_json](https://github.com/serde-rs/json) + [ureq](https://github.com/algesten/ureq) | ACP is the open standard Zed and JetBrains use for coding agents. ureq (with rustls and bundled root certificates) lets the built-in agent reach free models from anywhere, including Android. |
-| Text width | [unicode-width](https://github.com/unicode-rs/unicode-width) | Correct columns for CJK and wide characters. |
-| Plugins | JSON-RPC 2.0 over stdio | Line-delimited JSON, the same transport as LSP and ACP, so any language can be a plugin. See [docs/plugins.md](docs/plugins.md). |
+| Concern | Library |
+|---|---|
+| Rendering | [ratatui](https://ratatui.rs) — diffed cell-buffer rendering |
+| Terminal I/O | [crossterm](https://github.com/crossterm-rs/crossterm) — cross-platform, mouse, bracketed paste, kitty protocol |
+| Text buffer | [ropey](https://github.com/cessen/ropey) — rope with O(log n) edits |
+| Syntax highlighting | [syntect](https://github.com/trishume/syntect) + [two-face](https://github.com/CosmicHorrorDev/two-face) — 192 languages |
+| Fuzzy matching | [nucleo-matcher](https://github.com/helix-editor/nucleo) — fzf-quality |
+| File tree | [ignore](https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore) — ripgrep walker |
+| Image preview | [image](https://github.com/image-rs/image) — bounded decoding, Kitty/iTerm2 native graphics |
+| ZIP folders | [zip](https://github.com/zip-rs/zip2) — virtual member paths, bounded reads |
+| Change margin | [similar](https://github.com/mitsuhiko/similar) — fast line diff |
+| Find / replace | [regex](https://github.com/rust-lang/regex) + [ignore](https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore) + [memchr](https://github.com/BurntSushi/memchr) |
+| AI agents | [Agent Client Protocol](https://agentclientprotocol.com) + [serde_json](https://github.com/serde-rs/json) + [ureq](https://github.com/algesten/ureq) |
+| Text width | [unicode-width](https://github.com/unicode-rs/unicode-width) |
+| Plugins | JSON-RPC 2.0 over stdio |
 
 Source layout:
-
 ```
 src/
-  document.rs     text/preview documents, archive-aware saves and safe exports
-  image_view.rs   bounded image decoding, fit/zoom/pan and viewport cache
-  archive.rs      ZIP indexing, virtual folders, member reads and conflict-safe writes
-  editor.rs       caret/selection model, soft wrap and VS-style editing commands
-  highlight.rs    incremental, time-budgeted highlighting + string-aware bracket analysis
-  theme.rs        Visual Studio Dark / Termed Studio / Termed Neon + bundled palettes
-  agent.rs        Agent Client Protocol client: launches the agent, JSON-RPC, chat model, free-model failover
-  builtin_agent.rs  built-in agent: free models over an OpenAI-compatible API, file/search/command tools
-  shell.rs        picks the host shell (sh on POSIX, Git Bash or cmd.exe on Windows) for AI commands
+  document.rs     text/preview documents, archive-aware saves, safe exports
+  image_view.rs   bounded image decoding, fit/zoom/pan, viewport cache
+  archive.rs      ZIP indexing, virtual folders, member reads/writes
+  editor.rs       caret/selection model, soft wrap, VS-style commands
+  highlight.rs    incremental highlighting + string-aware bracket analysis
+  theme.rs        Visual Studio Dark / Termed Studio / Termed Neon + palettes
+  agent.rs        Agent Client Protocol client, JSON-RPC, chat model
+  builtin_agent.rs  free models over OpenAI-compatible API, file/search/command tools
+  shell.rs        picks host shell for AI commands
   search.rs       find/replace in files: roots, glob filters, walk, replacements
   plugin.rs       plugin host: manifests, JSON-RPC subprocesses, discovery, manager
-  config.rs       validated user preferences, legacy migration and inherited agent restrictions
-  management.rs   settings, plugin, specialist and skill menus
-  skills.rs       Markdown skill discovery, management and prompt context
-  automation.rs   approved plugin tools, pinned buffers and bounded specialist sessions
+  config.rs       validated user preferences, legacy migration
+  management.rs   settings, plugin, specialist, skill menus
+  skills.rs       Markdown skill discovery, management, prompt context
+  automation.rs   approved plugin tools, pinned buffers, bounded specialist sessions
   tool_bridge.rs  authenticated live-editor MCP relay for external ACP agents
   toolkit.rs      100 capability-gated host tools: workspace, text, buffers, edits, files, search, git
   app.rs          state, key/mouse handling, palette, find/replace, dialogs
   ui/             title bar, explorer/drawer, tabs, code view, minimap, toolbar, overlays
 examples/
-  snapshot.rs     renders frames to HTML headlessly (used for the screenshots)
+  snapshot.rs     renders frames to HTML headlessly
 plugins/
   text-tools/ todo/ stats/ git-info/   bundled plugins, embedded into the binary
 ```
@@ -245,11 +183,10 @@ plugins/
 ## Development
 
 ```sh
-cargo test --locked         # includes image/ZIP/contrast, phone/touch and scripted agent tests
+cargo test --locked         # includes image/ZIP/contrast, phone/touch, scripted agent tests
 cargo clippy --all-targets
-# Render a frame to HTML, replaying keystrokes, taps and swipes:
+# Render a frame to HTML:
 cargo run --example snapshot -- out.html 150x42 "Visual Studio Dark" . src/main.rs -- ctrl+p text:editor
-cargo run --example snapshot -- phone.html 46x30 "Visual Studio Dark" . src/main.rs -- tap:1,0 swipeup:20,10 resize:100x24
 ```
 
-Tests use Python 3 for local ACP/provider fixtures; some HTTPS integration tests also require OpenSSL. Run the locked build and tests on each target platform before release.
+Tests use Python 3 for local ACP/provider fixtures; some HTTPS tests also need OpenSSL. Run locked build and tests on each target platform before release.
