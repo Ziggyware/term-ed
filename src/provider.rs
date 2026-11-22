@@ -79,6 +79,8 @@ pub fn local_endpoint(options: &AgentConfig) -> String {
 pub fn endpoint(options: &AgentConfig) -> String {
     if options.uses_router() {
         ROUTER_ENDPOINT.into()
+    } else if options.uses_kono() {
+        KONO_ENDPOINT.into()
     } else if options.uses_local() {
         local_endpoint(options)
     } else if options.endpoint.is_empty() {
@@ -131,6 +133,20 @@ pub fn router_models() -> Vec<(String, String)> {
         ("free:smart", "Router · Smart"),
         ("free:reasoning", "Router · Reasoning"),
         ("openrouter/free", "Router · OpenRouter free"),
+    ]
+    .into_iter()
+    .map(|(id, name)| (id.into(), name.into()))
+    .collect()
+}
+
+pub fn kono_models() -> Vec<(String, String)> {
+    [
+        ("free:tools", "Kono · Tools & Coding (default)"),
+        ("free:code", "Kono · Coding"),
+        ("free:fast", "Kono · Fast"),
+        ("free:auto", "Kono · Automatic"),
+        ("free:smart", "Kono · Smart"),
+        ("free:reasoning", "Kono · Reasoning"),
     ]
     .into_iter()
     .map(|(id, name)| (id.into(), name.into()))

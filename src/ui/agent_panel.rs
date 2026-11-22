@@ -749,10 +749,13 @@ fn build_rows(app: &App, w: usize, panel_bg: Color) -> Vec<Row> {
     if working && !a.entries.is_empty() {
         let secs = a.turn_started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
         rows.push(Row::blank());
-        rows.push(Row::text(
-            format!("{} {name} is working… {secs}s", spinner()),
-            Style::default().fg(pal.accent),
-        ));
+        let status_line = match a.status_text.as_deref().filter(|s| !s.trim().is_empty()) {
+            Some(detail) => format!("{} {name} is working · {detail} ({secs}s)", spinner()),
+            None => format!("{} {name} is working… {secs}s", spinner()),
+        };
+        for l in wrap_text(&status_line, w) {
+            rows.push(Row::text(l, Style::default().fg(pal.accent)));
+        }
     } else if let Some((used, _, cost)) = a.usage {
         let price = if cost == 0.0 {
             "free".to_string()
