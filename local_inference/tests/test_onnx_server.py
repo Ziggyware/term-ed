@@ -646,6 +646,51 @@ class UnitTests(unittest.TestCase):
         self.assertTrue(onnx_server.path_like("~/onnx"))
         self.assertFalse(onnx_server.path_like("onnx-community/SmolLM2-135M-Instruct"))
 
+    def test_pair_kv_cache_matches_present_outputs_to_past_key_values_inputs(self):
+        past_names = [
+            "past_key_values.0.key",
+            "past_key_values.0.value",
+            "past_key_values.1.key",
+            "past_key_values.1.value",
+        ]
+        present_outputs = [
+            "logits",
+            "present.0.key",
+            "present.0.value",
+            "present.1.key",
+            "present.1.value",
+        ]
+        self.assertEqual(
+            onnx_server._pair_kv_cache(past_names, present_outputs),
+            [
+                ("past_key_values.0.key", "present.0.key"),
+                ("past_key_values.0.value", "present.0.value"),
+                ("past_key_values.1.key", "present.1.key"),
+                ("past_key_values.1.value", "present.1.value"),
+            ],
+        )
+
+    def test_select_onnx_files_picks_one_preferred_variant_and_its_data(self):
+        names = [
+            "onnx/model.onnx",
+            "onnx/model.onnx_data",
+            "onnx/model_fp16.onnx",
+            "onnx/model_quantized.onnx",
+            "onnx/model_quantized.onnx.data",
+            "onnx/model_q4.onnx",
+        ]
+        self.assertEqual(
+            onnx_server._select_onnx_files(names),
+            {"onnx/model_quantized.onnx", "onnx/model_quantized.onnx.data"},
+        )
+
+    def test_onnx_community_repo_falls_back_to_suffixed_hub_repo_on_401(self):
+        candidates = onnx_server._hf_repo_candidates(
+            "onnx-community/SmolLM2-135M-Instruct"
+        )
+        self.assertIn("onnx-community/SmolLM2-135M-Instruct-ONNX", candidates)
+        self.assertIn("HuggingFaceTB/SmolLM2-135M-Instruct", candidates)
+
 
 if __name__ == "__main__":
     unittest.main()

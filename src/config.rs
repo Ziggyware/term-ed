@@ -195,7 +195,9 @@ impl AgentConfig {
                 let remote = self.model == crate::provider::ROUTER_MODEL
                     || self.model == crate::builtin_agent::DEFAULT_MODEL
                     || self.model == crate::provider::KONO_MODEL
-                    || self.model.ends_with(":free");
+                    || self.model.ends_with(":free")
+                    || self.model.starts_with("free:")
+                    || self.model == "openrouter/free";
                 if remote {
                     self.model.clear();
                 }
@@ -794,9 +796,23 @@ fn prepare_legacy_overlay(overlay: &mut Value) {
 /// Normalize every stored provider value in place (legacy aliases never
 /// persist). Deliberately retained values (`auto`) pass through untouched.
 fn canonicalize_providers(prefs: &mut Preferences) {
-    prefs.agent.provider = AgentConfig::canonical_provider(&prefs.agent.provider);
+    fn clean_agent(agent: &mut AgentConfig) {
+        agent.provider = AgentConfig::canonical_provider(&agent.provider);
+        if agent.uses_local() && matches!(agent.backend.as_str(), "builtin" | "auto") {
+            let remote = agent.model == crate::provider::ROUTER_MODEL
+                || agent.model == crate::builtin_agent::DEFAULT_MODEL
+                || agent.model == crate::provider::KONO_MODEL
+                || agent.model.ends_with(":free")
+                || agent.model.starts_with("free:")
+                || agent.model == "openrouter/free";
+            if remote {
+                agent.model.clear();
+            }
+        }
+    }
+    clean_agent(&mut prefs.agent);
     for profile in &mut prefs.sub_agents {
-        profile.agent.provider = AgentConfig::canonical_provider(&profile.agent.provider);
+        clean_agent(&mut profile.agent);
     }
 }
 

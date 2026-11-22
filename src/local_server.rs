@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 /// Must match `__version__` in `local_inference/onnx_server.py`.
-pub const SERVER_VERSION: &str = "1.0.0";
+pub const SERVER_VERSION: &str = "1.1.0";
 const SERVER_SOURCE: &str = include_str!("../local_inference/onnx_server.py");
 /// Model downloaded on first use when none is configured.
 pub const DEFAULT_MODEL: &str = "onnx-community/SmolLM2-135M-Instruct";
@@ -131,17 +131,24 @@ fn advertised_model(list: &Value) -> Option<String> {
 }
 
 /// `POST /admin/shutdown`, used to retire a server from another termed
-/// version before starting the embedded one.
+/// version (or a failed load) before starting the embedded one.
 fn shutdown(http: &ureq::Agent, endpoint: &str) {
-    let _ = http
-        .post(format!("{endpoint}/admin/shutdown"))
-        .config()
-        .timeout_per_call(Some(Duration::from_secs(2)))
-        .build()
-        // Bodyless POST: `RequestBuilder<WithBody>` has `send`, not `call`
-        // (ureq 3.x). An empty JSON object keeps the request simple; the
-        // server ignores the body for this route.
-        .send("{}");
+    let mut urls = vec![format!("{endpoint}/admin/shutdown")];
+    if let Some(root) = endpoint.strip_suffix("/v1") {
+        // Older 1.0.0 servers only routed `/admin/shutdown` at the root.
+        urls.push(format!("{root}/admin/shutdown"));
+    }
+    for url in urls {
+        let _ = http
+            .post(url)
+            .config()
+            .timeout_per_call(Some(Duration::from_secs(2)))
+            .build()
+            // Bodyless POST: `RequestBuilder<WithBody>` has `send`, not `call`
+            // (ureq 3.x). An empty JSON object keeps the request simple; the
+            // server ignores the body for this route.
+            .send("{}");
+    }
 }
 
 /// Ask the running server which model it loaded.
@@ -209,6 +216,13 @@ fn wait_ready<F: Fn() -> bool, P: Fn(Duration)>(
                 return Ok(running_model(http, endpoint).unwrap_or_else(|| model.to_string()));
             }
             if let Some(error) = ready_error(&info) {
+                if let Some(mut c) = child {
+                    // Never leave a failed server bound to the port where it
+                    // would answer 503 to every later session.
+                    shutdown(http, endpoint);
+                    let _ = c.kill();
+                    let _ = c.wait();
+                }
                 return Err(format!(
                     "Local ONNX server failed to load {model}: {error}. See {}",
                     log_path().display()
@@ -267,24 +281,43 @@ pub fn ensure_running<F: Fn() -> bool, P: Fn(Duration)>(
     cancelled: F,
     progress: P,
 ) -> Result<String, String> {
-    let model = model_for(model);
+    let trimmed = model.trim();
+    let model = model_for(trimmed);
+    let explicit_model = !trimmed.is_empty() && trimmed != DEFAULT_MODEL && model == trimmed;
+    let is_loopback = loopback_host_port(endpoint).is_some();
+    if is_loopback {
+        let _ = materialize();
+    }
     if let Some(info) = health(http, endpoint) {
-        if info.get("version").and_then(Value::as_str) == Some(SERVER_VERSION) {
+        let same_version = info.get("version").and_then(Value::as_str) == Some(SERVER_VERSION);
+        let wrong_model = explicit_model
+            && is_loopback
+            && info
+                .get("model")
+                .and_then(Value::as_str)
+                .is_some_and(|loaded| loaded != model);
+        if same_version && !wrong_model {
             if info.get("status").and_then(Value::as_str) == Some("ok") {
                 return Ok(running_model(http, endpoint).unwrap_or(model));
             }
             if let Some(error) = ready_error(&info) {
-                return Err(format!(
-                    "Local ONNX server failed to load {model}: {error}. See {}",
-                    log_path().display()
-                ));
+                if !is_loopback {
+                    return Err(format!(
+                        "Local ONNX server failed to load {model}: {error}. See {}",
+                        log_path().display()
+                    ));
+                }
+                // A loopback server wedged in "failed" state from an earlier
+                // attempt must not poison later turns: shut it down below and
+                // start a fresh one.
+            } else {
+                // Already loading (started by another termed instance): wait
+                // for it instead of spawning a second server.
+                return wait_ready(http, endpoint, &model, None, cancelled, progress);
             }
-            // Already loading (started by another termed instance): wait
-            // for it instead of spawning a second server.
-            return wait_ready(http, endpoint, &model, None, cancelled, progress);
         }
-        // A server from an older termed version: ask it to stop, then
-        // start the embedded one below.
+        // A server from an older termed version, with a different model, or
+        // wedged in "failed" state: ask it to stop, then start a fresh one.
         shutdown(http, endpoint);
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline && health(http, endpoint).is_some() {
