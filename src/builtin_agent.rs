@@ -969,7 +969,7 @@ impl Worker {
                 {
                     self.notice(
                         &format!(
-                            if local_load_failure(&msg) {
+                            "{}", if local_load_failure(&msg) {
                                 "The provider and local ONNX inference both failed ({msg}). Check the network connection (or set HF_ENDPOINT to a reachable mirror), pass --model with a local directory, or run termed --local-prefetch first."
                             } else {
                                 "The provider and local ONNX inference both failed ({msg}). Check the connection, then run termed --local-serve or pip install -r local_inference/requirements.txt."
