@@ -821,7 +821,9 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
             .agent_targets
             .push((Rect::new(nx, inner.y, x - nx, 1), AgentTarget::PickAgent));
     }
-    let right = " ⚙  + New  ✕ ";
+    // Header right side: settings · full transcript copy · new chat ·
+    // expand/restore · close. Button widths come from the labels themselves.
+    let right = " ⚙  📋  + New ⤢ ✕ ";
     let rx = head.right().saturating_sub(width(right));
     if let Some(label) = app.agent.model_label() {
         // Shorten a provider-qualified model label for compact panels.
@@ -853,8 +855,13 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
     put(buf, rx, inner.y, " ⚙ ", fgbg(pal.fg, head_bg), head.right());
     app.layout
         .agent_targets
-        .push((Rect::new(rx, inner.y, 3, 1), AgentTarget::Settings));
-    let rx = rx + 3;
+        .push((Rect::new(rx, inner.y, width(" ⚙ "), 1), AgentTarget::Settings));
+    let rx = rx + width(" ⚙ ");
+    put(buf, rx, inner.y, " 📋 ", fgbg(pal.fg, head_bg), head.right());
+    app.layout
+        .agent_targets
+        .push((Rect::new(rx, inner.y, width(" 📋 "), 1), AgentTarget::CopyAll));
+    let rx = rx + width(" 📋 ");
     put(
         buf,
         rx,
@@ -865,10 +872,18 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
     );
     app.layout
         .agent_targets
-        .push((Rect::new(rx, inner.y, 7, 1), AgentTarget::NewChat));
+        .push((Rect::new(rx, inner.y, width(" + New "), 1), AgentTarget::NewChat));
+    let rx = rx + width(" + New ");
+    let expand_glyph = if app.agent_expanded { "⤡" } else { "⤢" };
+    let expand_label = format!(" {expand_glyph} ");
+    put(buf, rx, inner.y, &expand_label, fgbg(pal.fg, head_bg), head.right());
+    app.layout
+        .agent_targets
+        .push((Rect::new(rx, inner.y, width(&expand_label), 1), AgentTarget::Expand));
+    let rx = rx + width(&expand_label);
     put(
         buf,
-        rx + 7,
+        rx,
         inner.y,
         " ✕ ",
         fgbg(pal.fg, head_bg),
@@ -876,7 +891,7 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
     );
     app.layout
         .agent_targets
-        .push((Rect::new(rx + 7, inner.y, 3, 1), AgentTarget::Close));
+        .push((Rect::new(rx, inner.y, width(" ✕ "), 1), AgentTarget::Close));
 
     // Input box (grows to 5 lines), with the attached-context chip above it.
     let text_w = inner.width.saturating_sub(7).max(1) as usize;
@@ -963,6 +978,14 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
         Some(s) if s.start != s.end => selection_text(&rows, s, tw),
         _ => String::new(),
     };
+    // Full transcript plain text (copy-all): every non-empty text row, in
+    // order, with trailing whitespace trimmed.
+    app.agent_transcript_text = rows
+        .iter()
+        .map(|r| r.spans.iter().map(|(s, _)| s.as_str()).collect::<String>().trim_end().to_string())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
     for (k, row) in rows.iter().skip(start).take(h).enumerate() {
         let y = body.y + k as u16;
         let rx0 = body.x + 1;

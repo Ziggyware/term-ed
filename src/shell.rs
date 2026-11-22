@@ -55,7 +55,60 @@ impl Shell {
     pub fn label(&self) -> String {
         self.program.display().to_string()
     }
+}
 
+/// Normalize an LLM-generated shell command so it runs as the model meant.
+///
+/// Models frequently write commands the way they would write JSON or a
+/// markdown link: over-escaped quotes (`python -c \"with open('x')...\"`
+/// instead of `python -c "with open('x')..."`) and file references in
+/// markdown-link syntax (`[README.md](http://README.md)` instead of
+/// `README.md`). Both produce a shell syntax error with no hint of what the
+/// command was supposed to say; both are cheap to repair deterministically.
+pub fn normalize_shell_command(input: &str) -> String {
+    let trimmed = input.trim();
+    // Strip markdown links: `[text](url)` -> `text`. Only rewrites simple
+    // `[text](url)` shapes with bracket-free text; anything else is left alone.
+    let mut out = String::with_capacity(trimmed.len());
+    let mut rest = trimmed;
+    while let Some(start) = rest.find('[') {
+        let Some(close_rel) = rest[start..].find("](") else {
+            out.push_str(rest);
+            return out;
+        };
+        let text = &rest[start + 1..start + close_rel];
+        let Some(end_rel) = rest[start..].find(')') else {
+            out.push_str(rest);
+            return out;
+        };
+        if text.is_empty()
+            || text.contains('[')
+            || text.contains(']')
+            || text.contains('(')
+            || text.contains(')')
+        {
+            out.push_str(rest);
+            return out;
+        }
+        out.push_str(&rest[..start]);
+        out.push_str(text);
+        rest = &rest[start + end_rel + 1..];
+    }
+    out.push_str(rest);
+    // Unescape over-escaped quotes: `\"` -> `"`, repeatedly so triple-escaped
+    // input settles too.
+    let mut s = out;
+    for _ in 0..4 {
+        let before = s.clone();
+        s = s.replace("\\\"", "\"");
+        if s == before {
+            break;
+        }
+    }
+    s.trim().to_string()
+}
+
+impl Shell {
     /// A process that runs `text` through this shell.
     pub fn command(&self, text: &str) -> Command {
         let mut cmd = Command::new(&self.program);
@@ -569,6 +622,28 @@ pub fn build_shell_command(text: &str, cwd: &Path) -> Result<Command, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_shell_command_strips_markdown_links_and_unescapes_quotes() {
+        assert_eq!(
+            normalize_shell_command("iconv -f UTF-16LE -t UTF-8 [README.md](http://README.md)"),
+            "iconv -f UTF-16LE -t UTF-8 README.md"
+        );
+        assert_eq!(
+            normalize_shell_command("python -c \\\"with open('README.md', 'rb') as f: pass\\\""),
+            "python -c \"with open('README.md', 'rb') as f: pass\""
+        );
+        assert_eq!(
+            normalize_shell_command("powershell -Command \\\"Get-Content -Path README.md\\\""),
+            "powershell -Command \"Get-Content -Path README.md\""
+        );
+        // Legitimate shell syntax is left alone.
+        assert_eq!(
+            normalize_shell_command("echo [test] && echo ok"),
+            "echo [test] && echo ok"
+        );
+        assert_eq!(normalize_shell_command("cargo test"), "cargo test");
+    }
 
     #[test]
     fn analyzes_stateful_cd_and_workspace_escapes() {

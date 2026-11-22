@@ -5,10 +5,11 @@ termed can run the built-in agent on a model **on your own machine**, using
 key. It is used in two ways:
 
 - **Automatically when the remote provider fails.** If the provider (for
-  example the NoKey Router) answers **HTTP 503** — or any other 5xx — the
-  current turn continues on the local model instead of ending with
-  "Provider request failed". The agent panel says so, and the model picker
-  shows the local model while the fallback is active.
+  example the NoKey Router) answers **HTTP 503** — or any other 5xx — or
+  rejects its key (HTTP **401/403**), the current turn continues on the
+  local model instead of ending with an authentication or failover error.
+  The agent panel says so, and the model picker shows the local model while
+  the fallback is active.
 - **As the selected provider.** Choose **Use Local ONNX Inference** in **AI
   agent configuration**, set `"provider": "local"` in settings JSON, or start
   termed with `--local`. Every turn then runs on this machine.
