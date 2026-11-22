@@ -354,6 +354,20 @@ fn read_text(path: &std::path::Path) -> Result<(crate::text_encoding::TextEncodi
         .map_err(|e| format!("cannot read {}: {e}", path.display()))
 }
 
+/// Whether an error text is a local model-load failure (the model could not
+/// be fetched or loaded) rather than a generic provider outage. Local
+/// failures come from the on-device server, whose message naming the cause
+/// is more useful to the user than a generic "install dependencies" line.
+fn local_load_failure(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("failed to load")
+        || m.contains("could not list files")
+        || m.contains("could not download")
+        || m.contains("no .onnx")
+        || m.contains("no tokenizer.json")
+        || m.contains("not reachable")
+}
+
 struct Worker {
     cwd: PathBuf,
     options: AgentConfig,
@@ -752,7 +766,11 @@ impl Worker {
                 {
                     self.notice(
                         &format!(
-                            "The provider and local ONNX inference both failed ({msg}). Check the connection, then run termed --local-serve or pip install -r local_inference/requirements.txt."
+                            if local_load_failure(&msg) {
+                                "The provider and local ONNX inference both failed ({msg}). Check the network connection (or set HF_ENDPOINT to a reachable mirror), pass --model with a local directory, or run termed --local-prefetch first."
+                            } else {
+                                "The provider and local ONNX inference both failed ({msg}). Check the connection, then run termed --local-serve or pip install -r local_inference/requirements.txt."
+                            }
                         ),
                         true,
                     );
@@ -783,7 +801,13 @@ impl Worker {
                         }
                     }
                     // Busy or failing free model: move on to another free model.
-                    let busy = matches!(status, Some(429) | Some(500..=599)) || status.is_none();
+                    // A step against the local endpoint is never "busy":
+                    // there is no other model to fail over to when the
+                    // on-device server cannot load the model, so report the
+                    // real error instead of re-trying the same server.
+                    let busy = matches!(status, Some(429) | Some(500..=599))
+                        || status.is_none();
+                    let busy = busy && !self.options.uses_local() && self.local.is_none();
                     let busy_set: HashSet<String> = tried_models.iter().cloned().collect();
                     let next = self
                         .model_selector
@@ -833,6 +857,9 @@ impl Worker {
                                 }
                                 Some(429) => {
                                     "The provider rate limit was reached. Wait before trying again."
+                                }
+                                _ if self.options.uses_local() && local_load_failure(&msg) => {
+                                    "The local ONNX model could not be fetched or loaded (the error in parentheses is the concrete cause). Check the network connection, set HF_ENDPOINT to a reachable mirror, pass --model with a local directory, or run termed --local-prefetch first."
                                 }
                                 _ if self.options.uses_local() => {
                                     "Local ONNX inference is not running. Install its dependencies with pip install -r local_inference/requirements.txt, or run termed --local-serve, then retry."
@@ -1979,6 +2006,23 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_load_failure_recognizes_load_errors() {
+        assert!(local_load_failure(
+            "local model failed to load: could not list files for Hugging Face model 'onnx-community/SmolLM2-135M-Instruct' (<urlopen error [WinError 10054]>)"
+        ));
+        assert!(local_load_failure(
+            "Local ONNX server failed to load onnx-community/SmolLM2-135M-Instruct: the Hub answered HTTP 404"
+        ));
+        assert!(local_load_failure("no .onnx file in /tmp/cache/owner--model"));
+        assert!(local_load_failure("no tokenizer.json found in /tmp/cache"));
+        assert!(local_load_failure("Local ONNX server is not reachable at http://127.0.0.1:8080/v1"));
+        // Generic outages are NOT model-load failures.
+        assert!(!local_load_failure("Provider request failed. Check the connection"));
+        assert!(!local_load_failure("Authentication failed. Check the provider key"));
+        assert!(!local_load_failure("The model's output exceeded its size limit"));
+    }
 
     fn worker(dir: &Path) -> Worker {
         let (_tx, rx) = channel();
