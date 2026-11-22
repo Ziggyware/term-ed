@@ -691,6 +691,60 @@ class UnitTests(unittest.TestCase):
         self.assertIn("onnx-community/SmolLM2-135M-Instruct-ONNX", candidates)
         self.assertIn("HuggingFaceTB/SmolLM2-135M-Instruct", candidates)
 
+    def test_render_chat_disables_thinking_for_hybrid_reasoning_templates(self):
+        out = onnx_server.render_chat(
+            [
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": "hi"},
+            ],
+            "<|im_start|>{{ m.role }}\n<think></think>",
+        )
+        self.assertIn("/no_think\nbe brief", out)
+        self.assertTrue(
+            out.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+            out,
+        )
+
+    def test_generate_text_stops_before_hallucinated_user_turn_and_strips_think(self):
+        pieces = [
+            "<think>",
+            "internal monologue",
+            "</think>\n",
+            "Real ",
+            "answer.",
+            "\n",
+            "user",
+            ":",
+            " fake follow-up question",
+        ]
+
+        class FakeEngine:
+            def generate_tokens(self, _prompt_ids, max_tokens, _temp, _top_p):
+                for i in range(min(max_tokens, len(pieces))):
+                    yield i
+
+            def decode(self, ids):
+                return "".join(pieces[i] for i in ids)
+
+        state = onnx_server.State("fake")
+        state.engine = FakeEngine()
+        streamed: list[str] = []
+        handler = onnx_server.Handler.__new__(onnx_server.Handler)
+        text, finish, count = handler._generate_text(
+            state,
+            [1, 2],
+            50,
+            0.0,
+            1.0,
+            [],
+            on_token=streamed.append,
+        )
+        self.assertEqual(text, "Real answer.")
+        self.assertEqual("".join(streamed), "Real answer.")
+        self.assertEqual(finish, "stop")
+        # Generation stopped at ':' (index 7 -> 8 tokens), never running the tail.
+        self.assertEqual(count, 8)
+
 
 if __name__ == "__main__":
     unittest.main()
