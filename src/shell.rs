@@ -463,6 +463,11 @@ pub fn analyze_command(command: &str, cwd: &Path) -> ShellAnalysis {
                     .copied()
                     .unwrap_or(fallback)
             };
+            let references_external_path = tokens.iter().skip(1).any(|t| {
+                !t.starts_with('-')
+                    && (t.starts_with('/') || t.contains(':'))
+                    && crate::config::workspace_path(cwd, t).is_err()
+            });
             match prog {
                 "pwd" => {
                     return ShellAnalysis::Redirect(format!(
@@ -470,25 +475,29 @@ pub fn analyze_command(command: &str, cwd: &Path) -> ShellAnalysis {
                         cwd.display()
                     ));
                 }
-                "ls" | "dir" | "tree" => {
+                "ls" | "dir" | "tree" if !references_external_path => {
                     let target = first_operand(".");
                     return ShellAnalysis::Redirect(format!(
                         "Use the native `list_files` tool (`{{\"path\": \"{target}\"}}`) instead of running `{prog}` in a shell. `list_files` is instant and does not require command approval."
                     ));
                 }
-                "find" | "fd" => {
+                "find" | "fd" if !references_external_path => {
                     return ShellAnalysis::Redirect(
                         "Use the native `list_files` tool to discover file paths or `search` to match content instead of spawning `find`."
                             .into(),
                     );
                 }
-                "cat" | "head" | "tail" | "type" | "less" | "more" => {
+                "cat" | "head" | "tail" | "type" | "less" | "more"
+                    if !references_external_path =>
+                {
                     let file = first_operand("<path>");
                     return ShellAnalysis::Redirect(format!(
                         "Use the native `read_file` tool (`{{\"path\": \"{file}\"}}` with optional `start_line`/`end_line`) or `read_editor` instead of `{prog}`."
                     ));
                 }
-                "grep" | "rg" | "egrep" | "fgrep" | "ag" | "ack" | "findstr" => {
+                "grep" | "rg" | "egrep" | "fgrep" | "ag" | "ack" | "findstr"
+                    if !references_external_path =>
+                {
                     return ShellAnalysis::Redirect(
                         "Use the native `search` tool (`{\"pattern\": \"...\", \"path\": \".\"}`) instead of spawning a shell grep."
                             .into(),

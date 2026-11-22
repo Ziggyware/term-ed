@@ -171,6 +171,10 @@ impl AgentConfig {
 
     pub fn use_kono(&mut self) {
         self.backend = "builtin".into();
+        self.read_only = false;
+        if self.commands == CommandPolicy::Deny {
+            self.commands = CommandPolicy::Ask;
+        }
         self.normalize_for_provider("kono");
     }
 

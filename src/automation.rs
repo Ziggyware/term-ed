@@ -306,7 +306,7 @@ impl App {
                 self.reply_tool(reply,Ok(json!({"cancelled":id,"descendants_cancelled":true})));
             }
             "define_function"=>{
-                let result=self.automation.functions.entry(source).or_default().define(args);
+                let result=self.automation.functions.entry(source).or_default().define_or_replace(args);
                 self.reply_tool(reply,result);
             }
             "list_functions"=>{
@@ -314,7 +314,22 @@ impl App {
                 self.reply_tool(reply,Ok(json!(schemas)));
             }
             "call_function"=>{
-                let result=self.automation.functions.get(&source).ok_or("No functions defined in this task".to_string()).and_then(|r|r.call(s("name"),args.get("arguments").unwrap_or(&Value::Null)));
+                let fn_name = if !s("name").is_empty() { s("name") } else { s("function") };
+                let call_args = if let Some(v) = args.get("arguments").or_else(|| args.get("params")).or_else(|| args.get("parameters")) {
+                    if let Some(raw) = v.as_str() {
+                        serde_json::from_str::<Value>(raw).unwrap_or_else(|_| v.clone())
+                    } else {
+                        v.clone()
+                    }
+                } else if let Some(obj) = args.as_object() {
+                    let mut rest = obj.clone();
+                    rest.remove("name");
+                    rest.remove("function");
+                    Value::Object(rest)
+                } else {
+                    Value::Null
+                };
+                let result=self.automation.functions.get(&source).ok_or("No functions defined in this task".to_string()).and_then(|r|r.call(fn_name,&call_args));
                 self.reply_tool(reply,result);
             }
             other if crate::toolkit::contains(&options, other) => {

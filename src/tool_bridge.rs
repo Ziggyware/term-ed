@@ -64,9 +64,9 @@ pub fn tools(options: &AgentConfig) -> Vec<McpTool> {
     ]);
     if options.generated_tools {
         tools.extend([
-            McpTool{name:"define_function".into(),description:"Create a reusable, task-scoped pure function from validated JSON Schema and 1–12 declarative transformations. Returns a callable function schema. Never executes generated source code, shell, filesystem/network I/O or other tools. Limits: 16 functions/task, 16 KiB definition, 64 KiB input/output.".into(),input_schema:json!({"type":"object","properties":crate::generated_tools::definition_properties(),"required":["name","description","input_schema","steps"],"additionalProperties":false})},
+            McpTool{name:"define_function".into(),description:"Create or update a reusable, session-scoped function from JSON Schema and declarative text/JSON/regex/template operations. Accepts `steps` or a top-level `template` string with `{field}` placeholders, and returns a callable function schema.".into(),input_schema:json!({"type":"object","properties":crate::generated_tools::definition_properties(),"required":["name"]})},
             McpTool{name:"list_functions".into(),description:"List this task's reusable pure function schemas, including copies inherited from its parent.".into(),input_schema:json!({"type":"object","properties":{}})},
-            McpTool{name:"call_function".into(),description:"Call a previously defined pure function. Also available under its fn_ name to the built-in agent; MCP agents can always use this wrapper.".into(),input_schema:json!({"type":"object","properties":{"name":{"type":"string"},"arguments":{"type":"object"}},"required":["name","arguments"]})},
+            McpTool{name:"call_function".into(),description:"Call a previously defined function by name (with or without the `fn_` prefix). Also callable directly by its `fn_*` tool name.".into(),input_schema:json!({"type":"object","properties":{"name":{"type":"string"},"arguments":{"type":"object"}},"required":["name"]})},
         ]);
     }
     // Extended toolkit: workspace, text, buffer, edit, filesystem, search, git,

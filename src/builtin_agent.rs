@@ -283,9 +283,20 @@ fn tools_schema(options: &AgentConfig) -> Value {
         ),
         f(
             "run_command",
-            "Run a build, test, or git command in a stateless subshell rooted at the project directory. NEVER use `run_command` for `cd`, `ls`, `cat`, `grep`, `find`, or file edits: standalone `cd` has no effect across calls, and paths outside the workspace root (`..`) are forbidden. This also finds and runs software on the user's machine: locate installed software (`which <tool>`, `where <tool>`, `command -v <tool>` or the platform equivalent) before assuming it is available, then run it (e.g. `cargo build`, `npx <tool>`, `python <script>`, `<tool> --version`). Absolute paths and PATH-resolved executables both work.",
+            "Run a shell, build, test, git, or media/CLI command (e.g. `ffmpeg`, `ffprobe`, `python`, `cargo`, `npx`) in a subshell rooted at the project directory. NEVER use `run_command` for standalone `cd`, or for workspace `ls`, `cat`, `grep`, `find`, or file edits. Locate installed software (`which <tool>`, `where <tool>`, `command -v <tool>`) and run it; absolute paths and PATH-resolved executables both work.",
             json!({"command":{"type":"string"}}),
             &["command"],
+        ),
+        f(
+            "run_code",
+            "Execute arbitrary code or a script in a chosen interpreter (`python`, `powershell`, `pwsh`, `node`, `bash`, `sh`, or `cmd`) on the user's machine and return stdout, stderr, and exit status. Use this to run Python/JS/PowerShell/shell scripts, data processing, media/ffmpeg automation, or inspect files and directories anywhere on the machine.",
+            json!({
+                "code": {"type": "string", "description": "Source code or script to execute"},
+                "language": {"type": "string", "description": "Interpreter/runtime: python (default), powershell, pwsh, node, bash, sh, or cmd"},
+                "args": {"type": "array", "items": {"type": "string"}, "description": "Optional command-line arguments passed to the script"},
+                "cwd": {"type": "string", "description": "Optional working directory (defaults to the project root; absolute paths on the machine are supported)"}
+            }),
+            &["code"],
         ),
         f(
             "local_inference",
@@ -300,8 +311,12 @@ fn tools_schema(options: &AgentConfig) -> Value {
             .and_then(Value::as_str)
             .unwrap_or("");
         !(options.read_only
-            && matches!(name, "edit_file" | "write_file" | "run_command" | "local_inference")
-            || options.commands == CommandPolicy::Deny && name == "run_command")
+            && matches!(
+                name,
+                "edit_file" | "write_file" | "run_command" | "run_code" | "local_inference"
+            )
+            || options.commands == CommandPolicy::Deny
+                && matches!(name, "run_command" | "run_code"))
     });
     tools.extend(crate::tool_bridge::tools(options).into_iter().map(|t| {
         json!({"type":"function","function":{"name":t.name,"description":t.description,"parameters":t.input_schema}})
@@ -566,6 +581,8 @@ impl Worker {
                                 .push(json!({"role": role, "content": content}));
                         }
                     }
+                } else {
+                    self.dynamic_tools.clear();
                 }
                 self.used_tool_ids.clear();
                 self.always_allow_commands = false;
@@ -894,12 +911,12 @@ impl Worker {
         let capabilities = if self.options.read_only {
             "\n\n<capabilities>\n- Inspection only: you cannot create or modify files, run commands or invoke plugins. Inspect with list_files/read_file/search and report evidence; never claim an action ran.\n</capabilities>"
         } else {
-            "\n\n<capabilities>\n- Whole programs: you can create files, folders and entire programs (any language, multi-file projects included) with write_file, which creates parent directories automatically. Verify the program by building and running it with run_command.\n- Software on the user's machine: you run on the user's real machine with its installed software. Never assume a tool is installed — locate software first (`which <tool>`, `where <tool>`, `command -v <tool>` or the platform equivalent), then run it via run_command (e.g. `cargo build`, `npx <tool>`, `python <script>`, `<tool> --version`). Absolute paths and PATH-resolved executables both work.\n- On-device ONNX AI: if the user asks to use the local/on-device ONNX model (no network, no API key), use the local_inference tool. action=status checks it, action=download fetches the model into ~/.config/termed/onnx-models/, action=start serves it and switches this session to on-device inference. On failure, say so and name the fix (`pip install -r local_inference/requirements.txt` for missing dependencies, see ~/.config/termed/onnx-server.log or run termed --local-serve).\n</capabilities>"
+            "\n\n<capabilities>\n- Whole programs & arbitrary code: you can create files, folders and entire programs (any language, multi-file projects included) with write_file, and execute arbitrary scripts or code directly with run_code (`python`, `powershell`, `pwsh`, `node`, `bash`, `sh`, or `cmd`) or shell/CLI commands with run_command.\n- Software on the user's machine: you run on the user's real machine with its installed software (e.g. `ffmpeg`, `ffprobe`, `python`, `cargo`, `npx`). Locate software first (`which <tool>`, `where <tool>`, `command -v <tool>`) and run it via run_command or run_code. Absolute paths and PATH-resolved executables both work.\n- On-device ONNX AI: if the user asks to use the local/on-device ONNX model (no network, no API key), use the local_inference tool. action=status checks it, action=download fetches the model into ~/.config/termed/onnx-models/, action=start serves it and switches this session to on-device inference. On failure, say so and name the fix (`pip install -r local_inference/requirements.txt` for missing dependencies, see ~/.config/termed/onnx-server.log or run termed --local-serve).\n</capabilities>"
         };
         let mode_rules = if self.options.read_only {
             "- Read-Only Mode: Do NOT modify files, create files, run shell commands, or invoke mutating plugins. Focus strictly on inspection, analysis, and evidence-backed reporting."
         } else {
-            "- Native Tool Mandate: NEVER use `run_command` for `cd`, `ls`, `dir`, `pwd`, `cat`, `head`, `tail`, `find`, `grep`, `rg`, `sed`, or `awk`. Use `list_files`, `read_file`, `read_editor`, `search`, `edit_file`, and `write_file` instead.\n\
+            "- Native Tool Mandate: NEVER use `run_command` for `cd`, `ls`, `dir`, `pwd`, `cat`, `head`, `tail`, `find`, `grep`, `rg`, `sed`, or `awk` inside the workspace. Use `list_files`, `read_file`, `read_editor`, `search`, `edit_file`, and `write_file` instead, or `run_code` for arbitrary script execution.\n\
              - Stateless Subshell & Workspace Boundary: Every `run_command` executes in a fresh subshell fixed at the project root. Standalone `cd` commands do nothing, and navigating above the project root (`cd ..` or `../`) is strictly forbidden.\n\
              - Read Before Edit: Always read the target file with `read_file` (or `read_editor` for unsaved buffers) before calling `edit_file`.\n\
              - Surgical Edits: Prefer `edit_file` with a minimal, unique `old_text` (including 2-3 surrounding context lines) over rewriting whole files with `write_file`.\n\
@@ -932,7 +949,6 @@ impl Worker {
 
     /// One user turn: loop model → tools until the model stops calling tools.
     fn turn(&mut self, p: &Value) -> &'static str {
-        self.dynamic_tools.clear();
         if let Some(context) = p.get("_termedSkillContext").and_then(Value::as_str) {
             self.skill_context = context.to_string();
         }
@@ -978,6 +994,12 @@ impl Worker {
             }
         }
         let mut user_content = text.trim().to_string();
+        if self.multi_source_enabled() && !user_content.contains("<task_brief>") {
+            self.options.read_only = false;
+            if self.options.commands == CommandPolicy::Deny {
+                self.options.commands = CommandPolicy::Ask;
+            }
+        }
         if self.options.auto_context
             && (self.local.is_some()
                 || self.options.uses_local()
@@ -1722,6 +1744,48 @@ impl Worker {
         crate::config::workspace_path(&self.cwd, p.trim())
     }
 
+    /// Resolve a path for read-only inspection (`list_files`, `read_file`,
+    /// `search`). Allows workspace paths plus non-private absolute paths that
+    /// the user explicitly referenced in the conversation.
+    fn resolve_read(&self, p: &str) -> Result<PathBuf, String> {
+        let trimmed = p.trim();
+        if let Ok(path) = self.resolve(trimmed) {
+            return Ok(path);
+        }
+        let candidate = Path::new(trimmed);
+        if candidate.is_absolute()
+            && !trimmed.contains("..")
+            && !crate::credentials::is_private_path(candidate)
+        {
+            let norm = |s: &str| s.to_ascii_lowercase().replace('\\', "/");
+            let target_norm = norm(trimmed);
+            let mentioned = self.history.iter().any(|msg| {
+                if msg.get("role").and_then(Value::as_str) != Some("user") {
+                    return false;
+                }
+                let content = norm(msg.get("content").and_then(Value::as_str).unwrap_or(""));
+                if content.contains(&target_norm) {
+                    return true;
+                }
+                let mut anc = candidate.parent();
+                while let Some(dir) = anc {
+                    let d = norm(&dir.to_string_lossy());
+                    let trimmed_d = d.trim_end_matches('/');
+                    // Require at least two path segments (e.g. C:/dev/project)
+                    if trimmed_d.matches('/').count() >= 2 && content.contains(trimmed_d) {
+                        return true;
+                    }
+                    anc = dir.parent();
+                }
+                false
+            });
+            if mentioned {
+                return Ok(crate::search::absolute_path(candidate));
+            }
+        }
+        self.resolve(trimmed)
+    }
+
     /// Project-relative path for tool output. Always `/`-separated: these
     /// strings reach the model (and the diff notice) as JSON, where a
     /// backslash reads as an escape and Windows would otherwise disagree
@@ -1774,7 +1838,12 @@ impl Worker {
         if self.options.read_only
             && matches!(
                 name,
-                "edit_file" | "write_file" | "run_command" | "run_plugin" | "local_inference"
+                "edit_file"
+                    | "write_file"
+                    | "run_command"
+                    | "run_code"
+                    | "run_plugin"
+                    | "local_inference"
             )
         {
             self.tool_start(id, name, "other", None);
@@ -1785,7 +1854,9 @@ impl Worker {
             );
             return "Error: this agent is read-only; do not attempt file edits, commands, plugins, or on-device inference.".into();
         }
-        if name == "run_command" && self.options.commands == CommandPolicy::Deny {
+        if matches!(name, "run_command" | "run_code")
+            && self.options.commands == CommandPolicy::Deny
+        {
             self.tool_start(id, name, "execute", None);
             self.tool_end(
                 id,
@@ -1801,15 +1872,17 @@ impl Worker {
             "edit_file" => self.edit_file(id, &s("path"), &s("old_text"), &s("new_text")),
             "write_file" => self.write_file(id, &s("path"), &s("content")),
             "run_command" => self.run_command(id, &s("command")),
+            "run_code" => self.run_code(id, a),
             "local_inference" => self.local_inference(id, &s("action"), &s("model")),
             host if crate::tool_bridge::tools(&self.options)
                 .iter()
                 .any(|t| t.name == host)
                 || self.options.generated_tools
-                    && self
+                    && (self
                         .dynamic_tools
                         .iter()
-                        .any(|t| t["function"]["name"] == host) =>
+                        .any(|t| t["function"]["name"] == host)
+                        || host.starts_with("fn_")) =>
             {
                 self.host_tool(id, host, a)
             }
@@ -1922,6 +1995,12 @@ impl Worker {
         let value = v.get("result").cloned().unwrap_or(Value::Null);
         if name == "define_function" && self.options.generated_tools {
             if let Some(schema) = value.get("dynamic_function") {
+                let fn_name = schema
+                    .pointer("/function/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                self.dynamic_tools
+                    .retain(|t| t["function"]["name"].as_str() != Some(fn_name));
                 if self.dynamic_tools.len() < 16 {
                     self.dynamic_tools.push(schema.clone());
                 }
@@ -1942,7 +2021,7 @@ impl Worker {
     }
 
     fn list_files(&self, id: &str, path: &str) -> Result<String, String> {
-        let dir = self.resolve(if path.is_empty() { "." } else { path })?;
+        let dir = self.resolve_read(if path.is_empty() { "." } else { path })?;
         self.tool_start(
             id,
             &format!("List {}", if path.is_empty() { "." } else { path }),
@@ -1982,7 +2061,7 @@ impl Worker {
     }
 
     fn read_file(&self, id: &str, path: &str, a: &Value) -> Result<String, String> {
-        let p = self.resolve(path)?;
+        let p = self.resolve_read(path)?;
         self.tool_start(id, &format!("Read {}", self.rel(&p)), "read", Some(&p));
         let meta = std::fs::metadata(&p).map_err(|e| format!("cannot read {path}: {e}"))?;
         if meta.is_dir() {
@@ -2025,7 +2104,7 @@ impl Worker {
 
     fn search(&self, id: &str, pattern: &str, path: &str) -> Result<String, String> {
         let re = regex::Regex::new(pattern).map_err(|e| format!("bad pattern: {e}"))?;
-        let dir = self.resolve(if path.is_empty() { "." } else { path })?;
+        let dir = self.resolve_read(if path.is_empty() { "." } else { path })?;
         self.tool_start(id, &format!("Search \"{pattern}\""), "search", None);
         let mut hits = Vec::new();
         'files: for e in ignore::WalkBuilder::new(&dir).build().flatten() {
@@ -2165,7 +2244,7 @@ impl Worker {
 
     /// Ask the user (through the panel) to approve something.
     fn permission(&mut self, tool_id: &str, title: &str) -> bool {
-        if self.always_allow_commands {
+        if self.always_allow_commands || self.options.commands == CommandPolicy::Allow {
             return true;
         }
         self.next_id += 1;
@@ -2187,16 +2266,279 @@ impl Worker {
                         .pointer("/result/outcome/optionId")
                         .and_then(Value::as_str)
                         .unwrap_or("no");
-                    if choice == "always" {
+                    if matches!(choice, "always" | "never") {
                         self.always_allow_commands = true;
                     }
-                    return matches!(choice, "once" | "always");
+                    return matches!(choice, "once" | "always" | "never");
                 }
                 Ok(v) => self.stash(v),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(_) => return false,
             }
         }
+    }
+
+    fn run_code(&mut self, id: &str, a: &Value) -> Result<String, String> {
+        let code = ["code", "script", "source", "command"]
+            .into_iter()
+            .find_map(|k| a.get(k).and_then(Value::as_str))
+            .unwrap_or("")
+            .trim();
+        if code.is_empty() {
+            return Err("run_code requires a non-empty `code` string".into());
+        }
+        let lang = ["language", "runtime", "interpreter", "lang"]
+            .into_iter()
+            .find_map(|k| a.get(k).and_then(Value::as_str))
+            .unwrap_or("python")
+            .trim()
+            .to_ascii_lowercase();
+        let extra_args: Vec<String> = a
+            .get("args")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let work_dir = match a.get("cwd").and_then(Value::as_str).map(str::trim) {
+            Some(d) if !d.is_empty() => {
+                let p = Path::new(d);
+                if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    self.cwd.join(p)
+                }
+            }
+            _ => self.cwd.clone(),
+        };
+        let preview: String = code.lines().next().unwrap_or("").chars().take(72).collect();
+        self.tool_start(
+            id,
+            &format!("Run {lang} code `{preview}`"),
+            "execute",
+            None,
+        );
+
+        let verdict = self
+            .policy
+            .evaluate_command(code, &work_dir.to_string_lossy());
+        match verdict {
+            PermissionVerdict::AutoAllow { .. } => {
+                if self.options.commands == CommandPolicy::Ask
+                    && !self.permission(id, &format!("run {lang} code `{preview}`"))
+                {
+                    self.tool_end(id, false, vec![Self::text_block("Rejected by the user.")]);
+                    return Ok("The user rejected this code execution.".into());
+                }
+            }
+            PermissionVerdict::Block { score, reason } => {
+                self.tool_end(
+                    id,
+                    false,
+                    vec![Self::text_block(&format!(
+                        "Blocked by policy (risk {:.2}): {reason}",
+                        score
+                    ))],
+                );
+                return Ok(format!("Code blocked by Jev risk policy: {reason}"));
+            }
+            PermissionVerdict::PromptUser { score, rationale } => {
+                let prompt_desc = format!(
+                    "run {lang} code `{preview}` (risk {:.2}: {})",
+                    score, rationale
+                );
+                if !self.permission(id, &prompt_desc) {
+                    self.tool_end(id, false, vec![Self::text_block("Rejected by the user.")]);
+                    return Ok("The user rejected this code execution.".into());
+                }
+            }
+        }
+
+        static CODE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let ext = match lang.as_str() {
+            "python" | "python3" | "py" => "py",
+            "powershell" | "pwsh" | "ps1" => "ps1",
+            "node" | "javascript" | "js" => "js",
+            "cmd" | "bat" | "batch" => "cmd",
+            _ => "sh",
+        };
+        let script_path = std::env::temp_dir().join(format!(
+            "termed-run-code-{}-{}.{}",
+            std::process::id(),
+            CODE_SEQ.fetch_add(1, Ordering::Relaxed),
+            ext
+        ));
+        std::fs::write(&script_path, code)
+            .map_err(|e| format!("cannot write temporary script: {e}"))?;
+
+        let build_process = || -> Result<std::process::Command, String> {
+            let script_str = script_path.to_string_lossy().into_owned();
+            let mut cmd = match lang.as_str() {
+                "python" | "python3" | "py" => {
+                    let bin = ["python3", "python", "py"]
+                        .into_iter()
+                        .find_map(|cand| crate::plugin::path_candidates(cand).into_iter().next())
+                        .ok_or_else(|| "Python interpreter not found on PATH".to_string())?;
+                    let mut c = std::process::Command::new(&bin);
+                    if bin
+                        .file_stem()
+                        .is_some_and(|s| s.eq_ignore_ascii_case("py"))
+                    {
+                        c.arg("-3");
+                    }
+                    c.arg(&script_path);
+                    c.args(&extra_args);
+                    c
+                }
+                "powershell" | "pwsh" | "ps1" => {
+                    let bin = ["pwsh", "powershell"]
+                        .into_iter()
+                        .find_map(|cand| crate::plugin::path_candidates(cand).into_iter().next())
+                        .ok_or_else(|| "PowerShell not found on PATH".to_string())?;
+                    let mut c = std::process::Command::new(bin);
+                    c.args([
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-File",
+                    ]);
+                    c.arg(&script_path);
+                    c.args(&extra_args);
+                    c
+                }
+                "node" | "javascript" | "js" => {
+                    let bin = crate::plugin::path_candidates("node")
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| "Node.js not found on PATH".to_string())?;
+                    let mut c = std::process::Command::new(bin);
+                    c.arg(&script_path);
+                    c.args(&extra_args);
+                    c
+                }
+                "cmd" | "bat" | "batch" => {
+                    let mut c = std::process::Command::new("cmd");
+                    c.arg("/C").arg(&script_path).args(&extra_args);
+                    c
+                }
+                _ => {
+                    let mut cmd_line = format!("\"{script_str}\"");
+                    for arg in &extra_args {
+                        cmd_line.push(' ');
+                        cmd_line.push_str(arg);
+                    }
+                    return build_shell_command(&cmd_line, &work_dir);
+                }
+            };
+            cmd.current_dir(&work_dir);
+            crate::process_guard::configure(&mut cmd);
+            Ok(cmd)
+        };
+
+        let mut process = match build_process() {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = std::fs::remove_file(&script_path);
+                return Err(e);
+            }
+        };
+        let started = Instant::now();
+        process
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = match process.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = std::fs::remove_file(&script_path);
+                return Err(format!("cannot run {lang}: {e}"));
+            }
+        };
+        let take = |reader: Option<Box<dyn std::io::Read + Send>>| {
+            let (tx, rx) = channel();
+            std::thread::spawn(move || {
+                let mut tail = Vec::new();
+                if let Some(mut reader) = reader {
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        match reader.read(&mut chunk) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                tail.extend_from_slice(&chunk[..n]);
+                                if tail.len() > 8000 {
+                                    tail.drain(..tail.len() - 8000);
+                                }
+                            }
+                        }
+                    }
+                }
+                let _ = tx.send(String::from_utf8_lossy(&tail).into_owned());
+            });
+            rx
+        };
+        let out_rx = take(
+            child
+                .stdout
+                .take()
+                .map(|r| Box::new(r) as Box<dyn std::io::Read + Send>),
+        );
+        let err_rx = take(
+            child
+                .stderr
+                .take()
+                .map(|r| Box::new(r) as Box<dyn std::io::Read + Send>),
+        );
+        let status = loop {
+            if let Ok(Some(status)) = child.try_wait() {
+                break Some(status);
+            }
+            if self.cancel.load(Ordering::SeqCst)
+                || started.elapsed() > Duration::from_secs(self.options.task_timeout_secs)
+            {
+                crate::process_guard::terminate(&mut child);
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        crate::process_guard::kill_group(&child);
+        let _ = std::fs::remove_file(&script_path);
+        let mut out = out_rx
+            .recv_timeout(Duration::from_millis(500))
+            .unwrap_or_else(|_| "[stdout pipe still held open by an escaped process]".into());
+        out.push_str(
+            &err_rx
+                .recv_timeout(Duration::from_millis(500))
+                .unwrap_or_else(|_| "[stderr pipe still held open by an escaped process]".into()),
+        );
+        if out.len() > 8000 {
+            let mut start = out.len() - 8000;
+            while !out.is_char_boundary(start) {
+                start += 1;
+            }
+            out = format!("…{}", &out[start..]);
+        }
+        let code_status = match status {
+            Some(s) => format!("exit code {}", s.code().unwrap_or(-1)),
+            None => "stopped (timeout or cancelled)".into(),
+        };
+        let shown: String = out
+            .lines()
+            .rev()
+            .take(4)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.tool_end(
+            id,
+            status.is_some_and(|s| s.success()),
+            vec![Self::text_block(&format!("{code_status}\n{shown}"))],
+        );
+        Ok(format!("{code_status}\n{out}"))
     }
 
     fn run_command(&mut self, id: &str, command: &str) -> Result<String, String> {

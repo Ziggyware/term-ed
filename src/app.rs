@@ -5120,11 +5120,11 @@ impl App {
     /// sessions do not ask either.
     fn answer_permission(&mut self, entry: usize, option: Option<&str>) {
         self.agent.choose(entry, option);
-        let never = option == Some("never")
+        let never = matches!(option, Some("never" | "always"))
             && self.agent.spec.as_ref().is_some_and(|s| s.builtin)
             && self.agent.entries.get(entry).is_some_and(|e| {
                 matches!(e, agent::Entry::Permission(p)
-                    if p.options.iter().any(|(id, _, _)| id.as_str() == "never"))
+                    if p.options.iter().any(|(id, _, _)| matches!(id.as_str(), "never" | "always")))
             });
         if never
             && self.preferences.agent.commands != crate::config::CommandPolicy::Allow
