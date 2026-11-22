@@ -2394,26 +2394,32 @@ impl Worker {
             _ => self.cwd.clone(),
         };
         let preview: String = code.lines().next().unwrap_or("").chars().take(72).collect();
-        self.tool_start(
-            id,
-            &format!("Run {lang} code `{preview}`"),
-            "execute",
-            None,
-        );
-
+        let title = format!("Run {lang} code `{preview}`");
+        // The card must not claim the code is running before it is: evaluate
+        // first, and when approval is needed show the card as awaiting
+        // approval until the user answers. A parked approval otherwise looks
+        // exactly like a hung run — nothing has spawned yet.
         let verdict = self
             .policy
             .evaluate_command(code, &work_dir.to_string_lossy());
+        let prompt = |this: &mut Self, desc: &str| -> bool {
+            if this.always_allow_commands || this.options.commands == CommandPolicy::Allow {
+                return true;
+            }
+            this.tool_start(id, &format!("Awaiting approval: {title}"), "execute", None);
+            this.permission(id, desc)
+        };
         match verdict {
             PermissionVerdict::AutoAllow { .. } => {
                 if self.options.commands == CommandPolicy::Ask
-                    && !self.permission(id, &format!("run {lang} code `{preview}`"))
+                    && !prompt(self, &format!("run {lang} code `{preview}`"))
                 {
                     self.tool_end(id, false, vec![Self::text_block("Rejected by the user.")]);
                     return Ok("The user rejected this code execution.".into());
                 }
             }
             PermissionVerdict::Block { score, reason } => {
+                self.tool_start(id, &title, "execute", None);
                 self.tool_end(
                     id,
                     false,
@@ -2429,12 +2435,13 @@ impl Worker {
                     "run {lang} code `{preview}` (risk {:.2}: {})",
                     score, rationale
                 );
-                if !self.permission(id, &prompt_desc) {
+                if !prompt(self, &prompt_desc) {
                     self.tool_end(id, false, vec![Self::text_block("Rejected by the user.")]);
                     return Ok("The user rejected this code execution.".into());
                 }
             }
         }
+        self.tool_start(id, &title, "execute", None);
 
         static CODE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let ext = match lang.as_str() {
@@ -2457,7 +2464,15 @@ impl Worker {
             let script_str = script_path.to_string_lossy().into_owned();
             let mut cmd = match lang.as_str() {
                 "python" | "python3" | "py" => {
-                    let bin = ["python3", "python", "py"]
+                    // On Windows, `python3` usually resolves to the Microsoft
+                    // Store AppExec alias in WindowsApps, which can detour
+                    // through the Store instead of running the script; the
+                    // `py` launcher and `python` are unambiguous there.
+                    #[cfg(windows)]
+                    let order = ["py", "python", "python3"];
+                    #[cfg(not(windows))]
+                    let order = ["python3", "python", "py"];
+                    let bin = order
                         .into_iter()
                         .find_map(|cand| crate::plugin::path_candidates(cand).into_iter().next())
                         .ok_or_else(|| "Python interpreter not found on PATH".to_string())?;
@@ -2624,16 +2639,18 @@ impl Worker {
     fn run_command(&mut self, id: &str, command: &str) -> Result<String, String> {
         let command = crate::shell::normalize_shell_command(command).into_boxed_str();
         let command = command.as_ref();
-        self.tool_start(id, &format!("Run `{command}`"), "execute", None);
+        let title = format!("Run `{command}`");
 
         // Pre-flight lexical analysis: redirect redundant file/navigation commands
         // to native tools and block workspace-escape traversal before prompting.
         match analyze_command(command, &self.cwd) {
             ShellAnalysis::Redirect(msg) => {
+                self.tool_start(id, &title, "execute", None);
                 self.tool_end(id, true, vec![Self::text_block(&msg)]);
                 return Ok(format!("Redirected to native tool: {msg}"));
             }
             ShellAnalysis::Block(reason) => {
+                self.tool_start(id, &title, "execute", None);
                 self.tool_end(id, false, vec![Self::text_block(&reason)]);
                 return Ok(format!("Error: {reason}"));
             }
@@ -2659,16 +2676,26 @@ impl Worker {
             }),
         );
 
+        // Same honesty rule as run_code: while approval is outstanding the
+        // card says so, instead of claiming the command is already running.
+        let prompt = |this: &mut Self, desc: &str| -> bool {
+            if this.always_allow_commands || this.options.commands == CommandPolicy::Allow {
+                return true;
+            }
+            this.tool_start(id, &format!("Awaiting approval: {title}"), "execute", None);
+            this.permission(id, desc)
+        };
         match verdict {
             PermissionVerdict::AutoAllow { .. } => {
                 if self.options.commands == CommandPolicy::Ask
-                    && !self.permission(id, &format!("run `{command}`"))
+                    && !prompt(self, &format!("run `{command}`"))
                 {
                     self.tool_end(id, false, vec![Self::text_block("Rejected by the user.")]);
                     return Ok("The user rejected this command.".into());
                 }
             }
             PermissionVerdict::Block { score, reason } => {
+                self.tool_start(id, &title, "execute", None);
                 self.tool_end(
                     id,
                     false,
@@ -2681,12 +2708,13 @@ impl Worker {
             }
             PermissionVerdict::PromptUser { score, rationale } => {
                 let prompt_desc = format!("run `{command}` (risk {:.2}: {})", score, rationale);
-                if !self.permission(id, &prompt_desc) {
+                if !prompt(self, &prompt_desc) {
                     self.tool_end(id, false, vec![Self::text_block("Rejected by the user.")]);
                     return Ok("The user rejected this command.".into());
                 }
             }
         }
+        self.tool_start(id, &title, "execute", None);
         let started = Instant::now();
         let mut process = build_shell_command(command, &self.cwd)?;
         process

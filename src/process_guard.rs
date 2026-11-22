@@ -26,7 +26,19 @@ pub fn kill_group(child: &Child) {
             }
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // Windows has no process groups: ask taskkill to terminate the
+        // child's whole tree. Best-effort — the child may already be gone,
+        // and taskkill may be absent on stripped-down installs.
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(not(any(unix, windows)))]
     let _ = child;
 }
 
