@@ -39,7 +39,7 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 DEFAULT_MODEL = "onnx-community/SmolLM2-135M-Instruct"
 MAX_BODY_BYTES = 2 * 1024 * 1024
 MAX_OUTPUT_TOKENS = 8192
@@ -145,6 +145,55 @@ def _download(url: str, dest: str) -> None:
 # and fast on a CPU; sentence-transformers/all-MiniLM-L6-v2 is the same model.
 DEFAULT_EMBEDDING_MODEL = "Xenova/all-MiniLM-L6-v2"
 
+# Preferred single-file weight variants when a Hub repo publishes an entire
+# `onnx/` matrix (fp32, fp16, int8, q4, ...); fetching every variant would pull
+# gigabytes when `find_onnx_file` only ever loads one.
+_PREFERRED_ONNX = (
+    "onnx/model_quantized.onnx",
+    "model_quantized.onnx",
+    "onnx/model_int8.onnx",
+    "model_int8.onnx",
+    "onnx/model_q4.onnx",
+    "model_q4.onnx",
+    "onnx/model.onnx",
+    "model.onnx",
+)
+
+# `onnx-community` appends `-ONNX` to converted repos, and Hugging Face
+# answers HTTP 401 (not 404) when an unauthenticated client queries a repo
+# name that does not exist. Try the canonical Hub repos when the short id fails.
+_REPO_FALLBACKS: dict[str, tuple[str, ...]] = {
+    "onnx-community/SmolLM2-135M-Instruct": (
+        "onnx-community/SmolLM2-135M-Instruct-ONNX",
+        "HuggingFaceTB/SmolLM2-135M-Instruct",
+    ),
+}
+
+
+def _select_onnx_files(names: list[str]) -> set[str]:
+    onnx_files = [n for n in names if n.endswith(".onnx")]
+    if not onnx_files:
+        return set()
+    name_set = set(onnx_files)
+    chosen = next(
+        (cand for cand in _PREFERRED_ONNX if cand in name_set),
+        sorted(onnx_files)[0],
+    )
+    selected = {chosen}
+    for ext in (f"{chosen}.data", f"{chosen}_data"):
+        if ext in names:
+            selected.add(ext)
+    return selected
+
+
+def _hf_repo_candidates(repo: str) -> list[str]:
+    candidates = [repo, *_REPO_FALLBACKS.get(repo, ())]
+    if repo.startswith("onnx-community/") and not repo.endswith("-ONNX"):
+        suffixed = f"{repo}-ONNX"
+        if suffixed not in candidates:
+            candidates.append(suffixed)
+    return candidates
+
 
 def _hf_wanted_files(repo: str) -> list[str]:
     api = f"{HUB}/api/models/{repo}"
@@ -164,12 +213,26 @@ def _hf_wanted_files(repo: str) -> list[str]:
         "merges.txt",
         "vocab.txt",
     }
+    onnx_wanted = _select_onnx_files(names)
     wanted = [
         n
         for n in names
-        if n.endswith((".onnx", ".onnx.data")) or os.path.basename(n) in keep
+        if n in onnx_wanted or os.path.basename(n) in keep
     ]
     return sorted(set(wanted))
+
+
+def _resolve_hf_repo(repo: str) -> tuple[str, list[str]]:
+    last_err: HubError | None = None
+    for candidate in _hf_repo_candidates(repo):
+        try:
+            return candidate, _hf_wanted_files(candidate)
+        except HubError as exc:
+            last_err = exc
+            if "HTTP 401" not in str(exc) and "HTTP 404" not in str(exc):
+                raise
+    assert last_err is not None
+    raise last_err
 
 
 def path_like(model: str) -> bool:
@@ -208,7 +271,7 @@ def resolve_model_dir(model: str, cache_dir: str) -> str:
     if find_onnx_file(cache) and os.path.isfile(os.path.join(cache, "tokenizer.json")):
         return cache
     log(f"fetching model {model} into {cache}")
-    wanted = _hf_wanted_files(model)
+    resolved_repo, wanted = _resolve_hf_repo(model)
     if not any(n.endswith(".onnx") for n in wanted):
         raise RuntimeError(f"model {model!r} has no .onnx files")
     if "tokenizer.json" not in [os.path.basename(n) for n in wanted]:
@@ -216,7 +279,7 @@ def resolve_model_dir(model: str, cache_dir: str) -> str:
     for name in wanted:
         dest = os.path.join(cache, name)
         if not os.path.isfile(dest):
-            _download(f"{HUB}/{model}/resolve/main/{name}", dest)
+            _download(f"{HUB}/{resolved_repo}/resolve/main/{name}", dest)
     return cache
 
 
@@ -309,6 +372,33 @@ def render_chat(messages: list[dict], template: str | None) -> str:
 # ONNX engine
 # --------------------------------------------------------------------------
 
+def _pair_kv_cache(past_names: list[str], outputs: list[str]) -> list[tuple[str, str]]:
+    """Pair each `past_key_values.*` input with its corresponding `present.*` output.
+
+    Standard ONNX exports (Hugging Face optimum, Olive, ONNX Runtime GenAI)
+    name the KV-cache inputs `past_key_values.<layer>.<key|value>` and the
+    updated cache outputs `present.<layer>.<key|value>` (or
+    `present_key_values.<layer>.<key|value>`). Matching only identical names
+    drops the cache after step 0 and breaks `GroupQueryAttention` on step 1.
+    """
+    if not past_names:
+        return []
+    out_set = set(outputs)
+    pairs: list[tuple[str, str]] = []
+    prefix_len = len("past_key_values")
+    for in_name in past_names:
+        tail = in_name[prefix_len:]
+        for cand in (in_name, "present" + tail, "present_key_values" + tail):
+            if cand in out_set:
+                pairs.append((in_name, cand))
+                break
+    if len(pairs) == len(past_names):
+        return pairs
+    if len(outputs) == 1 + len(past_names):
+        return list(zip(past_names, outputs[1:]))
+    return []
+
+
 class OnnxEngine:
     """Autoregressive generation over an ONNX Runtime session."""
 
@@ -344,9 +434,13 @@ class OnnxEngine:
         self.past_shapes = {
             n: self._past_shape(inputs[n], model_dir) for n in self.past_names
         }
+        self.past_dtypes = {
+            n: self._past_dtype(inputs[n]) for n in self.past_names
+        }
         outputs = [o.name for o in self.session.get_outputs()]
         self.logits_name = outputs[0]
-        self.past_output_names = [n for n in self.past_names if n in outputs]
+        self.past_pairs = _pair_kv_cache(self.past_names, outputs)
+        self.past_output_names = [out_name for _in_name, out_name in self.past_pairs]
         handled = {
             self.input_ids_name,
             self.attention_name,
@@ -395,19 +489,26 @@ class OnnxEngine:
 
     def _past_shape(self, node_arg, model_dir: str) -> tuple[int, int, int, int]:
         shape = list(node_arg.shape or [])
-        heads = head_dim = None
+        kv_heads = head_dim = None
         try:
             with open(os.path.join(model_dir, "config.json"), encoding="utf-8") as fh:
                 cfg = json.load(fh)
-            heads = cfg.get("num_attention_heads") or cfg.get("num_key_value_heads")
+            attn_heads = cfg.get("num_attention_heads")
+            kv_heads = cfg.get("num_key_value_heads") or attn_heads
             hidden = cfg.get("hidden_size")
-            if heads and hidden and hidden % heads == 0:
-                head_dim = hidden // heads
+            head_dim = cfg.get("head_dim")
+            if (
+                not isinstance(head_dim, int)
+                and attn_heads
+                and hidden
+                and hidden % attn_heads == 0
+            ):
+                head_dim = hidden // attn_heads
         except (OSError, ValueError):
             pass
 
         def dim(index: int, fallback: int | None) -> int:
-            if index < len(shape) and isinstance(shape[index], int):
+            if index < len(shape) and isinstance(shape[index], int) and shape[index] >= 0:
                 return shape[index]
             if fallback is not None:
                 return fallback
@@ -416,7 +517,20 @@ class OnnxEngine:
                 "provide config.json with num_attention_heads/hidden_size"
             )
 
-        return (dim(0, 1), dim(1, heads), dim(2, 0), dim(3, head_dim))
+        return (dim(0, 1), dim(1, kv_heads), 0, dim(3, head_dim))
+
+    def _past_dtype(self, node_arg):
+        np = self.np
+        kind = getattr(node_arg, "type", "tensor(float)")
+        return {
+            "tensor(float16)": np.float16,
+            "tensor(float)": np.float32,
+            "tensor(double)": np.float64,
+            "tensor(int64)": np.int64,
+            "tensor(int32)": np.int32,
+            "tensor(int8)": np.int8,
+            "tensor(uint8)": np.uint8,
+        }.get(kind, np.float32)
 
     def encode(self, text: str) -> list[int]:
         return self.tokenizer.encode(text).ids
@@ -426,7 +540,8 @@ class OnnxEngine:
 
     def _pick(self, logits, temperature: float, top_p: float) -> int:
         np = self.np
-        row = logits[0, -1, :].astype(np.float64)
+        last = logits[0, -1, :] if getattr(logits, "ndim", 3) == 3 else logits[0, :]
+        row = last.astype(np.float64)
         if temperature <= 0:
             return int(np.argmax(row))
         row = row / max(temperature, 1e-6)
@@ -456,7 +571,7 @@ class OnnxEngine:
         ids = list(prompt_ids)
         past: dict[str, object] = {}
         past_len = 0
-        use_cache = bool(self.past_names)
+        use_cache = bool(self.past_pairs)
         for step in range(max_tokens):
             if use_cache and step > 0:
                 step_ids = [ids[-1]]
@@ -485,7 +600,7 @@ class OnnxEngine:
                         feeds[name] = np.zeros(
                             (self.past_shapes[name][0], self.past_shapes[name][1], 0,
                              self.past_shapes[name][3]),
-                            dtype=np.float32,
+                            dtype=self.past_dtypes[name],
                         )
             outputs = self.session.run(
                 [self.logits_name, *self.past_output_names], feeds
@@ -493,8 +608,8 @@ class OnnxEngine:
             logits = outputs[0]
             if use_cache:
                 past = {
-                    name: outputs[1 + i]
-                    for i, name in enumerate(self.past_output_names)
+                    in_name: outputs[1 + i]
+                    for i, (in_name, _out_name) in enumerate(self.past_pairs)
                 }
                 past_len = total
             token = self._pick(logits, temperature, top_p)
@@ -648,7 +763,7 @@ class Handler(BaseHTTPRequestHandler):
                     "version": __version__,
                 })
             return
-        if path == "/v1/models":
+        if path in ("/models", "/v1/models"):
             state = STATE
             assert state is not None
             self._send_json(200, {
@@ -716,14 +831,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 (stdlib naming)
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
-        if path == "/admin/shutdown":
+        if path in ("/admin/shutdown", "/v1/admin/shutdown"):
             self._send_json(200, {"status": "shutting_down"})
             threading.Thread(target=self.server.shutdown, daemon=True).start()
             return
-        if path == "/v1/embeddings":
+        if path in ("/embeddings", "/v1/embeddings"):
             self._handle_embeddings()
             return
-        if path != "/v1/chat/completions":
+        if path not in ("/chat/completions", "/v1/chat/completions"):
             self._send_json(404, error_body(f"unknown route: {path}", "not_found"))
             return
         payload, err = self._read_json()

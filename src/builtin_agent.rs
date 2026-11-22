@@ -737,6 +737,7 @@ impl Worker {
                 // provider instead of failing the turn on the machine.
                 Err(Step::Failed(msg, _)) if self.local.is_some() => {
                     if self.options.uses_local() {
+                        self.local = None;
                         self.notice(
                             &format!(
                                 "Local ONNX inference failed ({msg}). Check the server log at {} or run termed --local-serve.",
@@ -956,6 +957,32 @@ impl Worker {
     /// One model call. Ok(true) = tools ran, call the model again. `finalize`
     /// withholds tools and demands an answer; it never returns Ok(true).
     fn step(&mut self, finalize: bool) -> Result<bool, Step> {
+        if self.options.uses_local() && self.local.is_none() {
+            let endpoint = crate::provider::local_endpoint(&self.options);
+            let cancel = self.cancel.clone();
+            let out = self.out.clone();
+            let waiting = move |elapsed: Duration| {
+                let title = format!(
+                    "Waiting for the local ONNX server ({}s); the first run downloads the model.",
+                    elapsed.as_secs()
+                );
+                out(json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"builtin",
+                    "update":{"sessionUpdate":"notice","severity":"info","title":title}}}));
+            };
+            let model = crate::local_server::ensure_running(
+                &self.http,
+                &endpoint,
+                &self.model,
+                move || cancel.load(Ordering::SeqCst),
+                waiting,
+            )
+            .map_err(|e| Step::Failed(e, Some(503)))?;
+            self.local = Some(crate::config::LocalInference {
+                endpoint,
+                model: model.clone(),
+            });
+            self.model = model;
+        }
         if self.model.is_empty() {
             self.models = custom_models(&self.http, &self.options)?;
             self.model = self.models[0].0.clone();
