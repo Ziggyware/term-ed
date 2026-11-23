@@ -1,86 +1,42 @@
-# Settings, plugins, agents and skills
+# Agent Configuration Reference
 
 ## Menus
 
-- **Settings** in the desktop title bar, **Preferences: Settings** in the command palette, or **Ctrl+,** opens user preferences.
-- **Plugins** in the title bar, **Plugins: Manage Plugins**, or **Ctrl+Alt+P** opens plugin management. Select a plugin for its commands, enable/disable switch, AI permission and manifest.
-- **Agent: Configure AI Agent**, **Agent: Manage Sub-agents**, and **Skills: Manage Skills** go directly to those settings. The agent panel's **⚙** button opens agent configuration.
-- On a phone, use **⋯** to find any of these commands. Menus are searchable and support arrows, Enter, Esc and touch. Setting values are preselected; type or paste to replace, **Ctrl+A** selects all, and **Ctrl+Backspace** clears the field.
+- **Settings** (title bar, `Ctrl+,`) — user preferences
+- **Plugins** (title bar, `Ctrl+Alt+P`) — plugin management, AI permissions
+- **Agent: Configure AI Agent** / **Agent: Manage Sub-agents** / **Skills: Manage Skills** — direct links to agent settings
 
-## User settings and migration
-
-Menu changes save a complete user configuration at **`$XDG_CONFIG_HOME/termed/settings.json`** (normally `~/.config/termed/settings.json`). `XDG_CONFIG_HOME` must be an absolute path; empty or relative values are ignored. On Windows, when `XDG_CONFIG_HOME` and `HOME` are unset, it is under `%USERPROFILE%\.config\termed\settings.json`. Settings load across folders and restarts; opening the editor alone does not create a file. On Unix, a new config directory is private (`0700`) and settings are atomically replaced using a private (`0600`) file. Other platforms rely on user-directory ACLs. The separate **Save Router API Key** action stores credentials in a user-local credentials file, never in settings JSON. See [router setup and supervision](router-and-supervision.md).
-
-For migration, if no user settings file exists, termed reads the current folder's old `.termed/settings.json`. Version 1 or unversioned automatic/OpenCode backends migrate to the built-in agent; the old implicit built-in gateway becomes the router, and an old OpenCode default model is cleared. A deliberately selected `auto`, `kilo`, or custom provider in version 2 is retained. Other settings (non-OpenCode backends, custom providers, permission restrictions) are preserved. Loading alone does not write a file. The first successful menu save writes settings at user scope and leaves the old workspace file untouched.
-
-**Important:** Once a user settings file exists it is authoritative, and legacy `.termed/settings.json` files in *all* folders are ignored — including per-project instructions, `read_only`, command or plugin restrictions. An in-editor notice appears when a legacy file is present. Before migrating, inspect and copy any restrictions you need into the user settings; reapply folder-specific safeguards yourself. Old workspace files are not deleted. Skills and plugins still have their own workspace discovery rules.
-
-Use **Open User Settings JSON** for multi-line instructions or bulk edits, then **Reload Settings from Disk**. Invalid JSON, unsupported versions, invalid budgets and unavailable backends are reported; the last live configuration is retained on a failed reload. At startup, an invalid configuration falls back to defaults with an error notification. Menu changes do not overwrite an invalid configuration or an unsaved user settings buffer. Stop an AI turn before changing its agent/sub-agent configuration.
-
-Editor preferences include theme, minimap, whitespace, indent guides, line numbers, word wrap and the touch toolbar. Wrap and toolbar each cycle through automatic/on/off. Editor display commands persist their changes.
-
-## Connecting Kono Router or local llama.cpp
-
-Open **F1 → Agent: Configure AI Agent** (or **F1, Alt+A**). Use the **builtin** backend, then set **API base URL**:
-
-| Server | API base URL | Model |
-|---|---|---|
-| Kono Router | `https://kono-router.onrender.com` | Leave empty for `free:tools` (the tool-capable lane), or enter a model ID advertised by Kono |
-| llama.cpp | `http://127.0.0.1:8080` | Leave empty to discover the loaded model via `/v1/models`, or use the model's exact ID or `--alias` |
-
-`/v1` is added automatically to a base URL with no path (`http://192.168.1.20:8080`, `https://api.example.com`). A URL that already has a path is used verbatim — include any other API prefix yourself. Setting an API base URL also selects the custom provider when the built-in provider is still `router`, so a settings file never silently keeps using the router. Leave **API key environment variable** empty for an unauthenticated server; if your deployment requires a key, enter the name of the environment variable holding it. For Kono, use a separate variable such as `KONO_API_KEY`. The saved NoKey Router credential and reserved `ROUTER_API_KEY` variable are not forwarded to either server.
-
-Run `llama-server` on the same machine as termed and wait for the model to load before opening the agent. Use a tool-capable instruct model with a compatible chat template; llama.cpp may need `--jinja` for tool calls. With an 8,192-token context, start with a smaller **Model output token budget** (e.g. 1,024) to leave room for instructions, tools, and history. If the server is still starting or Kono is waking from sleep, retry once it is ready.
-
-## On-device ONNX inference
-
-termed can run the built-in agent on a local ONNX model with ONNX Runtime: no network, no API key. It is used **automatically when the provider returns HTTP 503** (or any other 5xx), and can be selected outright with **Use Local ONNX Inference**, `"provider": "local"` or `--local`. If local inference also fails, the turn goes back to the configured provider.
-
-Set up Python with `pip install -r local_inference/requirements.txt`; the default model (~150 MB) downloads once from Hugging Face and then runs offline. termed starts the server from the embedded `local_inference/onnx_server.py` on the **Local ONNX endpoint** (default `http://127.0.0.1:8080/v1`) and reuses it across sessions. Only loopback `http://` endpoints are started automatically; run `termed --local-serve` to serve one yourself. See [local ONNX inference](local-inference.md) for models, logs, limits and tests.
-
-## Configuring the primary agent
-
-The agent configuration menu exposes:
+## Primary Agent Configuration
 
 | Setting | Meaning |
 |---|---|
-| Backend | `builtin` (default), `custom`, or the exact display name of an installed ACP agent; legacy `auto` selects the built-in agent |
-| Custom ACP command | An argv string with single/double-quoted arguments; no shell expansion. Set it before choosing `custom` |
-| Model | Explicit provider model ID; empty uses the provider default or discovers the first model advertised by a custom server |
-| API base URL | Built-in agent's OpenAI-compatible base URL, including `/v1` when required; empty uses the selected provider. The default router uses `https://nokey-router.ziggyware.deno.net/v1`. Ignored while `local` is selected |
-| Local ONNX endpoint | On-device ONNX server base URL used by `local` and the 503 fallback; empty uses `http://127.0.0.1:8080/v1` |
-| API key environment variable | Name of an environment variable, never the API key itself |
-| Instructions | Role, conventions and additional instructions; use JSON for multiple lines |
-| Step budget | 1–100 built-in model/tool rounds per turn (default 30) |
-| Read-only | Built-in agent cannot edit/write files, run commands or execute plugins |
-| Command permissions | `ask` (default), `deny`, `risk_assessed`, or `allow` (never ask) |
-| AI plugin tools | Whether plugin discovery and execution tools are exposed |
-| Plugin allowlist | Comma-separated names; empty allows all enabled plugins except explicit plugin-menu denials |
-| Attached skills | Comma-separated enabled skill IDs to include on each prompt |
-| Sub-agent delegation | Whether the primary AI can delegate to configured specialists |
-| Delegations per turn | 1–32 total tasks for the whole root tree (default 4); descendants share this budget |
-| Task timeout | 10–1800 seconds (default 300) for the root turn and inherited specialist deadlines, including approval waits |
-| Attach editor context | Include the active file and selection in prompts and bounded worker briefs |
-| Built-in provider | `router` (default), `kilo`, `custom`, `local` (on-device ONNX); `onnx` normalizes to `local` on load/save; legacy `auto` is retained. Related model, endpoint, key variable and backend normalize with the provider |
-| Maximum agent depth | 1–3 (default 2): root=0, child=1, grandchild=2; every ancestor can impose a smaller cap |
-| Concurrent tasks | 1–8 active tasks (default 4), including waiting coordinators; new delegation fails fast when full |
-| Overwatch stall timeout | 15–600 seconds (default 150); child/approval/plugin waits are exempt from idle detection, not absolute deadlines |
-| Pure generated functions | Enable bounded task-scoped data transformations; no generated code execution |
-| Extended AI toolkit | Expose the 100 extra host tools; write tools hidden from read-only agents and git tools from `deny` |
-| Toolkit groups | Comma-separated groups (`workspace`, `text`, `buffers`, `edit`, `filesystem`, `search`, `git`, `ui`, `code`, `session`); empty means all. Fewer groups means a shorter tool prompt |
-| Model output token budget | 256–16384 (default 4096), inherited restrictively |
+| **Backend** | `builtin` (default), `custom`, or exact ACP agent name; legacy `auto` selects built-in |
+| **Custom ACP command** | argv string with quoted args; no shell expansion |
+| **Model** | Provider model ID; empty = provider default or first discovered |
+| **API base URL** | OpenAI-compatible base URL including `/v1`; empty = selected provider |
+| **Local ONNX endpoint** | Local server base URL for `local` provider; default `http://127.0.0.1:8080/v1` |
+| **API key environment variable** | Name of env var holding the key |
+| **Instructions** | Role, conventions, additional instructions (use JSON for multi-line) |
+| **Step budget** | 1–100 model/tool rounds per turn (default 30) |
+| **Read-only** | Agent cannot edit/write files, run commands, or execute plugins |
+| **Command permissions** | `ask` (default), `deny`, `risk_assessed`, `allow` — destructive commands always blocked |
+| **AI plugin tools** | Expose plugin discovery/execution to the agent |
+| **Plugin allowlist** | Comma-separated enabled plugin names; empty = all enabled except explicit denials |
+| **Attached skills** | Comma-separated enabled skill IDs to include on each prompt |
+| **Sub-agent delegation** | Whether the primary AI can delegate to specialists |
+| **Delegations per turn** | 1–32 total tasks for whole root tree (default 4); descendants share budget |
+| **Task timeout** | 10–1800 seconds (default 300) for root turn and inherited deadlines |
+| **Attach editor context** | Include active file and selection in prompts and worker briefs |
+| **Built-in provider** | `router` (default), `kilo`, `custom`, `local` (on-device ONNX); `onnx` normalizes to `local` |
+| **Maximum agent depth** | 1–3 (default 2): root=0, child=1, grandchild=2; ancestors may lower the cap |
+| **Concurrent tasks** | 1–8 active tasks (default 4), including waiting coordinators |
+| **Overwatch stall timeout** | 15–600 seconds (default 150); child/approval/plugin waits exempt from idle detection |
+| **Pure generated functions** | Enable bounded task-scoped data transforms; no code execution |
+| **Extended AI toolkit** | Expose 100 host tools in 10 groups; write tools hidden from read-only agents |
+| **Toolkit groups** | Comma-separated: `workspace`, `text`, `buffers`, `edit`, `filesystem`, `search`, `git`, `ui`, `code`, `session`; empty = all |
+| **Model output token budget** | 256–16384 (default 4096), inherited restrictively |
 
-Explicit settings take precedence over environment defaults. Custom provider requests use `Authorization: Bearer <value of api_key_env>`; missing credentials are reported without exposing their value. Custom endpoints use the explicitly chosen model rather than discovering/failing over to unrelated free models.
-
-With `ask`, each shell command asks permission unless you select **Always allow** for the rest of the session or **Never ask** (saves `allow` so later sessions don't ask). `deny` blocks shell commands. `risk_assessed` lets the risk policy auto-allow low-risk commands without asking. `allow` never asks. Commands the risk policy marks as destructive remain blocked in every mode. Plugin approval is separate and always per invocation.
-
-Commands run through the machine's own shell rather than a hardcoded `sh`: `/bin/sh` on Linux, macOS, the BSDs and Android/Termux; on Windows `sh` when Git for Windows, MSYS2, Cygwin or WSL provides it, otherwise `cmd.exe` (PowerShell as last resort). The `bash.exe`/`wsl.exe`/`lxrun.exe` launcher stubs in the Windows system directory are never picked automatically (they relay to WSL rather than running a shell and fail with `WSL ... ERROR: CreateProcessCommon:...`); an explicit `TERMED_SHELL` can still use them. Set `TERMED_SHELL` to the program and its leading arguments, e.g. `TERMED_SHELL="bash -c"`. If no shell can be found, the tool reports that instead of failing silently.
-
-External ACP agents receive configured instructions, selected skills, model selection and an MCP server definition. Provider URLs, built-in step budgets and built-in tool restrictions do not reconfigure or sandbox an external process. An external agent must support ACP MCP servers to use the live editor tools. Use the built-in agent for host-enforced read-only and command restrictions; external agents and plugins remain trusted local programs with your account's filesystem access.
-
-### Example
-
-This is a partial configuration; omitted fields retain defaults:
+## Minimal Example
 
 ```json
 {
@@ -88,118 +44,25 @@ This is a partial configuration; omitted fields retain defaults:
   "editor": { "minimap": false, "word_wrap": true },
   "agent": {
     "backend": "builtin",
-    "provider": "custom",
-    "endpoint": "http://127.0.0.1:11434/v1",
-    "model": "your-tool-capable-model",
-    "api_key_env": "",
-    "instructions": "Prefer small patches. Explain how to verify each change.",
-    "max_steps": 2000,
-    "commands": "ask",
-    "plugins": true,
-    "allowed_plugins": ["text-tools", "stats", "todo"],
-    "denied_plugins": [],
-    "skills": ["project-style"],
+    "provider": "router",
+    "model": "free:code",
+    "instructions": "Prefer small changes. Explain how to verify each change.",
     "sub_agents": true,
     "max_delegations": 3,
     "toolkit": true,
-    "toolkit_groups": ["workspace", "text", "buffers", "edit", "search", "git"]
+    "toolkit_groups": ["workspace", "text", "buffers", "search", "git"]
   }
 }
 ```
 
-The loopback URL above is for a model server on the **same machine as termed**, not a browser-facing service. A remote provider's HTTPS API URL works too. Use **API key environment variable** for authentication rather than putting secrets into JSON or URLs.
+## AI Plugin Tools
 
-## AI plugin tools
+Available to the built-in agent and external MCP clients:
 
-The built-in agent and external MCP clients share these live tools:
-
-- `read_editor(file?)`: read an open buffer, including unsaved plugin edits.
-- `list_plugins()`: enabled, runnable, permitted plugins and their exact command IDs.
-- `run_plugin(plugin, command, arguments?, file?)`: request approval, run the exact command and wait for its real JSON-RPC result. `arguments` is passed as `params.arguments` to the plugin.
-- `list_skills()` / `read_skill(id)`.
-- `list_sub_agents()` / `delegate_task(agent, task, acceptance_criteria?, constraints?, context?, context_files?)`.
-- `report_progress(message)`, `task_status()`, `cancel_task(task_id)`.
-- `define_function(...)`, `list_functions()`, `call_function(name, arguments)`; built-in agents also get each generated `fn_` schema dynamically.
-
-Disabled tools are omitted from schemas **and** rejected at dispatch. Plugin allowlists and explicit denials also apply to delegated workers. Selecting Reject or stopping the turn returns an error to the AI — it does not launch the plugin command. A plugin that exits, times out, reports a JSON-RPC error or emits an error toast is reported as a failure, not a successful process launch.
-
-Plugin calls target the explicit workspace file or the active buffer captured when approval was requested. Switching tabs while a plugin runs does not redirect its edits. Changes remain unsaved and undoable. Results include plugin messages and the resulting buffer (with a size limit). **Read the live buffer after plugin edits; disk reads can still contain the old saved version.** Executable plugins are not sandboxed — inspect their manifests/scripts before enabling them or approving execution.
-
-Plugin command execution times out after 120 seconds; unanswered plugin approvals expire after five minutes. Stop cancels pending approvals, stops active plugin processes and cancels delegated tasks. Partial plugin edits remain visible and undoable rather than being silently reverted.
-
-### External ACP / MCP transport
-
-For external agents, termed supplies an authenticated **stdio MCP relay** in ACP's `mcpServers` list. It forwards requests to the live editor through a randomly authenticated loopback connection. Tools operate on the same buffers and approval cards as the built-in agent. The listener is not exposed on the network, the authentication value is session-local, and the relay writes JSON-RPC only to stdout. `--mcp-bridge` is an internal command, not a public unauthenticated tool server.
-
-## Extended host toolkit
-
-The host advertises 100 additional tools from a single catalog, in ten groups:
-
-| Group | Tools |
-|---|---|
-| `workspace` | `workspace_info`, `list_directory`, `tree_view`, `file_info`, `find_files`, `path_exists`, `workspace_stats`, `recent_files`, `file_checksum`, `directory_sizes` |
-| `text` | `read_lines`, `grep_context`, `todo_scan`, `word_stats`, `line_stats`, `whitespace_report`, `text_diff`, `buffer_disk_diff`, `json_query`, `regex_test` |
-| `buffers` | `list_buffers`, `buffer_info`, `get_selection`, `cursor_info`, `buffer_text`, `selection_count`, `bracket_balance`, `indent_report`, `buffer_changes`, `line_at` |
-| `edit` | `replace_in_buffer`, `replace_line_range`, `insert_lines`, `delete_lines`, `append_text`, `prepend_text`, `trim_trailing_whitespace`, `sort_lines`, `dedupe_lines`, `transform_case` |
-| `filesystem` | `create_file`, `create_directory`, `copy_path`, `move_path`, `delete_path`, `write_lines`, `patch_file`, `save_buffer`, `save_all_buffers`, `revert_buffer` |
-| `search` | `search_workspace`, `match_count`, `find_references`, `grep_patterns`, `list_large_files`, `list_empty_files`, `duplicate_basenames`, `replace_in_files`, `files_containing_all`, `symbol_search` |
-| `git` | `git_status`, `git_diff`, `git_log`, `git_show`, `git_branches`, `git_blame`, `git_file_history`, `git_remotes`, `git_stash_list`, `git_tags` |
-| `ui` | `notify_user`, `open_file`, `activate_buffer`, `close_buffer`, `go_to_line`, `select_range`, `list_themes`, `set_theme`, `toggle_view`, `get_ui_state` |
-| `code` | `detect_language`, `outline_symbols`, `dependency_summary`, `license_check`, `markdown_stats`, `import_summary`, `comment_ratio`, `function_sizes`, `test_map`, `json_validate` |
-| `session` | `list_toolkit`, `describe_tool`, `get_agent_settings`, `list_editor_commands`, `run_editor_command`, `open_palette`, `focus_panel`, `scratchpad_write`, `scratchpad_read`, `session_summary` |
-
-Every tool has a JSON schema, and the same catalog drives what is advertised, accepted and what runs — a disabled or non-permitted tool is not merely hidden; the host rejects the call. Rules:
-
-- **Read-only.** `read_only` hides every mutating tool and rejects `run_editor_command` for commands that change content. Git tools are fixed-argv, read-only commands (`status`, `diff`, `log`, `show`, `branch`, `blame`, `log --follow`, `remote`, `stash list`, `tag --list`) with no shell, and are hidden entirely when command permissions are `deny`.
-- **Live buffers first.** A tool that edits a file open in the editor replaces the buffer in one undo step and leaves it unsaved, instead of writing disk content over your unsaved work. `save_buffer`/`save_all_buffers` are the only toolkit calls that write buffers to disk, and `revert_buffer` needs `confirm: "DISCARD"`.
-- **Confirmation tokens.** Destructive calls fail closed without the literal token: `delete_path` requires `confirm: "DELETE"` (and `recursive: true` for a directory), `patch_file` and `replace_in_files` require `confirm: "APPLY"` when not dry runs, and `close_buffer` requires `DISCARD` to discard an edited buffer. `create_file`, `write_lines`, `copy_path` and `move_path` refuse to replace an existing path unless `overwrite` is true. `delete_path` also refuses the workspace root, paths inside `.git`, symlinks and files with an open buffer.
-- **Bounded.** Paths go through `workspace_path` resolution, so `..` escapes, symlink escapes and credential files are rejected. Scans stop after 2,000 files or 512 KiB per file; listings and match lists are capped; returned text is truncated at 96 KiB with an explicit note.
-- **Session notes.** `scratchpad_write`/`scratchpad_read` keep up to 64 keys and 32 KiB of notes for the current editor session. Memory-only: nothing is written to disk, and notes disappear when termed exits.
-
-Sub-agents inherit the toolkit: a child keeps `toolkit` only if its parent has it, and keeps only groups the parent already has — a specialist can never gain a group its parent lacks.
-
-## Sub-agents
-
-Three editable profiles are provided by default: **Reviewer**, **Test planner**, and **Coordinator**. All are read-only; the coordinator may delegate to the leaf profiles. Existing saved profile arrays remain authoritative. The sub-agent menu supports creating, enabling/disabling, changing the name/description, model, provider, instructions, budgets, permissions and attached skills, and deleting a profile with confirmation.
-
-Sub-agents are **built-in specialists**, even when the primary agent is external. Each gets a separate conversation, a scoped task brief, inherited project/ancestor instructions, immutable inherited skill snapshots and its own role/additional skills. An empty model and `auto` provider inherit the primary configuration. An inherited API key environment variable is not forwarded to a different explicitly configured provider endpoint.
-
-The host intersects permissions with the parent's settings: workers cannot bypass read-only mode, command denial, plugin restrictions, step limits or the task deadline. Nested delegation is bounded by depth, lineage cycle checks, global concurrency/delegation caps and inherited absolute deadlines. `sub_agents` must be enabled on a coordinator profile, not just the root. Results return to the parent as tool output; worker tool activity and approval requests are visible in the main transcript. Esc/Stop cancels the entire task tree. This is bounded task delegation, not a new operating-system sandbox or an autonomous always-running agent service.
-
-## Skills
-
-A skill is a folder containing **`SKILL.md`**, not an executable:
-
-```text
-<workspace>/.termed/skills/project-style/SKILL.md
-~/.config/termed/skills/project-style/SKILL.md
-```
-
-Workspace skills override user skills with the same ID. IDs contain 1–64 ASCII letters, digits, `-` or `_`. Skills are limited to 32 KB each and discovery is bounded. Simple single-line `name:` and `description:` front matter is supported:
-
-```markdown
----
-name: Project style
-description: Coding conventions and verification steps for this project
----
-
-# Project style
-
-Prefer small, focused changes. Add regression tests for Unicode and empty input.
-Run the project's relevant tests before reporting completion.
-```
-
-**Skills: Manage Skills** can create a skill, open its instructions in the editor, enable/disable it, attach/detach it from the primary agent, reload discovery and delete a workspace skill with confirmation. Per-specialist attached skill IDs are editable in each sub-agent's configuration. Global skills can be edited/disabled here, but not deleted by the workspace menu. Deletion removes `SKILL.md` only, not arbitrary additional files in its folder, and refuses to discard dirty instruction buffers.
-
-Required attached skills must exist, be enabled/readable and fit a combined 96 KiB budget, or the task fails explicitly instead of silently omitting instructions. Skill snapshots are inherited by descendants; other enabled skills are available on demand through the skill tools. Disabled skills are not listed, read through `read_skill`, or attached automatically. Disabling does not redact instructions already present in a conversation; start a new chat to clear prior context. Skills contain instructions sent to your configured model provider, so do not include secrets.
-
-## Verification
-
-Regression coverage lives in `tests/search.rs`, `tests/management.rs`, `tests/automation.rs` and the automation module's unit tests. `mock_automation_gateway.py` exercises plugin approval, unsaved buffer updates, skill loading and a read-only specialist using a local deterministic provider, without API keys or external model access.
-
-```sh
-cargo test
-cargo clippy --all-targets
-```
-
-Integration fixtures require Python 3; HTTPS fixtures also use OpenSSL. Run the production locked-dependency build and tests on the intended platforms before release. A live authenticated router request is a separate check from the local mock tests.
+- `read_editor(file?)` — open buffer including unsaved plugin edits
+- `list_plugins()` — enabled, runnable, permitted plugins and command IDs
+- `run_plugin(plugin, command, arguments?, file?)` — request approval, execute, return result + buffer
+- `list_skills()` / `read_skill(id)`
+- `list_sub_agents()` / `delegate_task(agent, task, acceptance_criteria?, constraints?, context?, context_files?)`
+- `report_progress(message)`, `task_status()`, `cancel_task(task_id)`
+- `define_function(...)`, `list_functions()`, `call_function(name, arguments)`
