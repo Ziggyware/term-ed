@@ -597,18 +597,18 @@ impl Default for Preferences {
             ..Default::default() };
         let reviewer = SubAgentConfig { id: "reviewer".into(), name: "Reviewer".into(),
             description: "Code review and bug analysis".into(),
-            agent: AgentConfig { instructions: "Review the requested code. Identify concrete bugs, security risks and missing tests; cite files and lines. Do not edit files.".into(), ..SubAgentConfig::default().agent },
+            agent: AgentConfig { read_only: true, instructions: "Review the requested code. Identify concrete bugs, security risks and missing tests; cite files and lines. Do not edit files.".into(), ..SubAgentConfig::default().agent },
             ..Default::default() };
         let tester = SubAgentConfig { id: "tester".into(), name: "Test planner".into(),
             description: "Test design and coverage analysis".into(),
-            agent: AgentConfig { instructions: "Inspect the code and propose focused regression tests, edge cases and verification commands. Do not edit or execute commands.".into(), ..SubAgentConfig::default().agent },
+            agent: AgentConfig { read_only: true, instructions: "Inspect the code and propose focused regression tests, edge cases and verification commands. Do not edit or execute commands.".into(), ..SubAgentConfig::default().agent },
             ..Default::default() };
         let coordinator=SubAgentConfig {id:"coordinator".into(),name:"Coordinator".into(),
             description:"Coordinator that can delegate focused reviews and test planning to grandchildren".into(),
             agent:AgentConfig{backend:"builtin".into(),provider:"auto".into(),read_only:false,commands:CommandPolicy::Deny,plugins:false,max_steps:18,sub_agents:true,
                 instructions:"Coordinate a focused investigation. When useful, delegate distinct evidence-based tasks to reviewer and tester, passing relevant findings, scope and acceptance criteria. Collect every result before finishing, verify claims, and report disagreements, blockers and checks not run. Do not edit files or execute commands.".into(),..Default::default()},..Default::default()};
         Self {
-            version: 3,
+            version: 4,
             editor: EditorConfig::default(),
             search: SearchConfig::default(),
             agent: AgentConfig::default(),
@@ -657,7 +657,7 @@ pub fn valid_id(id: &str) -> bool {
 
 impl Preferences {
     pub fn validate(&self) -> Result<()> {
-        if !matches!(self.version, 1 | 2 | 3) {
+        if !matches!(self.version, 1 | 2 | 3 | 4) {
             bail!("Unsupported settings version {}", self.version);
         }
         self.agent.validate()?;
@@ -689,7 +689,7 @@ impl Preferences {
         let mut value = serde_json::to_value(Self::default())?;
         let mut selected_in_file = false;
         let mut legacy_schema = false;
-        let mut file_version = 3;
+        let mut file_version = 4;
         // Existing per-project preferences are a migration source only. Once
         // user settings exist, old workspace files cannot override or break
         // the preferences chosen for all folders.
@@ -747,18 +747,22 @@ impl Preferences {
             prefs.agent.provider = "auto".into();
             environment_agent = true;
         }
-        if !matches!(prefs.version, 1 | 2 | 3) {
+        if !matches!(prefs.version, 1 | 2 | 3 | 4) {
             bail!("Unsupported settings version {}", prefs.version);
         }
         migrate_removed_backend(&mut prefs.agent, !environment_agent, legacy_schema);
         for profile in &mut prefs.sub_agents {
             migrate_removed_backend(&mut profile.agent, false, legacy_schema);
         }
-        if file_version < 3 {
+        // One-time refresh of the shipped built-in profiles whenever the
+        // defaults change (v3: workers became writable; v4: reviewer and
+        // tester returned to read-only analysis profiles). Custom
+        // profiles are preserved untouched.
+        if file_version < 4 {
             refresh_builtin_sub_agents(&mut prefs);
         }
         canonicalize_providers(&mut prefs);
-        prefs.version = 3;
+        prefs.version = 4;
         prefs.validate()?;
         Ok(prefs)
     }
@@ -1065,9 +1069,12 @@ mod command_policy_tests {
     }
 
     #[test]
-    fn v3_refresh_replaces_saved_read_only_builtins_and_keeps_custom_profiles() {
-        // Simulate a v2 settings file: the built-ins as they shipped
-        // (read-only, no worker profile) plus one user-defined profile.
+    fn builtin_refresh_restores_shipped_defaults_and_keeps_custom_profiles() {
+        // Simulate an old settings file: the built-ins with stale
+        // read_only flags (all read-only, no worker profile) plus one
+        // user-defined profile. The refresh must deliver the CURRENT
+        // shipped defaults — worker/coordinator writable, reviewer and
+        // tester read-only analysis profiles — and keep the custom one.
         let mut prefs = Preferences::default();
         for p in &mut prefs.sub_agents {
             p.agent.read_only = true;
@@ -1081,9 +1088,13 @@ mod command_policy_tests {
         refresh_builtin_sub_agents(&mut prefs);
         assert_eq!(prefs.sub_agents.len(), 5);
         assert_eq!(prefs.sub_agents[0].id, "worker");
-        for id in ["worker", "reviewer", "tester", "coordinator"] {
+        for id in ["worker", "coordinator"] {
             let p = prefs.sub_agents.iter().find(|p| p.id == id).unwrap();
             assert!(!p.agent.read_only, "{id} must be writable after refresh");
+        }
+        for id in ["reviewer", "tester"] {
+            let p = prefs.sub_agents.iter().find(|p| p.id == id).unwrap();
+            assert!(p.agent.read_only, "{id} is a read-only analysis profile");
         }
         assert!(prefs.sub_agents.iter().any(|p| p.id == "mine"));
     }

@@ -232,7 +232,10 @@ fn menus_render_at_desktop_and_phone_sizes_and_have_click_targets() {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(|f| termed::ui::draw(f, &mut a, true)).unwrap();
         if w >= 80 {
-            for cmd in [Command::Settings, Command::Plugins, Command::FindInFiles] {
+            // The title bar's clickable chrome is the agent toggle, quick
+            // open, and the command palette (⋯); Settings/Plugins live in
+            // the palette, exercised by the second loop below.
+            for cmd in [Command::AgentToggle, Command::QuickOpen, Command::CommandPalette] {
                 assert!(
                     a.layout
                         .click_items
@@ -876,7 +879,7 @@ fn legacy_builtin_implicit_gateway_becomes_router_but_new_explicit_auto_is_prese
     let old = r#"{"version":1,"agent":{"backend":"builtin","provider":"auto","model":"opencode/big-pickle","read_only":true}}"#;
     std::fs::write(&path, old).unwrap();
     let mut prefs = Preferences::load(&root).unwrap();
-    assert_eq!(prefs.version, 2);
+    assert_eq!(prefs.version, Preferences::default().version);
     assert!(prefs.agent.uses_router());
     assert!(prefs.agent.model.is_empty());
     assert!(prefs.agent.read_only);
@@ -884,7 +887,7 @@ fn legacy_builtin_implicit_gateway_becomes_router_but_new_explicit_auto_is_prese
     prefs.save(&root).unwrap();
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap()["version"],
-        2
+        Preferences::default().version
     );
 
     // A deliberate choice of legacy auto in the new schema stays a choice,

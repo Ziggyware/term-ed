@@ -52,8 +52,13 @@ fn built_in_agent_uses_live_plugins_skills_and_an_isolated_specialist() {
     prefs.agent.model = "test/automation".into();
     prefs.agent.instructions = "PARENT-AUTOMATION".into();
     prefs.agent.skills = vec!["policy".into()];
-    prefs.sub_agents[0].agent.instructions = "SPECIALIST-REVIEW".into();
-    prefs.sub_agents[0].agent.skills = vec!["policy".into()];
+    let reviewer = prefs
+        .sub_agents
+        .iter_mut()
+        .find(|p| p.id == "reviewer")
+        .unwrap();
+    reviewer.agent.instructions = "SPECIALIST-REVIEW".into();
+    reviewer.agent.skills = vec!["policy".into()];
     prefs.save(&root).unwrap();
     let mut app = App::new(
         root.clone(),

@@ -414,6 +414,12 @@ fn length_stop_failure(msg: &str, status: Option<u16>) -> bool {
     status == Some(413) && msg.contains("stopped with length")
 }
 
+/// Per-turn cap on partial-write salvages (see ModelResponse::salvage_write):
+/// generous enough for a multi-chunk file built across several capped
+/// replies, small enough that a model which keeps overrunning still
+/// terminates via the ordinary length-stop failure.
+const MAX_SALVAGES_PER_TURN: u32 = 4;
+
 /// The bounded length-stop recovery decision: after a length stop, the
 /// step may be retried once with this instruction appended to the history;
 /// a second length stop (or any other failure) gets no recovery. Returns
@@ -459,6 +465,10 @@ struct Worker {
     next_id: u64,
     next_tool_id: u64,
     used_tool_ids: HashSet<String>,
+    /// Partial write_file salvages performed in the current turn (see
+    /// ModelResponse::salvage_write); reset when a turn starts and capped
+    /// so a model that keeps overrunning cannot loop forever.
+    salvage_count: u32,
     /// Shared "Always allow" grant for command execution. The handle is
     /// shared across the delegation tree (see adopt_always_allow): a grant
     /// given to one worker is honored by workers spawned afterwards,
@@ -524,6 +534,7 @@ impl Worker {
             next_id: 1000,
             next_tool_id: 0,
             used_tool_ids: HashSet::new(),
+            salvage_count: 0,
             always_allow_commands: Arc::new(AtomicBool::new(false)),
             policy,
             model_selector,
@@ -993,7 +1004,8 @@ impl Worker {
              - Surgical Edits: Prefer `edit_file` with a minimal, unique `old_text` (including 2-3 surrounding context lines) over rewriting whole files with `write_file`.\n\
              - Chunked Output: Each of your replies has a hard output-token cap, and a reply that is cut off mid-tool-call is discarded whole. Fit output into smaller calls from the start: keep every write_file/append_file content to at most ~6,000 characters, building large files chunk by chunk (write_file first, then append_file), and prefer several small edit_file changes over one whole-file rewrite.\n\
              - Live Buffer Discipline: Plugin tools (`run_plugin`) mutate live unsaved editor buffers. Always inspect their returned buffer or call `read_editor`; never overwrite live plugin edits with stale disk content.\n\
-             - Specialist & Skill Discovery: Use `list_skills`/`read_skill` when relevant domain skills exist, and `list_sub_agents`/`delegate_task` for focused parallel or specialist sub-tasks."
+             - Specialist & Skill Discovery: Use `list_skills`/`read_skill` when relevant domain skills exist, and `list_sub_agents`/`delegate_task` for focused parallel or specialist sub-tasks.\n\
+             - Delegation Discipline: When work spans several files, delegate instead of reading everything yourself first — your context is the scarcest budget in the run, and files you pre-read are re-read by the worker anyway. Briefs carry the goal, acceptance criteria, and constraints, NOT file contents: never paste file text or long tool output into a brief (context is capped and crowds out the task); workers read files themselves, and context_files is only for small files a worker cannot locate alone. Assign ONE file or ONE concern per worker and run independent delegations in parallel. Match the profile to the work (see list_sub_agents): worker implements and edits; reviewer analyzes and does not edit; tester plans and runs tests; coordinator plans a split. An oversized brief or a wrong-profile delegation wastes the whole run."
         };
         let mut prompt = format!(
             "You are termed AI, an autonomous coding agent embedded inside the termed code editor.\n\
@@ -1143,6 +1155,7 @@ impl Worker {
         // Bounded length-stop recovery: one retry per step, reset on any
         // successful step (see the Step::Failed arm below).
         let mut length_retries = 0u32;
+        self.salvage_count = 0;
         loop {
             if self.cancel.load(Ordering::SeqCst) {
                 return "cancelled";
@@ -1487,6 +1500,29 @@ impl Worker {
 
     /// One model call. Ok(true) = tools ran, call the model again. `finalize`
     /// withholds tools and demands an answer; it never returns Ok(true).
+    /// When a step dies on the output cap, recover a partial write_file
+    /// if the response holds one and the per-turn salvage budget has
+    /// room. Returns None for every other failure (including the
+    /// finalize pass, where calls are discarded by design), which then
+    /// propagates unchanged into the ordinary length-stop recovery.
+    fn try_salvage(
+        &self,
+        response: &crate::model_response::ModelResponse,
+        err: &Step,
+        finalize: bool,
+    ) -> Option<crate::model_response::SalvagedWrite> {
+        if finalize || self.salvage_count >= MAX_SALVAGES_PER_TURN {
+            return None;
+        }
+        let Step::Failed(message, status) = err else {
+            return None;
+        };
+        if !length_stop_failure(message, *status) {
+            return None;
+        }
+        response.salvage_write()
+    }
+
     fn step(&mut self, finalize: bool) -> Result<bool, Step> {
         if self.options.uses_local() && self.local.is_none() && self.remote_override.is_none() {
             let endpoint = crate::provider::local_endpoint(&self.options);
@@ -1679,6 +1715,7 @@ impl Worker {
                 }));
             }
         };
+        let mut salvaged_write: Option<crate::model_response::SalvagedWrite> = None;
         if is_json {
             let mut text = String::new();
             std::io::Read::take(&mut reader, 2 * 1024 * 1024 + 1)
@@ -1701,7 +1738,12 @@ impl Worker {
             }
             let value: Value = serde_json::from_str(&text)
                 .map_err(|_| Step::Failed("Malformed model JSON response".into(), Some(502)))?;
-            self.accept_model_event(&mut response, &value, key.as_ref())?;
+            if let Err(e) = self.accept_model_event(&mut response, &value, key.as_ref()) {
+                match self.try_salvage(&response, &e, finalize) {
+                    Some(w) => salvaged_write = Some(w),
+                    None => return Err(e),
+                }
+            }
         } else {
             let mut bytes = 0;
             loop {
@@ -1743,13 +1785,37 @@ impl Worker {
                 }
                 let value: Value = serde_json::from_str(data)
                     .map_err(|_| Step::Failed("Malformed model stream event".into(), Some(502)))?;
-                self.accept_model_event(&mut response, &value, key.as_ref())?;
+                if let Err(e) = self.accept_model_event(&mut response, &value, key.as_ref()) {
+                    match self.try_salvage(&response, &e, finalize) {
+                        Some(w) => {
+                            salvaged_write = Some(w);
+                            break;
+                        }
+                        None => return Err(e),
+                    }
+                }
             }
         }
         let truncated = response.was_truncated();
-        let (content, mut calls) = response
-            .finish()
-            .map_err(|e| Step::Failed(clean(&e.message), Some(e.status)))?;
+        let (content, mut calls) = if let Some(w) = &salvaged_write {
+            // The reply died on the output cap mid-write_file: execute
+            // the partial write through the normal governed path, then
+            // (below, after its result) instruct the model to continue
+            // the file with append_file from the exact saved tail.
+            self.salvage_count += 1;
+            (
+                response.partial_content().to_string(),
+                vec![(
+                    String::new(),
+                    "write_file".to_string(),
+                    json!({"path": w.path, "content": w.content}).to_string(),
+                )],
+            )
+        } else {
+            response
+                .finish()
+                .map_err(|e| Step::Failed(clean(&e.message), Some(e.status)))?
+        };
         if truncated && self.local.is_some() {
             self.notice(
                 "The local model reached its output limit; the answer is cut short. Raise the model output budget or ask for a smaller step.",
@@ -1810,6 +1876,27 @@ impl Worker {
         for ((id, _, _), result) in calls.iter().zip(results) {
             self.history
                 .push(json!({"role":"tool","tool_call_id":id,"content":result.unwrap_or_default()}));
+        }
+        if let Some(w) = salvaged_write {
+            let tail_start = w
+                .content
+                .char_indices()
+                .rev()
+                .nth(39)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            let tail = &w.content[tail_start..];
+            self.history.push(json!({"role":"user","content":format!(
+                "[router] The write_file call for {} hit the output limit and was cut off. The {} characters that arrived were saved to the file exactly as received; the saved content ends with: …{tail}\nContinue the file with append_file, starting from precisely that point — do not repeat anything already saved, and keep each append_file chunk under ~6,000 characters.",
+                w.path, w.chars
+            )}));
+            self.notice(
+                &format!(
+                    "Output limit cut off the write of {}; the partial file ({} chars) was saved and will be continued with append_file.",
+                    w.path, w.chars
+                ),
+                false,
+            );
         }
         Ok(true)
     }

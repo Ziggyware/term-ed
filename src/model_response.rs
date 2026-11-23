@@ -82,6 +82,18 @@ impl ModelResponse {
                     self.finished = true;
                     return Ok(update);
                 }
+                // Merge this event's own tool-call fragments before
+                // failing: a length finish often rides with the last
+                // fragment, and salvage (below) should see every byte
+                // the provider actually sent.
+                if reason == "length"
+                    && let Some(delta) = choice
+                        .get("delta")
+                        .filter(|v| v.is_object())
+                        .or_else(|| choice.get("message").filter(|v| v.is_object()))
+                {
+                    let _ = merge_tool_calls(&mut self.calls, delta);
+                }
                 return Err(ResponseError {
                     message: format!(
                         "Model stopped with {reason}; partial tool calls were not executed. Adjust the output budget or task."
@@ -135,6 +147,36 @@ impl ModelResponse {
         &self.content
     }
 
+    /// Recover a partial `write_file` from the calls accumulated before a
+    /// length stop. Only the FIRST call is eligible, and only when its
+    /// path is fully formed and some content arrived: the write is then
+    /// safe to execute as-is (it creates the file with the received
+    /// prefix), and the caller instructs the model to continue the file
+    /// with append_file from the exact tail. Anything else — a different
+    /// first call, a cut path, no content — is not salvageable and keeps
+    /// the discard-and-retry behavior.
+    pub fn salvage_write(&self) -> Option<SalvagedWrite> {
+        let call = self.calls.iter().flatten().next()?;
+        if call.1 != "write_file" {
+            return None;
+        }
+        let args = &call.2;
+        // Non-streaming shape: the arguments arrived whole.
+        if let Ok(v) = serde_json::from_str::<Value>(args) {
+            let path = v.get("path").and_then(Value::as_str)?;
+            let content = v.get("content").and_then(Value::as_str)?;
+            if path.is_empty() || content.is_empty() {
+                return None;
+            }
+            return Some(SalvagedWrite {
+                path: path.to_string(),
+                chars: content.chars().count(),
+                content: content.to_string(),
+            });
+        }
+        salvage_truncated_write(args)
+    }
+
     pub fn finish(self) -> Result<(String, Vec<ToolCall>), ResponseError> {
         if !self.finished {
             return Err(ResponseError::bad_gateway(
@@ -163,6 +205,115 @@ impl ModelResponse {
 /// Some upstreams leak their native tool-call markup into `content` instead of
 /// `tool_calls`: JSON bodies (Hermes/Qwen) or key/value tags (GLM `arg_*`,
 /// `param_*`). Returns the prose before the first call and the parsed calls.
+/// A `write_file` recovered from a reply that hit the output cap: the
+/// path is complete and `content` is the exact prefix that arrived.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SalvagedWrite {
+    pub path: String,
+    pub content: String,
+    pub chars: usize,
+}
+
+/// Parse one JSON string starting at the opening quote found at or after
+/// `from` in `chars`. Returns the decoded text, the index just past the
+/// string, and whether the closing quote was present. An unterminated
+/// string (the stream was cut) yields the text decoded so far; a trailing
+/// incomplete escape sequence is dropped rather than guessed.
+fn parse_json_string(
+    chars: &[char],
+    from: usize,
+) -> Option<(String, usize, bool)> {
+    let mut i = from;
+    while i < chars.len() && chars[i] != '"' {
+        i += 1;
+    }
+    if i >= chars.len() {
+        return None;
+    }
+    i += 1; // opening quote
+    let mut out = String::new();
+    while i < chars.len() {
+        match chars[i] {
+            '"' => return Some((out, i + 1, true)),
+            '\\' => {
+                // An escape cut in half by the stream end keeps the text
+                // decoded so far; it is never guessed.
+                let Some(esc) = chars.get(i + 1) else {
+                    return Some((out, i, false));
+                };
+                let decoded = match esc {
+                    '"' => '"',
+                    '\\' => '\\',
+                    '/' => '/',
+                    'b' => '\u{0008}',
+                    'f' => '\u{000C}',
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    'u' => {
+                        let Some(hex_chars) = chars.get(i + 2..i + 6) else {
+                            return Some((out, i, false));
+                        };
+                        let hex: String = hex_chars.iter().collect();
+                        let Ok(code) = u32::from_str_radix(&hex, 16) else {
+                            return Some((out, i, false));
+                        };
+                        out.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+                        i += 6;
+                        continue;
+                    }
+                    _ => return Some((out, i, false)),
+                };
+                out.push(decoded);
+                i += 2;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    Some((out, i, false))
+}
+
+/// Find `"key"` in a truncated JSON object and parse the string value
+/// after its colon.
+fn truncated_field(chars: &[char], key: &str, from: usize) -> Option<(String, usize, bool)> {
+    let needle: Vec<char> = format!("\"{key}\"").chars().collect();
+    let mut i = from;
+    while i + needle.len() <= chars.len() {
+        if chars[i..i + needle.len()] == needle[..] {
+            let mut j = i + needle.len();
+            while j < chars.len() && (chars[j] == ':' || chars[j].is_whitespace()) {
+                j += 1;
+            }
+            return parse_json_string(chars, j);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Salvage from stream-truncated write_file arguments of the shape
+/// `{"path":"...","content":"...` (schema order: path first). The path
+/// must be complete; the content may be cut mid-string.
+fn salvage_truncated_write(args: &str) -> Option<SalvagedWrite> {
+    let chars: Vec<char> = args.chars().collect();
+    let (path, next, path_complete) = truncated_field(&chars, "path", 0)?;
+    if !path_complete || path.is_empty() {
+        return None;
+    }
+    let (content, _, _) = truncated_field(&chars, "content", next)?;
+    if content.is_empty() {
+        return None;
+    }
+    Some(SalvagedWrite {
+        chars: content.chars().count(),
+        path,
+        content,
+    })
+}
+
 fn textual_tool_calls(content: &str) -> Option<(String, Vec<ToolCall>)> {
     let (head, rest) = content.split_once("<tool_call>")?;
     let mut calls = Vec::new();
@@ -457,6 +608,67 @@ mod tests {
         let mut later = vec![("fresh".into(), "search".into(), "{}".into())];
         assign_tool_call_ids(&mut later, &mut used, &mut counter);
         assert_eq!(later[0].0, "termed_call_4");
+    }
+
+    #[test]
+    fn length_stop_salvages_a_partial_write_file() {
+        // Streamed write_file, cut mid-content: push still errors (the
+        // step must not proceed as if the call completed), but the
+        // partial write is recoverable.
+        let mut response = ModelResponse::default();
+        response
+            .push(&json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"write_file","arguments":"{\"path\":\"docs/a.md\",\"con"}}]}}]}))
+            .unwrap();
+        response
+            .push(&json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"tent\":\"Hello\\nwor"}}]}}]}))
+            .unwrap();
+        let err = response
+            .push(&json!({"choices":[{"finish_reason":"length"}]}))
+            .unwrap_err();
+        assert_eq!(err.status, 413);
+        let salvaged = response.salvage_write().expect("partial write salvages");
+        assert_eq!(salvaged.path, "docs/a.md");
+        assert_eq!(salvaged.content, "Hello\nwor");
+        assert_eq!(salvaged.chars, 9);
+
+        // A trailing escape cut in half keeps the decoded prefix.
+        let mut response = ModelResponse::default();
+        response
+            .push(&json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"write_file","arguments":"{\"path\":\"a.txt\",\"content\":\"line\\"}}]}}]}))
+            .unwrap();
+        assert!(response
+            .push(&json!({"choices":[{"finish_reason":"length"}]}))
+            .is_err());
+        let salvaged = response.salvage_write().expect("prefix before cut escape");
+        assert_eq!(salvaged.content, "line");
+
+        // Whole-arguments providers: complete JSON in one message that
+        // still finished on length.
+        let mut response = ModelResponse::default();
+        assert!(response
+            .push(&json!({"choices":[{"message":{"tool_calls":[{"function":{"name":"write_file","arguments":"{\"path\":\"a.txt\",\"content\":\"whole\"}"}}]},"finish_reason":"length"}]}))
+            .is_err());
+        let salvaged = response.salvage_write().expect("whole-args write salvages");
+        assert_eq!(salvaged.content, "whole");
+
+        // Not salvageable: a different first call, and a cut path.
+        let mut response = ModelResponse::default();
+        response
+            .push(&json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"read_file","arguments":"{\"path\":\"a.txt\"}"}}]}}]}))
+            .unwrap();
+        assert!(response
+            .push(&json!({"choices":[{"finish_reason":"length"}]}))
+            .is_err());
+        assert!(response.salvage_write().is_none());
+
+        let mut response = ModelResponse::default();
+        response
+            .push(&json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"write_file","arguments":"{\"path\":\"docs/a"}}]}}]}))
+            .unwrap();
+        assert!(response
+            .push(&json!({"choices":[{"finish_reason":"length"}]}))
+            .is_err());
+        assert!(response.salvage_write().is_none());
     }
 
     #[test]

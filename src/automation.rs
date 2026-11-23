@@ -1916,9 +1916,10 @@ mod supervision_tests {
         assert_eq!(c.brief.parent_id, Some(parent));
         assert_eq!(c.brief.root_goal, "ROOT-GOAL");
         assert!(c.deadline <= p.deadline);
-        // Sub-agents have full write access by default (governed write
-        // orders still apply); read_only is an explicit per-profile opt-in.
-        assert!(!c.agent.options.read_only);
+        // The delegated agent's options mirror its profile: the reviewer
+        // is a read-only analysis profile by design (the worker profile
+        // is the writable default).
+        assert!(c.agent.options.read_only);
         assert!(!c.agent.options.sub_agents);
         assert!(
             c.agent
