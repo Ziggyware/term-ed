@@ -464,6 +464,19 @@ impl App {
         // A leaf's advertised tools agree with the actual depth boundary. The
         // dispatcher repeats all checks for invented calls and MCP clients.
         config.sub_agents &= brief.depth < config.max_agent_depth;
+        // Always-allow grants flow down the delegation tree: a worker
+        // spawned after an "Always allow" answer inherits the grant
+        // instead of re-prompting for the same tool kind.
+        let grant = match source {
+            Source::Main => self.agent.always_allow_handle(),
+            Source::Sub(id) => self
+                .automation
+                .tasks
+                .iter()
+                .find(|t| t.id == id)
+                .map(|t| t.agent.always_allow_handle())
+                .unwrap_or_else(|| self.agent.always_allow_handle()),
+        };
         let parent_context = match source {
             Source::Main => self.agent.skill_context.clone(),
             Source::Sub(id) => self
@@ -489,6 +502,7 @@ impl App {
             return fail(self, reply, "Required inherited/role skills exceed 96 KiB; narrow attached skills instead of silently omitting instructions".into());
         }
         let mut agent = Agent::new(self.explorer.root.clone());
+        agent.inherit_always_allow(grant);
         if let Err(e) = agent.configure(config, skills) {
             return fail(self, reply, e);
         }

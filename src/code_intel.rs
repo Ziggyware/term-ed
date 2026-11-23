@@ -118,12 +118,19 @@ pub fn word_at(line: &str, col: usize) -> Option<Word> {
 /// Guess a word's kind from how it appears. These are the cheap signals that
 /// are right most of the time; anything uncertain stays `Unknown` rather than
 /// claiming precision it does not have.
+/// The whitespace-delimited token immediately before a word: the keyword
+/// that introduces a declaration, when there is one. (Matching whole tokens
+/// matters: matching a trimmed prefix against patterns that end in a space
+/// can never succeed, which is how declaration kinds were lost before.)
+fn prev_token(before: &str) -> &str {
+    before.split_whitespace().next_back().unwrap_or("")
+}
+
 fn classify(line: &str, start: usize, end: usize) -> SymbolKind {
     let chars: Vec<char> = line.chars().collect();
     let before: String = chars[..start].iter().collect();
     let after: String = chars[end..].iter().collect();
     let word: String = chars[start..end].iter().collect();
-    let before_trim = before.trim_end();
     let after_trim = after.trim_start();
     let first = word.chars().next().unwrap_or(' ');
 
@@ -132,34 +139,15 @@ fn classify(line: &str, start: usize, end: usize) -> SymbolKind {
     {
         return SymbolKind::Constant;
     }
-    if before_trim.ends_with("fn ")
-        || before_trim.ends_with("def ")
-        || before_trim.ends_with("func ")
-        || before_trim.ends_with("function ")
-        || before_trim.ends_with("sub ")
-    {
-        return SymbolKind::Function;
-    }
-    if before_trim.ends_with("struct ")
-        || before_trim.ends_with("class ")
-        || before_trim.ends_with("enum ")
-        || before_trim.ends_with("trait ")
-        || before_trim.ends_with("interface ")
-        || before_trim.ends_with("type ")
-        || before_trim.ends_with("impl ")
-        || before_trim.ends_with("record ")
-    {
-        return SymbolKind::Type;
-    }
-    if before_trim.ends_with("macro_rules! ") || before_trim.ends_with("#define ") {
-        return SymbolKind::Macro;
-    }
-    if before_trim.ends_with("const ") || before_trim.ends_with("static ") {
-        return SymbolKind::Constant;
-    }
-    if before_trim.ends_with("let ") || before_trim.ends_with("var ") || before_trim.ends_with("mut ")
-    {
-        return SymbolKind::Variable;
+    match prev_token(&before) {
+        "fn" | "def" | "func" | "function" | "sub" => return SymbolKind::Function,
+        "struct" | "class" | "enum" | "trait" | "interface" | "type" | "impl" | "record" => {
+            return SymbolKind::Type
+        }
+        "macro_rules!" | "#define" => return SymbolKind::Macro,
+        "const" | "static" => return SymbolKind::Constant,
+        "let" | "var" | "mut" => return SymbolKind::Variable,
+        _ => {}
     }
     // `name(` or `name (` is a call site; `name:` or `name =` is a binding.
     if after_trim.starts_with('(') {
@@ -218,21 +206,55 @@ pub fn occurrences(text: &str, word: &str) -> Vec<Occurrence> {
     out
 }
 
-/// Definition candidates: occurrences that look like declarations, in the
-/// order a person would try them. `word` may be a `Type::member` tail, which
-/// is why the field/type kinds are accepted here.
+/// Is this occurrence a declaration rather than a use? Kind alone cannot
+/// say: a call site and a declaration both classify as `Function` (both are
+/// followed by `(`), and an all-caps constant classifies the same at its
+/// declaration and at every use. The token before the word and the shape
+/// after it carry the distinction.
+fn is_declaration(line: &str, occ: &Occurrence) -> bool {
+    let before: String = line.chars().take(occ.col).collect();
+    let prev = prev_token(&before);
+    match occ.kind {
+        // A function declaration is introduced by a keyword; a bare
+        // `name(` is a call.
+        SymbolKind::Function => {
+            matches!(prev, "fn" | "def" | "func" | "function" | "sub")
+        }
+        SymbolKind::Type => matches!(
+            prev,
+            "struct" | "class" | "enum" | "trait" | "interface" | "type" | "impl" | "record"
+        ),
+        SymbolKind::Constant => {
+            if matches!(prev, "const" | "static") {
+                return true;
+            }
+            // An all-caps use (`x = MAX + 1`) is not a declaration; an
+            // all-caps binding (`MAX: usize = 4`, `MAX = 4`) is.
+            let after: String = line
+                .chars()
+                .skip(occ.col + occ.text.chars().count())
+                .collect();
+            let after = after.trim_start();
+            after.starts_with(':') || after.starts_with('=')
+        }
+        // These kinds only arise in declaration position under classify():
+        // Variable from let/var/mut, Macro from macro_rules!/#define, and
+        // Field from a `name:` / `name =` binding shape.
+        SymbolKind::Variable | SymbolKind::Macro | SymbolKind::Field => true,
+        SymbolKind::Unknown => false,
+    }
+}
+
+/// Definition candidates: occurrences that are declarations, in the order
+/// a person would try them. `word` may be a `Type::member` tail, which is
+/// why the field kind is accepted here.
 pub fn definitions(text: &str, word: &str) -> Vec<Occurrence> {
+    let lines: Vec<&str> = text.split('\n').collect();
     occurrences(text, word)
         .into_iter()
         .filter(|o| {
-            matches!(
-                o.kind,
-                SymbolKind::Function
-                    | SymbolKind::Type
-                    | SymbolKind::Constant
-                    | SymbolKind::Variable
-                    | SymbolKind::Macro
-            )
+            let line = lines.get(o.line).copied().unwrap_or("");
+            is_declaration(line, o)
         })
         .collect()
 }
@@ -413,50 +435,141 @@ pub fn enclosing_block(text: &str, line: usize) -> Option<(usize, usize)> {
     if line >= lines.len() {
         return None;
     }
-    let indent_of = |l: &str| l.chars().take_while(|c| *c == ' ' || *c == '\t').count();
-    let target = indent_of(lines[line]);
-    let mut start = line;
-    while start > 0 {
-        let prev = lines[start - 1];
-        if prev.trim().is_empty() {
-            start -= 1;
-            continue;
-        }
-        if indent_of(prev) < target {
-            break;
-        }
-        start -= 1;
+    // Standing on the blank separator under a block means that block: the
+    // caret's effective line is the first non-blank line at or above it.
+    // (The old indent walk compared every line against the blank line's
+    // indent of 0, so it walked to the top of the file.)
+    let mut anchor = line;
+    while anchor > 0 && lines[anchor].trim().is_empty() {
+        anchor -= 1;
     }
-    // Walk forward to the line that closes the block: either indentation drops
-    // below the header, or braces return to their starting depth.
-    let header_indent = indent_of(lines[start]);
-    let mut depth = 0isize;
-    let mut end = line;
-    let mut saw_brace = false;
-    for (i, l) in lines.iter().enumerate().skip(start) {
-        for c in l.chars() {
-            match c {
-                '{' => {
-                    depth += 1;
-                    saw_brace = true;
-                }
-                '}' => depth -= 1,
-                _ => {}
-            }
-        }
-        end = i;
-        if saw_brace && depth <= 0 {
-            break;
-        }
-        if !saw_brace && i > start && !l.trim().is_empty() && indent_of(l) <= header_indent {
-            end = i.saturating_sub(1);
-            break;
-        }
+    if lines[anchor].trim().is_empty() {
+        return None;
+    }
+    let net: Vec<isize> = lines
+        .iter()
+        .map(|l| {
+            l.chars()
+                .map(|c| match c {
+                    '{' => 1,
+                    '}' => -1,
+                    _ => 0,
+                })
+                .sum()
+        })
+        .collect();
+    let (start, mut end) = brace_block(&net, anchor)
+        .or_else(|| indent_block(&lines, anchor))?;
+    // Blank lines the caret is standing on, directly under the block, are
+    // part of the range the user means.
+    if line > end && lines[end + 1..=line].iter().all(|l| l.trim().is_empty()) {
+        end = line;
     }
     if start == end {
         None
     } else {
         Some((start, end))
+    }
+}
+
+/// The innermost brace block touching `anchor`: the block it opens, the
+/// block it closes, or the block it sits inside. Brace counting is the
+/// module's usual cheap rule — braces inside strings or comments count,
+/// which is acceptable for an extraction aid that never edits by itself.
+fn brace_block(net: &[isize], anchor: usize) -> Option<(usize, usize)> {
+    // The line that closes the block opened at `header`.
+    let close_of = |header: usize| -> Option<usize> {
+        let mut pending = net[header];
+        if pending <= 0 {
+            return None;
+        }
+        for (i, n) in net.iter().enumerate().skip(header + 1) {
+            pending += n;
+            if pending <= 0 {
+                return Some(i);
+            }
+        }
+        None
+    };
+    if net[anchor] < 0 {
+        // The anchor closes a block: match opens against closes upward.
+        let mut pending = 1isize;
+        for j in (0..anchor).rev() {
+            if net[j] < 0 {
+                pending += -net[j];
+            } else if net[j] > 0 {
+                pending -= net[j];
+                if pending == 0 {
+                    return Some((j, anchor));
+                }
+            }
+        }
+        return None;
+    }
+    if net[anchor] > 0 {
+        // The anchor opens a block.
+        return close_of(anchor).map(|close| (anchor, close));
+    }
+    // A plain body line: the header is the first unmatched opener above.
+    let mut pending = 0isize;
+    for j in (0..anchor).rev() {
+        if net[j] < 0 {
+            pending += -net[j];
+        } else if net[j] > 0 {
+            if pending == 0 {
+                return close_of(j).map(|close| (j, close));
+            }
+            pending -= net[j];
+        }
+    }
+    None
+}
+
+/// Indentation-based fallback for brace-free languages (Python): the
+/// header is the nearest less-indented line above the anchor, and the
+/// block runs until indentation returns to the header's level.
+fn indent_block(lines: &[&str], anchor: usize) -> Option<(usize, usize)> {
+    let indent_of = |l: &str| l.chars().take_while(|c| *c == ' ' || *c == '\t').count();
+    let target = indent_of(lines[anchor]);
+    let mut header = anchor;
+    if target == 0 {
+        // The anchor itself must head an indented run to be a block.
+        let has_body = lines[anchor + 1..]
+            .iter()
+            .find(|l| !l.trim().is_empty())
+            .is_some_and(|l| indent_of(l) > 0);
+        if !has_body {
+            return None;
+        }
+    } else {
+        loop {
+            if header == 0 {
+                return None;
+            }
+            header -= 1;
+            if lines[header].trim().is_empty() {
+                continue;
+            }
+            if indent_of(lines[header]) < target {
+                break;
+            }
+        }
+    }
+    let header_indent = indent_of(lines[header]);
+    let mut end = anchor;
+    for (i, l) in lines.iter().enumerate().skip(anchor + 1) {
+        if l.trim().is_empty() {
+            continue;
+        }
+        if indent_of(l) <= header_indent {
+            break;
+        }
+        end = i;
+    }
+    if end == header {
+        None
+    } else {
+        Some((header, end))
     }
 }
 
@@ -650,9 +763,13 @@ fn main() {
         assert_eq!(w.text, "total");
         // Caret immediately after the word still selects it.
         assert_eq!(word_at(line, 13).unwrap().text, "total");
-        // `.` splits, so the field is found on its own.
-        assert_eq!(word_at(line, 16).unwrap().text, "x");
-        assert!(word_at(line, 8).is_none(), "whitespace is not a word");
+        // `.` splits, so the field is found on its own. (`x` is at column
+        // 18: `total` spans 8..13, `=` is 14, `p` is 16, `.` is 17.)
+        assert_eq!(word_at(line, 18).unwrap().text, "x");
+        // Column 15 is the space after `=`; neither neighbour is a word
+        // character, so nothing is selected. (Column 8 is the `t` of
+        // `total` itself.)
+        assert!(word_at(line, 15).is_none(), "whitespace is not a word");
         assert!(word_at("    1234", 5).is_none(), "numbers are not symbols");
         assert!(word_at("", 0).is_none());
     }
@@ -678,7 +795,9 @@ fn main() {
         assert_eq!(defs[0].line, 4);
         let refs = references(SRC, "magnitude");
         assert_eq!(refs.len(), 1, "{refs:?}");
-        assert_eq!(refs[0].line, 12);
+        // The call `let _ = magnitude(origin);` is SRC line 11 (line 12 is
+        // the closing brace of `main`).
+        assert_eq!(refs[0].line, 11);
 
         // A type used in a signature is a use, the struct is the definition.
         let defs = definitions(SRC, "Point");
@@ -734,7 +853,8 @@ fn main() {
         assert_eq!(edits.len(), 2, "one declaration, one call");
         assert!(edits.iter().all(|e| e.new == "length"));
         assert_eq!(edits[0].line, 4);
-        assert_eq!(edits[1].line, 12);
+        // The call site is SRC line 11, as in the references test above.
+        assert_eq!(edits[1].line, 11);
     }
 
     #[test]
@@ -771,7 +891,8 @@ fn main() {
         let names: Vec<(&str, usize)> = found.iter().map(|o| (o.text.as_str(), o.line)).collect();
         assert_eq!(
             names,
-            vec![("Point", 0), ("magnitude", 4), ("main", 10)],
+            // `fn main() {` is SRC line 9 (line 10 is its first body line).
+            vec![("Point", 0), ("magnitude", 4), ("main", 9)],
             "{found:?}"
         );
         assert_eq!(found[0].kind, SymbolKind::Type);

@@ -49,14 +49,30 @@ pub fn decode(bytes: &[u8]) -> Result<(TextEncoding, String), String> {
         let pairs = data.len() / 2;
         if odd_nul >= pairs / 2 && odd_nul > even_nul * 4 {
             let text = decode_utf16(data, true)?;
-            return Ok((TextEncoding::Utf16Le, text));
+            // The pattern alone is weak evidence on short inputs (six
+            // binary bytes can satisfy it), so the guess must also read
+            // as text: control characters other than tab/newline/return
+            // mean it was binary all along.
+            if looks_like_text(&text) {
+                return Ok((TextEncoding::Utf16Le, text));
+            }
         }
         if even_nul >= pairs / 2 && even_nul > odd_nul * 4 {
             let text = decode_utf16(data, false)?;
-            return Ok((TextEncoding::Utf16Be, text));
+            if looks_like_text(&text) {
+                return Ok((TextEncoding::Utf16Be, text));
+            }
         }
     }
     Err("not UTF-8 or UTF-16 text".into())
+}
+
+/// Does a decoded string read as text? Used to vet the BOM-less UTF-16
+/// guess, where the byte pattern alone cannot tell text from binary.
+fn looks_like_text(text: &str) -> bool {
+    !text
+        .chars()
+        .any(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
 }
 
 fn decode_utf16(bytes: &[u8], little_endian: bool) -> Result<String, String> {

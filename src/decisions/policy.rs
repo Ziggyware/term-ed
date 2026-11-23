@@ -87,6 +87,55 @@ impl PermissionPolicy {
         }
     }
 
+    /// Evaluates source code about to be executed by run_code and returns
+    /// the tiered permission verdict. Code gets its own metric
+    /// (`code_execution_risk`): scoring a script with the shell-command
+    /// signatures matched nothing and landed every script in the generic
+    /// 0.45 "unrecognized" prompt tier. The code metric reads the script
+    /// itself — network egress, process spawning, credential access,
+    /// destructive file operations, and paths outside the workspace raise
+    /// the score; plain computation and workspace file I/O stay low.
+    /// Same thresholds as commands and writes.
+    pub fn evaluate_code(&self, code: &str, language: &str, cwd: &str) -> PermissionVerdict {
+        let ctx = DecisionContext {
+            task_id: "code_permission_check".into(),
+            working_dir: cwd.into(),
+            session_history_summary: String::new(),
+            metadata: json!({ "language": language }),
+        };
+
+        let result = self
+            .engine
+            .ask_score("code_execution_risk", code, &ctx)
+            .unwrap_or(ScoreResult {
+                score: 0.50,
+                uncertainty: 0.50,
+                flags: vec!["policy_fallback".into()],
+                rationale: Some("Fallback policy applied".into()),
+            });
+
+        let rationale = result
+            .rationale
+            .unwrap_or_else(|| format!("Risk score: {:.2}", result.score));
+
+        if result.score < self.auto_allow_threshold {
+            PermissionVerdict::AutoAllow {
+                score: result.score,
+                rationale,
+            }
+        } else if result.score >= self.block_threshold {
+            PermissionVerdict::Block {
+                score: result.score,
+                reason: format!("Execution blocked: {} (risk: {:.2})", rationale, result.score),
+            }
+        } else {
+            PermissionVerdict::PromptUser {
+                score: result.score,
+                rationale,
+            }
+        }
+    }
+
     /// Evaluates a file write (a "write order" from the main agent or a
     /// sub-agent) and returns the tiered permission verdict. Same thresholds
     /// as commands: ordinary source files auto-allow, build/CI configuration

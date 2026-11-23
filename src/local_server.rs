@@ -189,6 +189,7 @@ fn wait_ready<F: Fn() -> bool, P: Fn(Duration)>(
                 // Startup is cheap to redo; a half-loaded 500 MB model is not
                 // worth leaving behind on a machine that may be low on RAM.
                 let _ = child.kill();
+                crate::process_guard::kill_group(child);
             }
             return Err("Local ONNX startup was cancelled".into());
         }
@@ -221,6 +222,7 @@ fn wait_ready<F: Fn() -> bool, P: Fn(Duration)>(
                     // would answer 503 to every later session.
                     shutdown(http, endpoint);
                     let _ = c.kill();
+                    crate::process_guard::kill_group(&c);
                     let _ = c.wait();
                 }
                 return Err(format!(
@@ -337,7 +339,8 @@ pub fn ensure_running<F: Fn() -> bool, P: Fn(Duration)>(
         .append(true)
         .open(log_path())
         .map_err(|e| format!("Cannot open {}: {e}", log_path().display()))?;
-    let child = Command::new(python())
+    let mut server_cmd = Command::new(python());
+    server_cmd
         .arg(&script)
         .arg("--model")
         .arg(&model)
@@ -347,7 +350,11 @@ pub fn ensure_running<F: Fn() -> bool, P: Fn(Duration)>(
         .arg(port.to_string())
         .stdin(Stdio::null())
         .stdout(log.try_clone().map_err(|e| e.to_string())?)
-        .stderr(log)
+        .stderr(log);
+    // Own process group (Unix) so the stop paths can take the whole tree
+    // down with kill_group, not just the interpreter process.
+    crate::process_guard::configure(&mut server_cmd);
+    let child = server_cmd
         .spawn()
         .map_err(|e| {
             format!(

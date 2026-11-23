@@ -12,6 +12,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -294,6 +295,11 @@ pub struct Agent {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     builtin_tx: Option<Sender<Value>>,
+    /// Shared "Always allow" grant handle for this agent's delegation
+    /// tree: sub-agents spawned from this agent inherit it (see
+    /// automation::start_task), so a grant is honored by workers started
+    /// afterwards instead of being re-asked per worker.
+    always_allow: Arc<AtomicBool>,
     tx: Sender<Inbound>,
     rx: Receiver<Inbound>,
     stderr: Arc<Mutex<VecDeque<String>>>,
@@ -348,6 +354,7 @@ impl Agent {
             child: None,
             stdin: None,
             builtin_tx: None,
+            always_allow: Arc::new(AtomicBool::new(false)),
             tx,
             rx,
             stderr: Arc::new(Mutex::new(VecDeque::new())),
@@ -371,6 +378,19 @@ impl Agent {
 
     /// Configure before starting a session. Unknown external backends fail
     /// explicitly instead of silently switching providers.
+    /// The shared always-allow grant handle for this agent's delegation
+    /// tree.
+    pub fn always_allow_handle(&self) -> Arc<AtomicBool> {
+        self.always_allow.clone()
+    }
+
+    /// Join another agent's delegation tree for always-allow grants, so
+    /// an "Always allow" answer given to the parent (or an earlier
+    /// sibling) is honored by this agent's worker without re-asking.
+    pub fn inherit_always_allow(&mut self, handle: Arc<AtomicBool>) {
+        self.always_allow = handle;
+    }
+
     pub fn configure(&mut self, options: AgentConfig, skill_context: String) -> Result<(), String> {
         options.validate().map_err(|e| e.to_string())?;
         let available = detect_agents();
@@ -479,6 +499,7 @@ impl Agent {
                 self.options.clone(),
                 self.skill_context.clone(),
                 self.agui.clone(),
+                self.always_allow.clone(),
                 move |v| {
                     let _ = tx.send(Inbound::Message(v));
                 },

@@ -58,7 +58,14 @@ pub fn spawn_configured(
     skill_context: String,
     out: impl Fn(Value) + Send + Sync + 'static,
 ) -> Sender<Value> {
-    spawn_configured_with_agui(cwd, options, skill_context, AGUIHub::new(), out)
+    spawn_configured_with_agui(
+        cwd,
+        options,
+        skill_context,
+        AGUIHub::new(),
+        Arc::new(AtomicBool::new(false)),
+        out,
+    )
 }
 
 pub fn spawn_configured_with_agui(
@@ -66,6 +73,7 @@ pub fn spawn_configured_with_agui(
     options: AgentConfig,
     skill_context: String,
     agui: AGUIHub,
+    always_allow: Arc<AtomicBool>,
     out: impl Fn(Value) + Send + Sync + 'static,
 ) -> Sender<Value> {
     let (to_agent, inbox) = channel::<Value>();
@@ -99,6 +107,7 @@ pub fn spawn_configured_with_agui(
     std::thread::spawn(move || {
         let mut w = Worker::new(cwd, out, reply_rx, cancel);
         w.agui = agui;
+        w.adopt_always_allow(always_allow);
         if !options.model.is_empty() {
             w.model = options.model.clone();
         } else if options.uses_router() {
@@ -396,6 +405,36 @@ fn local_load_failure(msg: &str) -> bool {
         || m.contains("not reachable")
 }
 
+/// Whether a step failure is the output-cap length stop: the response
+/// assembler reports it as status 413 with this message when a reply ends
+/// with finish_reason "length" and tool calls attached (the calls are
+/// discarded). A provider's own HTTP 413 (request too large) carries a
+/// different message, so both halves are required.
+fn length_stop_failure(msg: &str, status: Option<u16>) -> bool {
+    status == Some(413) && msg.contains("stopped with length")
+}
+
+/// The bounded length-stop recovery decision: after a length stop, the
+/// step may be retried once with this instruction appended to the history;
+/// a second length stop (or any other failure) gets no recovery. Returns
+/// the nudge text when a retry should happen.
+fn length_recovery_nudge(
+    retries_used: u32,
+    msg: &str,
+    status: Option<u16>,
+) -> Option<&'static str> {
+    if retries_used >= 1 || !length_stop_failure(msg, status) {
+        return None;
+    }
+    Some(
+        "Your previous reply was cut off at the output limit and its tool calls were \
+         discarded — nothing from it ran. Re-issue the work in smaller pieces: at most \
+         ~6,000 characters of file content per tool call (write_file for the first \
+         chunk, then append_file for each next chunk), one file per reply if needed, \
+         and keep any summary brief. Do not repeat work that already succeeded.",
+    )
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RemoteSource {
     label: &'static str,
@@ -420,7 +459,11 @@ struct Worker {
     next_id: u64,
     next_tool_id: u64,
     used_tool_ids: HashSet<String>,
-    always_allow_commands: bool,
+    /// Shared "Always allow" grant for command execution. The handle is
+    /// shared across the delegation tree (see adopt_always_allow): a grant
+    /// given to one worker is honored by workers spawned afterwards,
+    /// instead of every sub-agent re-asking for the same tool kind.
+    always_allow_commands: Arc<AtomicBool>,
     policy: PermissionPolicy,
     model_selector: ModelSelector,
     decisions: Arc<dyn DecisionEngine>,
@@ -481,7 +524,7 @@ impl Worker {
             next_id: 1000,
             next_tool_id: 0,
             used_tool_ids: HashSet::new(),
-            always_allow_commands: false,
+            always_allow_commands: Arc::new(AtomicBool::new(false)),
             policy,
             model_selector,
             decisions,
@@ -492,6 +535,19 @@ impl Worker {
             local_sticky: false,
             stashed: HashMap::new(),
         }
+    }
+
+    /// Adopt the delegation tree's shared always-allow grant handle. A
+    /// worker spawned standalone owns a private handle; a worker spawned
+    /// into a tree shares the root agent's, so an "Always allow" answer
+    /// given to any worker in the tree is honored by the workers spawned
+    /// afterwards (they still prompt for anything not yet granted).
+    fn adopt_always_allow(&mut self, handle: Arc<AtomicBool>) {
+        self.always_allow_commands = handle;
+    }
+
+    fn always_allow(&self) -> bool {
+        self.always_allow_commands.load(Ordering::SeqCst)
     }
 
     fn send(&self, v: Value) {
@@ -596,7 +652,11 @@ impl Worker {
                     self.dynamic_tools.clear();
                 }
                 self.used_tool_ids.clear();
-                self.always_allow_commands = false;
+                // The always-allow grant is deliberately NOT cleared
+                // here: it is shared across the delegation tree, and a
+                // sub-agent's fresh session must not revoke the grant the
+                // user gave its parent. It is bounded by the main Agent's
+                // lifetime — a new main Agent starts ungranted.
                 // A new session starts on the configured provider again; the
                 // local server stays up and can still serve a 5xx fallback.
                 self.remote_override = None;
@@ -1080,6 +1140,9 @@ impl Worker {
         // provider's original error is the real explanation.
         let mut local_failed = false;
         let (mut steps, mut resets) = (0, 0u32);
+        // Bounded length-stop recovery: one retry per step, reset on any
+        // successful step (see the Step::Failed arm below).
+        let mut length_retries = 0u32;
         loop {
             if self.cancel.load(Ordering::SeqCst) {
                 return "cancelled";
@@ -1094,6 +1157,7 @@ impl Worker {
                 Ok(true) => {
                     steps += 1;
                     resets = 0;
+                    length_retries = 0;
                     local_failed = false;
                     // Failover budget covers one outage, not every blip in a long turn.
                     tried_models = vec![self.model.clone()];
@@ -1101,6 +1165,24 @@ impl Worker {
                 }
                 Ok(false) => return "end_turn",
                 Err(Step::Cancelled) => return "cancelled",
+                // The reply hit the output cap and its tool calls were
+                // discarded whole. Failing the task over that wastes the
+                // turn when the same work re-issued in chunks fits, so the
+                // step gets one bounded retry with an explicit
+                // split-output instruction in the history.
+                Err(Step::Failed(msg, status))
+                    if length_recovery_nudge(length_retries, &msg, status).is_some() =>
+                {
+                    let nudge = length_recovery_nudge(length_retries, &msg, status)
+                        .unwrap_or_default();
+                    length_retries += 1;
+                    self.notice(
+                        "That reply hit the output limit and its tool calls were discarded. Retrying the step with chunked output…",
+                        false,
+                    );
+                    self.history
+                        .push(json!({"role": "user", "content": nudge}));
+                }
                 // Local inference failed: fall back to the configured
                 // provider instead of failing the turn on the machine.
                 Err(Step::Failed(msg, _)) if self.local.is_some() => {
@@ -2360,7 +2442,7 @@ impl Worker {
 
     /// Ask the user (through the panel) to approve something.
     fn permission(&mut self, tool_id: &str, title: &str) -> bool {
-        if self.always_allow_commands || self.options.commands == CommandPolicy::Allow {
+        if self.always_allow() || self.options.commands == CommandPolicy::Allow {
             return true;
         }
         self.next_id += 1;
@@ -2383,7 +2465,7 @@ impl Worker {
                         .and_then(Value::as_str)
                         .unwrap_or("no");
                     if matches!(choice, "always" | "never") {
-                        self.always_allow_commands = true;
+                        self.always_allow_commands.store(true, Ordering::SeqCst);
                     }
                     return matches!(choice, "once" | "always" | "never");
                 }
@@ -2437,9 +2519,9 @@ impl Worker {
         // exactly like a hung run — nothing has spawned yet.
         let verdict = self
             .policy
-            .evaluate_command(code, &work_dir.to_string_lossy());
+            .evaluate_code(code, &lang, &work_dir.to_string_lossy());
         let prompt = |this: &mut Self, desc: &str| -> bool {
-            if this.always_allow_commands || this.options.commands == CommandPolicy::Allow {
+            if this.always_allow() || this.options.commands == CommandPolicy::Allow {
                 return true;
             }
             this.tool_start(id, &format!("Awaiting approval: {title}"), "execute", None);
@@ -2715,7 +2797,7 @@ impl Worker {
         // Same honesty rule as run_code: while approval is outstanding the
         // card says so, instead of claiming the command is already running.
         let prompt = |this: &mut Self, desc: &str| -> bool {
-            if this.always_allow_commands || this.options.commands == CommandPolicy::Allow {
+            if this.always_allow() || this.options.commands == CommandPolicy::Allow {
                 return true;
             }
             this.tool_start(id, &format!("Awaiting approval: {title}"), "execute", None);
@@ -2757,6 +2839,11 @@ impl Worker {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // The child needs its own process group (Unix) so the timeout /
+        // cancel path's kill_group actually reaches its descendants;
+        // run_code's builder configures its command, this one did not, so
+        // a timed-out shell's children escaped the group kill.
+        crate::process_guard::configure(&mut process);
         let mut child = process.spawn().map_err(|e| format!("cannot run: {e}"))?;
         // Drain without unbounded allocation. Never join forever if an
         // intentionally daemonized process escaped with an output pipe open.
@@ -2998,6 +3085,30 @@ mod tests {
         assert!(!local_load_failure("The model's output exceeded its size limit"));
     }
 
+    #[test]
+    fn length_stop_recovery_retries_once_with_chunking_nudge() {
+        // The assembler's exact length-stop report (model_response.rs).
+        let msg = "Model stopped with length; partial tool calls were not executed. \
+                   Adjust the output budget or task.";
+        assert!(length_stop_failure(msg, Some(413)));
+        // A provider HTTP 413 (request too large) is a different failure.
+        assert!(!length_stop_failure("Request Entity Too Large", Some(413)));
+        assert!(!length_stop_failure(msg, Some(500)));
+        assert!(!length_stop_failure(msg, None));
+
+        // First length stop on a step: retry, with the split-output
+        // instruction that makes the retry succeed by chunking.
+        let nudge = length_recovery_nudge(0, msg, Some(413)).expect("first stop retries");
+        assert!(nudge.contains("append_file"), "{nudge}");
+        assert!(nudge.contains("6,000"), "{nudge}");
+        // The retry is bounded: a second length stop on the same step
+        // gets no further recovery.
+        assert!(length_recovery_nudge(1, msg, Some(413)).is_none());
+        // Other failures never take the length path.
+        assert!(length_recovery_nudge(0, "connection reset", None).is_none());
+        assert!(length_recovery_nudge(0, msg, Some(429)).is_none());
+    }
+
     fn worker(dir: &Path) -> Worker {
         let (_tx, rx) = channel();
         Worker::new(
@@ -3006,6 +3117,58 @@ mod tests {
             rx,
             Arc::new(AtomicBool::new(false)),
         )
+    }
+
+    #[test]
+    fn always_allow_grant_is_inherited_by_later_workers() {
+        let dir = std::env::temp_dir().join(format!(
+            "termed-builtin-grant-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Parent worker whose replies the test controls. The user answers
+        // "Always allow" to its first permission request (id 1001).
+        let (reply_tx, reply_rx) = channel();
+        let mut parent = Worker::new(
+            dir.clone(),
+            Arc::new(|_| {}),
+            reply_rx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        reply_tx
+            .send(json!({"id": 1001, "result": {"outcome": {"optionId": "always"}}}))
+            .unwrap();
+        assert!(parent.permission("t1", "run python code"));
+        assert!(parent.always_allow());
+
+        // A worker spawned afterwards into the same delegation tree
+        // adopts the shared grant handle (the spawn path does exactly
+        // this) and therefore runs a prompt-tier script without asking:
+        // no permission request is emitted and the code executes.
+        let (child_tx, child_rx) = channel();
+        let child_sent: Arc<std::sync::Mutex<Vec<Value>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let child_sent2 = child_sent.clone();
+        let mut child = Worker::new(
+            dir.clone(),
+            Arc::new(move |v| child_sent2.lock().unwrap().push(v)),
+            child_rx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        drop(child_tx);
+        child.adopt_always_allow(parent.always_allow_commands.clone());
+        let out = child.run_tool(
+            "c1",
+            "run_code",
+            &json!({"code": "import subprocess\nprint(subprocess.run(['echo', 'inherited-ok'], capture_output=True, text=True).stdout.strip())"}),
+        );
+        assert!(out.contains("inherited-ok"), "{out}");
+        let asked = child_sent
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|v| v.get("method").and_then(Value::as_str) == Some("session/request_permission"));
+        assert!(!asked, "the inherited worker must not re-ask for permission");
     }
 
     #[test]
