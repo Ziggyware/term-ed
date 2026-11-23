@@ -1,8 +1,10 @@
 //! An open editor tab: document + highlighter + caret/selection + viewport,
 //! and all the Visual Studio style editing commands.
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 
+use ropey::Rope;
 use unicode_width::UnicodeWidthChar;
 
 use crate::document::{Document, EditKind, Indent, Selection};
@@ -21,6 +23,17 @@ pub struct Editor {
     pub view_width: usize,
     /// Cached gutter change markers, keyed by document version.
     pub diff_cache: Option<(u64, Vec<LineChange>)>,
+    /// The saved-text baseline as a rope, rebuilt only when the saved
+    /// text actually changes; `line_changes` compares ropes chunk-wise
+    /// (no whole-buffer materialization) to decide whether a diff is
+    /// needed at all.
+    diff_baseline: Option<Rope>,
+    /// Single-line segment cache: the last `segments()` result, keyed by
+    /// (line, document version, wrap width, tab width). Cursor movement
+    /// and rendering re-ask for the same line several times per pass.
+    seg_cache: RefCell<Option<SegCache>>,
+    /// Scratch line buffer for read-only line access on `&self` paths.
+    line_buf: RefCell<String>,
     /// Exact highlighting has not caught up with the viewport yet.
     pub hl_pending: bool,
     /// Soft-wrap width in columns (set by the renderer when word wrap is on).
@@ -60,6 +73,16 @@ impl BoxSel {
     }
 }
 
+/// Key + payload of the last computed `segments()` call (see Editor).
+#[derive(Clone, Debug)]
+struct SegCache {
+    line: usize,
+    version: u64,
+    wrap_width: Option<usize>,
+    tab: usize,
+    segs: Vec<Seg>,
+}
+
 /// One visual row of a (possibly soft-wrapped) line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Seg {
@@ -75,33 +98,31 @@ pub struct Seg {
 /// Split a line into rows of at most `width` columns, breaking after
 /// whitespace where possible (VS Code's "wordWrap" with "same" indent).
 pub fn wrap_line(text: &str, width: usize, tab: usize) -> Vec<Seg> {
-    let chars: Vec<char> = text.chars().collect();
-    let n = chars.len();
-    let mut cols = Vec::with_capacity(n + 1);
+    // One table instead of two: (char, display column of that char).
+    // `total` is the display column one past the last char.
+    let mut items: Vec<(char, usize)> = Vec::with_capacity(text.len());
     let mut d = 0;
-    for &c in &chars {
-        cols.push(d);
+    for c in text.chars() {
+        items.push((c, d));
         d += char_width(c, d, tab);
     }
-    cols.push(d);
+    let total = d;
+    let n = items.len();
+    let col = |i: usize| if i < n { items[i].1 } else { total };
     let width = width.max(4);
-    let lead = chars
+    let lead = items
         .iter()
-        .take_while(|c| **c == ' ' || **c == '\t')
+        .take_while(|(c, _)| *c == ' ' || *c == '\t')
         .count();
-    let cont_indent = if cols[lead] <= width / 2 {
-        cols[lead]
-    } else {
-        0
-    };
+    let cont_indent = if col(lead) <= width / 2 { col(lead) } else { 0 };
     let mut segs = Vec::new();
     let mut s = 0;
     loop {
         let indent = if segs.is_empty() { 0 } else { cont_indent };
         let avail = width.saturating_sub(indent).max(1);
-        let ds = cols[s];
+        let ds = col(s);
         let mut e = s;
-        while e < n && cols[e + 1] - ds <= avail {
+        while e < n && col(e + 1) - ds <= avail {
             e += 1;
         }
         if e >= n {
@@ -119,10 +140,10 @@ pub fn wrap_line(text: &str, width: usize, tab: usize) -> Vec<Seg> {
         } else if let Some(b) = (s + 1..=e)
             .rev()
             .find(|&j| {
-                matches!(chars[j - 1], ' ' | '\t' | ',' | '(' | '[' | '{' | ';')
-                    || (j < n && chars[j] == '.')
+                matches!(items[j - 1].0, ' ' | '\t' | ',' | '(' | '[' | '{' | ';')
+                    || (j < n && items[j].0 == '.')
             })
-            .filter(|&j| cols[j] - ds >= avail / 3)
+            .filter(|&j| col(j) - ds >= avail / 3)
         {
             e = b;
         }
@@ -138,6 +159,49 @@ pub fn wrap_line(text: &str, width: usize, tab: usize) -> Vec<Seg> {
 
 fn seg_index(segs: &[Seg], col: usize) -> usize {
     segs.iter().rposition(|s| s.start <= col).unwrap_or(0)
+}
+
+/// First occurrence of `needle` in `rope` at or after byte offset
+/// `from_byte` — the same result as `str::find` on the whole text, but
+/// scanned chunk by chunk with a carry of the needle's tail bytes so
+/// matches straddling chunk boundaries are seen whole. Only the carry
+/// plus one chunk is ever materialized.
+fn rope_find(rope: &Rope, needle: &str, from_byte: usize) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    let keep = needle.len() - 1;
+    let mut window = String::new();
+    let mut carry = String::new();
+    let mut offset = 0usize;
+    for chunk in rope.chunks() {
+        let chunk_start = offset;
+        offset += chunk.len();
+        window.clear();
+        window.push_str(&carry);
+        window.push_str(chunk);
+        let window_base = chunk_start - carry.len();
+        if offset > from_byte {
+            // Both offsets are char boundaries, so the difference is a
+            // valid slice index into the window.
+            let from = from_byte.saturating_sub(window_base);
+            if let Some(pos) = window[from..].find(needle) {
+                return Some(window_base + from + pos);
+            }
+        }
+        // Carry the tail into the next window. The carry starts on a
+        // char boundary: a match can only begin at a leading byte, so
+        // skipping a partial char loses no match start.
+        carry.clear();
+        if keep > 0 {
+            let mut start = window.len().saturating_sub(keep);
+            while start < window.len() && !window.is_char_boundary(start) {
+                start += 1;
+            }
+            carry.push_str(&window[start..]);
+        }
+    }
+    None
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,7 +235,9 @@ pub fn display_col(line: &str, char_col: usize, tab: usize) -> usize {
 /// Char column closest to a display column.
 pub fn char_col_at(line: &str, target: usize, tab: usize) -> usize {
     let mut d = 0;
+    let mut count = 0;
     for (i, c) in line.chars().enumerate() {
+        count = i + 1;
         let w = char_width(c, d, tab);
         if d + w > target {
             return if target - d > w / 2 && w > 1 {
@@ -182,7 +248,7 @@ pub fn char_col_at(line: &str, target: usize, tab: usize) -> usize {
         }
         d += w;
     }
-    line.chars().count()
+    count
 }
 
 fn is_word(c: char) -> bool {
@@ -274,6 +340,9 @@ impl Editor {
             view_height: 30,
             view_width: 80,
             diff_cache: None,
+            diff_baseline: None,
+            seg_cache: RefCell::new(None),
+            line_buf: RefCell::new(String::new()),
             hl_pending: false,
             wrap_width: None,
             scroll_seg: 0,
@@ -301,7 +370,9 @@ impl Editor {
     /// Display column of the caret.
     pub fn cursor_display_col(&self) -> usize {
         let (l, c) = self.cursor();
-        display_col(&self.doc.line_str(l), c, self.tab())
+        let mut buf = self.line_buf.borrow_mut();
+        self.doc.line_into(l, &mut buf);
+        display_col(&buf, c, self.tab())
     }
 
     /// Propagate document edits to the highlighter.
@@ -385,30 +456,60 @@ impl Editor {
     // ------------------------------------------------------------ soft wrap
 
     /// Visual rows of a line (a single row when word wrap is off).
+    /// Results are cached per (line, document version, wrap width, tab
+    /// width): movement and rendering ask for the same line repeatedly
+    /// in one pass, and wrap mode otherwise rebuilds the line string
+    /// and its segment table on every ask.
     pub fn segments(&self, line: usize) -> Vec<Seg> {
-        match self.wrap_width {
-            Some(w) => wrap_line(&self.doc.line_str(line), w, self.tab()),
+        let version = self.doc.version;
+        let tab = self.tab();
+        if let Some(c) = self.seg_cache.borrow().as_ref()
+            && c.line == line
+            && c.version == version
+            && c.wrap_width == self.wrap_width
+            && c.tab == tab
+        {
+            return c.segs.clone();
+        }
+        let segs = match self.wrap_width {
+            Some(w) => {
+                let mut buf = self.line_buf.borrow_mut();
+                self.doc.line_into(line, &mut buf);
+                wrap_line(&buf, w, tab)
+            }
             None => vec![Seg {
                 start: 0,
                 end: self.doc.line_len(line),
                 dstart: 0,
                 indent: 0,
             }],
-        }
+        };
+        *self.seg_cache.borrow_mut() = Some(SegCache {
+            line,
+            version,
+            wrap_width: self.wrap_width,
+            tab,
+            segs: segs.clone(),
+        });
+        segs
     }
 
     /// (row within the line, visual x before horizontal scroll) of a char column.
     pub fn visual_x(&self, line: usize, col: usize) -> (usize, usize) {
         let segs = self.segments(line);
         let k = seg_index(&segs, col);
-        let d = display_col(&self.doc.line_str(line), col, self.tab());
+        let mut buf = self.line_buf.borrow_mut();
+        self.doc.line_into(line, &mut buf);
+        let d = display_col(&buf, col, self.tab());
         (k, segs[k].indent + d - segs[k].dstart)
     }
 
     /// Char column on row `seg` closest to visual x.
     pub fn col_at_x(&self, line: usize, seg: &Seg, last: bool, x: usize) -> usize {
         let target = x.saturating_sub(seg.indent) + seg.dstart;
-        let c = char_col_at(&self.doc.line_str(line), target, self.tab());
+        let mut buf = self.line_buf.borrow_mut();
+        self.doc.line_into(line, &mut buf);
+        let c = char_col_at(&buf, target, self.tab());
         let max = if last {
             seg.end
         } else {
@@ -515,7 +616,8 @@ impl Editor {
     /// Visual Studio smart Home: toggle between first non-blank and column 0.
     pub fn home(&mut self, extend: bool) {
         let (line, col) = self.cursor();
-        let text = self.doc.line_str(line);
+        let mut text = String::new();
+        self.doc.line_into(line, &mut text);
         let first = text.chars().take_while(|c| c.is_whitespace()).count();
         let target = if col == first { 0 } else { first };
         self.move_to(line, target, extend);
@@ -646,12 +748,9 @@ impl Editor {
             return false;
         }
         let needle = self.selected_text();
-        let hay = self.doc.rope.to_string();
         let start_byte = self.doc.rope.char_to_byte(self.sel.end());
-        let found = hay[start_byte..]
-            .find(&needle)
-            .map(|b| b + start_byte)
-            .or_else(|| hay.find(&needle));
+        let found = rope_find(&self.doc.rope, &needle, start_byte)
+            .or_else(|| rope_find(&self.doc.rope, &needle, 0));
         if let Some(b) = found {
             let s = self.doc.rope.byte_to_char(b);
             self.sel = Selection::new(s, s + needle.chars().count());
@@ -663,7 +762,8 @@ impl Editor {
 
     pub fn goto_line(&mut self, line: usize) {
         let line = line.min(self.doc.len_lines().saturating_sub(1));
-        let text = self.doc.line_str(line);
+        let mut text = String::new();
+        self.doc.line_into(line, &mut text);
         let first = text.chars().take_while(|c| c.is_whitespace()).count();
         self.move_to(line, first, false);
         self.center_on_cursor();
@@ -801,7 +901,8 @@ impl Editor {
         // Closing brace on a blank line: snap to the enclosing block's indent.
         if c == '}' {
             let (line, col) = self.doc.pos(at);
-            let text = self.doc.line_str(line);
+            let mut text = String::new();
+            self.doc.line_into(line, &mut text);
             if text.chars().take(col).all(|ch| ch == ' ' || ch == '\t') && col > 0 {
                 let unit = self.doc.indent.unit();
                 let indent: String = text.chars().take(col).collect();
@@ -845,7 +946,8 @@ impl Editor {
         self.delete_selection();
         let at = self.sel.head;
         let (line, col) = self.doc.pos(at);
-        let text = self.doc.line_str(line);
+        let mut text = String::new();
+        self.doc.line_into(line, &mut text);
         let indent: String = text
             .chars()
             .take_while(|c| *c == ' ' || *c == '\t')
@@ -901,7 +1003,8 @@ impl Editor {
         }
         self.begin(EditKind::Deleting);
         let (line, col) = self.doc.pos(at);
-        let text = self.doc.line_str(line);
+        let mut text = String::new();
+        self.doc.line_into(line, &mut text);
         let prev = self.doc.char_at(at - 1);
         let next = self.doc.char_at(at);
         let leading = text.chars().take(col).all(|c| c == ' ');
@@ -1026,7 +1129,8 @@ impl Editor {
                 shift(&mut anchor, n as isize);
                 shift(&mut head, n as isize);
             } else {
-                let text = self.doc.line_str(line);
+                let mut text = String::new();
+                self.doc.line_into(line, &mut text);
                 let remove = if text.starts_with('\t') {
                     1
                 } else {
@@ -1214,7 +1318,8 @@ impl Editor {
             return;
         }
         let (line, _) = self.cursor();
-        let text = self.doc.line_str(line);
+        let mut text = String::new();
+        self.doc.line_into(line, &mut text);
         let indent: String = text
             .chars()
             .take_while(|c| *c == ' ' || *c == '\t')
@@ -1344,7 +1449,10 @@ impl Editor {
             head_line: line,
             head_col: col,
         });
-        let c = char_col_at(&self.doc.line_str(line), col, self.tab());
+        let mut buf = self.line_buf.borrow_mut();
+        self.doc.line_into(line, &mut buf);
+        let c = char_col_at(&buf, col, self.tab());
+        drop(buf);
         self.sel = Selection::caret(self.doc.idx(line, c));
         self.preferred_col = Some(col);
     }
@@ -1355,8 +1463,9 @@ impl Editor {
     }
 
     fn display_width(&self, line: usize) -> usize {
-        let t = self.doc.line_str(line);
-        display_col(&t, t.chars().count(), self.tab())
+        let mut buf = self.line_buf.borrow_mut();
+        self.doc.line_into(line, &mut buf);
+        display_col(&buf, buf.chars().count(), self.tab())
     }
 
     /// Char ranges covered on each line of the box.
@@ -1368,11 +1477,12 @@ impl Editor {
         let (left, right) = b.cols();
         (top..=bottom)
             .map(|l| {
-                let t = self.doc.line_str(l);
+                let mut buf = self.line_buf.borrow_mut();
+                self.doc.line_into(l, &mut buf);
                 (
                     l,
-                    char_col_at(&t, left, self.tab()),
-                    char_col_at(&t, right, self.tab()),
+                    char_col_at(&buf, left, self.tab()),
+                    char_col_at(&buf, right, self.tab()),
                 )
             })
             .collect()
@@ -1382,12 +1492,9 @@ impl Editor {
         self.box_ranges()
             .iter()
             .map(|&(l, s, e)| {
-                self.doc
-                    .line_str(l)
-                    .chars()
-                    .skip(s)
-                    .take(e - s)
-                    .collect::<String>()
+                let mut buf = self.line_buf.borrow_mut();
+                self.doc.line_into(l, &mut buf);
+                buf.chars().skip(s).take(e - s).collect::<String>()
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -1403,6 +1510,7 @@ impl Editor {
         let (left, right) = b.cols();
         self.doc.begin(EditKind::Typing, self.sel);
         let mut new_col = left;
+        let mut t = String::new();
         for (i, line) in (top..=bottom).enumerate() {
             let piece = pieces.get(i).or(pieces.first()).copied().unwrap_or("");
             let width = self.display_width(line);
@@ -1416,7 +1524,7 @@ impl Editor {
                 self.doc
                     .insert(start + self.doc.line_len(line), &format!("{pad}{piece}"));
             } else {
-                let t = self.doc.line_str(line);
+                self.doc.line_into(line, &mut t);
                 let (s, e) = (
                     char_col_at(&t, left, self.tab()),
                     char_col_at(&t, right, self.tab()),
@@ -1434,7 +1542,8 @@ impl Editor {
             head_line: b.head_line,
             head_col: new_col,
         });
-        let c = char_col_at(&self.doc.line_str(b.head_line), new_col, self.tab());
+        self.doc.line_into(b.head_line, &mut t);
+        let c = char_col_at(&t, new_col, self.tab());
         self.sel = Selection::caret(self.doc.idx(b.head_line, c));
         self.doc.end(self.sel);
         self.preferred_col = Some(new_col);
@@ -1524,23 +1633,39 @@ impl Editor {
         if old == new {
             return;
         }
-        let a: Vec<char> = old.chars().collect();
-        let b: Vec<char> = new.chars().collect();
-        let prefix = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
-        let max_suffix = a.len().min(b.len()) - prefix;
-        let suffix = a
-            .iter()
-            .rev()
-            .zip(b.iter().rev())
-            .take(max_suffix)
-            .take_while(|(x, y)| x == y)
-            .count();
-        let (old_end, new_end) = (a.len() - suffix, b.len() - suffix);
-        let insert: String = b[prefix..new_end].iter().collect();
+        // Common prefix/suffix computed on bytes and backed off to char
+        // boundaries (the shared affixes have identical bytes, so the
+        // backed-off byte affixes are exactly the equal char affixes),
+        // then mapped to char offsets once. No whole-text Vec<char>.
+        let (ob, nb) = (old.as_bytes(), new.as_bytes());
+        let mut prefix_b = ob.iter().zip(nb).take_while(|(x, y)| x == y).count();
+        while prefix_b > 0 && !(old.is_char_boundary(prefix_b) && new.is_char_boundary(prefix_b)) {
+            prefix_b -= 1;
+        }
+        let max_suffix_b = ob.len().min(nb.len()) - prefix_b;
+        let mut suffix_b = 0;
+        while suffix_b < max_suffix_b
+            && ob[ob.len() - 1 - suffix_b] == nb[nb.len() - 1 - suffix_b]
+        {
+            suffix_b += 1;
+        }
+        while suffix_b > 0
+            && !(old.is_char_boundary(ob.len() - suffix_b)
+                && new.is_char_boundary(nb.len() - suffix_b))
+        {
+            suffix_b -= 1;
+        }
+        let prefix = old[..prefix_b].chars().count();
+        let suffix = old[ob.len() - suffix_b..].chars().count();
+        let (old_end, new_end) = (
+            self.doc.rope.len_chars() - suffix,
+            prefix + new[prefix_b..nb.len() - suffix_b].chars().count(),
+        );
+        let insert = &new[prefix_b..nb.len() - suffix_b];
         let head = self.sel.head;
         self.doc.begin(EditKind::Other, self.sel);
         self.doc.remove(prefix, old_end);
-        self.doc.insert(prefix, &insert);
+        self.doc.insert(prefix, insert);
         let delta = new_end as isize - old_end as isize;
         let moved = if head >= old_end {
             (head as isize + delta).max(0) as usize
@@ -1605,8 +1730,25 @@ impl Editor {
         if stale {
             let n = self.doc.len_lines();
             let mut marks = vec![LineChange::None; n];
-            let current = self.doc.rope.to_string();
-            if n < 50_000 && current != self.doc.saved_text {
+            // Cheap gate before any materialization: the saved baseline
+            // is kept as a rope and refreshed only when the saved text
+            // actually changed (exact chunk-wise compares throughout).
+            // When the buffer still equals the baseline, the marks are
+            // all None and neither the whole-rope stringify nor the
+            // line diff runs.
+            let baseline_ok = self
+                .diff_baseline
+                .as_ref()
+                .is_some_and(|r| *r == self.doc.saved_text.as_str());
+            if !baseline_ok {
+                self.diff_baseline = Some(Rope::from_str(&self.doc.saved_text));
+            }
+            let differs = self
+                .diff_baseline
+                .as_ref()
+                .is_some_and(|r| self.doc.rope != *r);
+            if n < 50_000 && differs {
+                let current = self.doc.rope.to_string();
                 let diff = similar::TextDiff::configure()
                     .timeout(std::time::Duration::from_millis(50))
                     .diff_lines(&self.doc.saved_text, &current);

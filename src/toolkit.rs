@@ -2,11 +2,13 @@
 //! `workspace`, `text`, `buffers`, `edit`, `filesystem`, `search`, `git`, `ui`, `code`, `session`
 //! plus native zero-spawn `head`, `tail`, and `grep` tools.
 
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
 use memchr::memrchr_iter;
 use regex::RegexBuilder;
+use ropey::Rope;
 use serde_json::{Value, json};
 
 use crate::app::{App, ToastKind};
@@ -258,6 +260,185 @@ fn read_tail_from_disk(path: &std::path::Path, lines: usize) -> Result<String, S
     String::from_utf8(out).map_err(|e| format!("Invalid UTF-8: {e}"))
 }
 
+/// Full rope text in one pre-sized allocation, built from the rope's
+/// chunks (a bare `to_string()` regrows the string chunk by chunk).
+fn rope_string(rope: &Rope) -> String {
+    let mut s = String::with_capacity(rope.len_bytes());
+    for chunk in rope.chunks() {
+        s.push_str(chunk);
+    }
+    s
+}
+
+/// How many lines `str::lines()` would yield for the rope's text —
+/// but only when the rope's own line structure agrees. Ropey also
+/// splits on lone `\r` and Unicode line breaks, which `str::lines`
+/// does not; when any are present the counts diverge and this returns
+/// None, sending the caller down the materializing path so results
+/// stay byte-identical.
+fn str_line_count(rope: &Rope) -> Option<usize> {
+    if rope.len_bytes() == 0 {
+        return Some(0);
+    }
+    let mut newlines = 0usize;
+    let mut last_byte = 0u8;
+    for chunk in rope.chunks() {
+        newlines += memchr::memchr_iter(b'\n', chunk.as_bytes()).count();
+        if let Some(b) = chunk.as_bytes().last() {
+            last_byte = *b;
+        }
+    }
+    let ends_nl = last_byte == b'\n';
+    let str_lines = newlines + usize::from(!ends_nl);
+    // Ropey additionally counts the phantom line after a trailing
+    // line break.
+    let expected_rope_lines = str_lines + usize::from(ends_nl);
+    (rope.len_lines() == expected_rope_lines).then_some(str_lines)
+}
+
+/// One rope line with exactly the content `str::lines()` would yield:
+/// the line break stripped, and a carriage return stripped only when
+/// it directly preceded the break. Borrows the rope's chunk when the
+/// line lives in a single chunk (the common case).
+fn rope_line<'a>(rope: &'a Rope, idx: usize) -> Cow<'a, str> {
+    let slice = rope.line(idx);
+    let mut chunks = slice.chunks();
+    let text: Cow<'a, str> = match (chunks.next(), chunks.next()) {
+        (Some(only), None) => Cow::Borrowed(only),
+        (None, _) => Cow::Borrowed(""),
+        _ => Cow::Owned(slice.to_string()),
+    };
+    match text {
+        Cow::Borrowed(s) => Cow::Borrowed(match s.strip_suffix('\n') {
+            Some(head) => head.strip_suffix('\r').unwrap_or(head),
+            None => s,
+        }),
+        Cow::Owned(mut s) => {
+            if s.ends_with('\n') {
+                s.pop();
+                if s.ends_with('\r') {
+                    s.pop();
+                }
+            }
+            Cow::Owned(s)
+        }
+    }
+}
+
+/// Count and first byte offset of `needle`'s occurrences in the rope,
+/// mirroring `str::matches` (non-overlapping, left to right). Scans
+/// chunk windows with a carry of `needle.len() - 1` bytes so matches
+/// spanning chunk boundaries are seen; nothing is materialized.
+fn rope_find(rope: &Rope, needle: &str) -> (usize, Option<usize>) {
+    let needle = needle.as_bytes();
+    debug_assert!(!needle.is_empty());
+    let mut count = 0usize;
+    let mut first = None;
+    let mut carry: Vec<u8> = Vec::new();
+    let mut base = 0usize; // global byte offset of the current window
+    let mut resume = 0usize; // global offset the next match may start at
+    for chunk in rope.chunks() {
+        let chunk = chunk.as_bytes();
+        let owned: Vec<u8>;
+        let window: &[u8] = if carry.is_empty() {
+            chunk
+        } else {
+            owned = carry.iter().chain(chunk.iter()).copied().collect();
+            &owned
+        };
+        let mut from = resume.saturating_sub(base);
+        while from < window.len()
+            && let Some(pos) = memchr::memmem::find(&window[from..], needle)
+        {
+            let at = base + from + pos;
+            count += 1;
+            if first.is_none() {
+                first = Some(at);
+            }
+            resume = at + needle.len();
+            from = resume - base;
+        }
+        let keep = (needle.len() - 1).min(window.len());
+        carry = window[window.len() - keep..].to_vec();
+        base += window.len() - keep;
+    }
+    (count, first)
+}
+
+fn collect_grep_matches<'a, I: Iterator<Item = Cow<'a, str>>>(
+    re: &regex::Regex,
+    lines: I,
+    max_results: usize,
+) -> Vec<Value> {
+    let mut matches = Vec::new();
+    for (idx, line) in lines.enumerate() {
+        if re.is_match(&line) {
+            matches.push(json!({
+                "line": idx + 1,
+                "text": line.chars().take(300).collect::<String>(),
+            }));
+            if matches.len() >= max_results {
+                break;
+            }
+        }
+    }
+    matches
+}
+
+fn outline_symbols<'a, I: Iterator<Item = Cow<'a, str>>>(lines: I) -> Vec<Value> {
+    const KEYWORDS: &[&str] = &[
+        "pub fn ",
+        "fn ",
+        "pub struct ",
+        "struct ",
+        "pub enum ",
+        "enum ",
+        "pub trait ",
+        "trait ",
+        "impl ",
+        "impl<",
+        "pub mod ",
+        "mod ",
+        "class ",
+        "interface ",
+        "def ",
+        "async def ",
+        "function ",
+        "export function ",
+        "export class ",
+        "export interface ",
+        "export type ",
+    ];
+    let mut symbols = Vec::new();
+    for (i, line) in lines.enumerate() {
+        let trimmed = line.trim();
+        if KEYWORDS.iter().any(|k| trimmed.starts_with(k)) && !trimmed.ends_with(';') {
+            let signature = trimmed.trim_end_matches('{').trim_end_matches(':').trim();
+            symbols.push(json!({
+                "line": i + 1,
+                "signature": signature.chars().take(160).collect::<String>(),
+            }));
+            if symbols.len() >= 300 {
+                break;
+            }
+        }
+    }
+    symbols
+}
+
+/// Outline of a live buffer: rope-native line iteration when the
+/// rope's line structure agrees with `str::lines`, else one
+/// materialization.
+fn buffer_outline(rope: &Rope) -> Vec<Value> {
+    match str_line_count(rope) {
+        Some(n) => outline_symbols((0..n).map(|i| rope_line(rope, i))),
+        None => {
+            let text = rope_string(rope);
+            outline_symbols(text.lines().map(Cow::Borrowed))
+        }
+    }
+}
+
 /// Executes a toolkit tool on the UI thread against live `App` state.
 pub fn call(app: &mut App, options: &AgentConfig, name: &str, args: &Value) -> ToolResult {
     if !contains(options, name) {
@@ -469,28 +650,32 @@ pub fn call(app: &mut App, options: &AgentConfig, name: &str, args: &Value) -> T
                     .size_limit(2 * 1024 * 1024)
                     .build()
                     .map_err(|e| format!("Invalid regex: {e}"))?;
-                let text = if let Some(ed) = app
+                let rel = search::relative(&app.explorer.root, &resolved);
+                if let Some(ed) = app
                     .editors
                     .iter()
                     .find(|e| e.doc.path.as_ref() == Some(&resolved))
                 {
-                    ed.doc.rope.to_string()
-                } else {
-                    std::fs::read_to_string(&resolved).map_err(|e| e.to_string())?
-                };
-                let rel = search::relative(&app.explorer.root, &resolved);
-                let mut matches = Vec::new();
-                for (idx, line) in text.lines().enumerate() {
-                    if re.is_match(line) {
-                        matches.push(json!({
-                            "line": idx + 1,
-                            "text": line.chars().take(300).collect::<String>(),
-                        }));
-                        if matches.len() >= max_results {
-                            break;
+                    let matches = match str_line_count(&ed.doc.rope) {
+                        Some(n) => collect_grep_matches(
+                            &re,
+                            (0..n).map(|idx| rope_line(&ed.doc.rope, idx)),
+                            max_results,
+                        ),
+                        None => {
+                            let text = rope_string(&ed.doc.rope);
+                            collect_grep_matches(&re, text.lines().map(Cow::Borrowed), max_results)
                         }
-                    }
+                    };
+                    return Ok(json!({
+                        "file": rel,
+                        "matches": matches,
+                    }));
                 }
+                let text =
+                    std::fs::read_to_string(&resolved).map_err(|e| e.to_string())?;
+                let matches =
+                    collect_grep_matches(&re, text.lines().map(Cow::Borrowed), max_results);
                 return Ok(json!({
                     "file": rel,
                     "matches": matches,
@@ -516,7 +701,7 @@ pub fn call(app: &mut App, options: &AgentConfig, name: &str, args: &Value) -> T
                 .filter_map(|e| {
                     (!e.doc.is_read_only())
                         .then_some(e.doc.path.as_ref()?)
-                        .map(|p| (p.clone(), e.doc.rope.to_string()))
+                        .map(|p| (p.clone(), rope_string(&e.doc.rope)))
                 })
                 .collect();
             let results = search::search_with_options(
@@ -574,11 +759,11 @@ pub fn call(app: &mut App, options: &AgentConfig, name: &str, args: &Value) -> T
             Ok(json!({ "buffers": buffers }))
         }
         "editor_outline" => {
-            let text = if s("path").is_empty() {
+            let symbols = if s("path").is_empty() {
                 let ed = app
                     .editor()
                     .ok_or_else(|| "No active buffer in editor".to_string())?;
-                ed.doc.rope.to_string()
+                buffer_outline(&ed.doc.rope)
             } else {
                 let path = workspace_path(&app.explorer.root, s("path"))?;
                 if let Some(ed) = app
@@ -586,48 +771,12 @@ pub fn call(app: &mut App, options: &AgentConfig, name: &str, args: &Value) -> T
                     .iter()
                     .find(|e| e.doc.path.as_ref() == Some(&path))
                 {
-                    ed.doc.rope.to_string()
+                    buffer_outline(&ed.doc.rope)
                 } else {
-                    std::fs::read_to_string(&path).map_err(|e| e.to_string())?
+                    let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+                    outline_symbols(text.lines().map(Cow::Borrowed))
                 }
             };
-            let keywords = [
-                "pub fn ",
-                "fn ",
-                "pub struct ",
-                "struct ",
-                "pub enum ",
-                "enum ",
-                "pub trait ",
-                "trait ",
-                "impl ",
-                "impl<",
-                "pub mod ",
-                "mod ",
-                "class ",
-                "interface ",
-                "def ",
-                "async def ",
-                "function ",
-                "export function ",
-                "export class ",
-                "export interface ",
-                "export type ",
-            ];
-            let mut symbols = Vec::new();
-            for (i, line) in text.lines().enumerate() {
-                let trimmed = line.trim();
-                if keywords.iter().any(|k| trimmed.starts_with(k)) && !trimmed.ends_with(';') {
-                    let signature = trimmed.trim_end_matches('{').trim_end_matches(':').trim();
-                    symbols.push(json!({
-                        "line": i + 1,
-                        "signature": signature.chars().take(160).collect::<String>(),
-                    }));
-                    if symbols.len() >= 300 {
-                        break;
-                    }
-                }
-            }
             Ok(json!({ "symbols": symbols }))
         }
         "project_search" => {
@@ -666,7 +815,7 @@ pub fn call(app: &mut App, options: &AgentConfig, name: &str, args: &Value) -> T
                 .filter_map(|e| {
                     (!e.doc.is_read_only())
                         .then_some(e.doc.path.as_ref()?)
-                        .map(|p| (p.clone(), e.doc.rope.to_string()))
+                        .map(|p| (p.clone(), rope_string(&e.doc.rope)))
                 })
                 .collect();
             let results = search::search_with_options(
@@ -743,8 +892,31 @@ pub fn call(app: &mut App, options: &AgentConfig, name: &str, args: &Value) -> T
             if ed.doc.is_read_only() {
                 return Err("Target buffer is read-only".into());
             }
-            let current = ed.doc.rope.to_string();
-            let patched = crate::aep::apply_patch_to_string(&current, old_text, new_text)?;
+            // The apply_patch_to_string contract (exactly one
+            // occurrence, or the same two errors), resolved with a
+            // chunk scan of the rope instead of a full materialization;
+            // the patched text is assembled from rope slices only when
+            // the patch actually applies.
+            let (count, first) = rope_find(&ed.doc.rope, old_text);
+            let Some(start) = first else {
+                return Err("old_text not found in file".into());
+            };
+            if count > 1 {
+                return Err(format!(
+                    "old_text matches {count} times; provide more context to make it unique"
+                ));
+            }
+            let end = start + old_text.len();
+            let rope = &ed.doc.rope;
+            let mut patched =
+                String::with_capacity(rope.len_bytes() - old_text.len() + new_text.len());
+            for chunk in rope.byte_slice(0..start).chunks() {
+                patched.push_str(chunk);
+            }
+            patched.push_str(new_text);
+            for chunk in rope.byte_slice(end..rope.len_bytes()).chunks() {
+                patched.push_str(chunk);
+            }
             ed.replace_document(&patched);
             if save {
                 ed.doc.save().map_err(|e| e.to_string())?;
@@ -783,5 +955,61 @@ pub fn call(app: &mut App, options: &AgentConfig, name: &str, args: &Value) -> T
             }))
         }
         _ => Err(format!("Unknown toolkit tool: {name}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rope_line_matches_str_lines() {
+        let rope = Rope::from_str("alpha\r\nbeta\ngamma");
+        assert_eq!(str_line_count(&rope), Some(3));
+        assert_eq!(rope_line(&rope, 0), "alpha");
+        assert_eq!(rope_line(&rope, 1), "beta");
+        assert_eq!(rope_line(&rope, 2), "gamma");
+
+        let rope = Rope::from_str("trailing\n");
+        assert_eq!(str_line_count(&rope), Some(1));
+        assert_eq!(rope_line(&rope, 0), "trailing");
+
+        let rope = Rope::from_str("");
+        assert_eq!(str_line_count(&rope), Some(0));
+
+        // A lone trailing carriage return is content, not an ending.
+        let rope = Rope::from_str("keep\r");
+        assert_eq!(rope_line(&rope, 0), "keep\r");
+    }
+
+    #[test]
+    fn str_line_count_rejects_ropey_only_breaks() {
+        // Lone \r and Unicode line separators split ropey lines but
+        // not str::lines — the fast path must refuse them.
+        assert_eq!(str_line_count(&Rope::from_str("a\rb")), None);
+        assert_eq!(str_line_count(&Rope::from_str("a\u{2028}b")), None);
+        assert_eq!(str_line_count(&Rope::from_str("a\r\nb")), Some(2));
+        assert_eq!(str_line_count(&Rope::from_str("a\n\nb")), Some(3));
+    }
+
+    #[test]
+    fn rope_find_mirrors_str_matches() {
+        let text = format!("{}needle{}needle", "ab".repeat(1500), "cd".repeat(1500));
+        let rope = Rope::from_str(&text);
+        assert_eq!(rope_find(&rope, "needle"), (2, Some(3000)));
+        assert_eq!(text.matches("needle").count(), 2);
+
+        // Non-overlapping, left to right, exactly like str::matches.
+        let rope = Rope::from_str("aaaa");
+        assert_eq!(rope_find(&rope, "aa"), (2, Some(0)));
+        let rope = Rope::from_str("aaa");
+        assert_eq!(rope_find(&rope, "aa"), (1, Some(0)));
+
+        // Needle longer than a chunk-spanning window edge: a needle
+        // placed to straddle the middle of a large rope.
+        let text = format!("{}XYZ{}", "q".repeat(4000), "q".repeat(4000));
+        let rope = Rope::from_str(&text);
+        assert_eq!(rope_find(&rope, "XYZ"), (1, Some(4000)));
+        assert_eq!(rope_find(&rope, "absent"), (0, None));
     }
 }

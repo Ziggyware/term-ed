@@ -346,27 +346,35 @@ fn tools_schema(options: &AgentConfig) -> Value {
 
 fn compact_history(history: &mut Vec<Value>, system_bytes: usize) {
     const BUDGET: usize = 320 * 1024;
-    let size = |h: &Vec<Value>| h.iter().map(|v| v.to_string().len()).sum::<usize>() + system_bytes;
-    if size(history) <= BUDGET {
+    // Serialize each message exactly once. The drain loops below subtract
+    // the lengths of the groups they remove instead of re-serializing the
+    // surviving history after every drain.
+    let mut lengths: Vec<usize> = history.iter().map(|v| v.to_string().len()).collect();
+    let mut size = lengths.iter().sum::<usize>() + system_bytes;
+    if size <= BUDGET {
         return;
     }
     let mut removed = false;
     // Drop completed prior user turns first so the active user turn's goal is at index 0.
     if let Some(i) = history.iter().rposition(|v| v["role"] == "user") {
         if i > 0 {
+            size -= lengths.iter().take(i).sum::<usize>();
             history.drain(..i);
+            lengths.drain(..i);
             removed = true;
         }
     }
     // Drain the oldest complete (assistant + tool_results) exchange groups after index 0.
-    while size(history) > BUDGET && history.len() > 1 {
+    while size > BUDGET && history.len() > 1 {
         let next = history
             .iter()
             .enumerate()
             .skip(2)
             .find_map(|(i, v)| (v["role"] == "assistant").then_some(i))
             .unwrap_or(history.len());
+        size -= lengths.iter().take(next).skip(1).sum::<usize>();
         history.drain(1..next);
+        lengths.drain(1..next);
         removed = true;
     }
     if removed {
@@ -462,6 +470,14 @@ struct Worker {
     models: Vec<(String, String)>,
     history: Vec<Value>,
     dynamic_tools: Vec<Value>,
+    /// Lazily built tool schema for the effective options + dynamic tools,
+    /// keyed by their serialized fingerprint. Any effective-state change
+    /// (including a read_only or profile flip) changes the key.
+    tools_schema_cache: Option<(String, Arc<Vec<Value>>)>,
+    /// Lazily built non-local system prompt, keyed by every input that
+    /// determines its content. The local-model prompt is never cached:
+    /// it embeds live workspace listings and history-dependent snippets.
+    system_prompt_cache: Option<(String, String)>,
     next_id: u64,
     next_tool_id: u64,
     used_tool_ids: HashSet<String>,
@@ -531,6 +547,8 @@ impl Worker {
             models: Vec::new(),
             history: Vec::new(),
             dynamic_tools: Vec::new(),
+            tools_schema_cache: None,
+            system_prompt_cache: None,
             next_id: 1000,
             next_tool_id: 0,
             used_tool_ids: HashSet::new(),
@@ -942,7 +960,92 @@ impl Worker {
         snippets
     }
 
-    fn system_prompt(&self) -> String {
+    /// Serialized fingerprint of the full effective agent options. This is
+    /// deliberately not keyed on the Worker alone: any option that can
+    /// alter a schema or prompt (read_only, commands, plugins, toolkit,
+    /// skills, instructions, ...) is part of the serialized state.
+    fn options_fingerprint(&self) -> String {
+        serde_json::to_string(&self.options).unwrap_or_default()
+    }
+
+    fn tools_schema_key(&self) -> String {
+        let mut key = self.options_fingerprint();
+        if self.options.generated_tools {
+            key.push('\0');
+            key.push_str(&serde_json::to_string(&self.dynamic_tools).unwrap_or_default());
+        }
+        key
+    }
+
+    /// The effective tool schemas (built-in + host bridge + toolkit, plus
+    /// generated functions when enabled), rebuilt only when their
+    /// fingerprint changes.
+    fn cached_tools_schema(&mut self) -> Arc<Vec<Value>> {
+        let key = self.tools_schema_key();
+        if let Some((cached_key, schema)) = &self.tools_schema_cache
+            && cached_key == &key
+        {
+            return schema.clone();
+        }
+        let mut schemas = tools_schema(&self.options)
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if self.options.generated_tools {
+            schemas.extend(self.dynamic_tools.iter().cloned());
+        }
+        let schema = Arc::new(schemas);
+        self.tools_schema_cache = Some((key, schema.clone()));
+        schema
+    }
+
+    fn system_prompt_key(&self) -> String {
+        let mut key = self.options_fingerprint();
+        key.push('\0');
+        key.push_str(&self.cwd.to_string_lossy());
+        key.push('\0');
+        key.push_str(&self.skill_context);
+        // AgentConfig's serde form skips inherited instructions, but they
+        // are rendered into the prompt, so they belong in the key.
+        for instruction in &self.options.inherited_instructions {
+            key.push('\0');
+            key.push_str(instruction);
+        }
+        key.push_str(if self.local.is_some() {
+            "\0local"
+        } else {
+            "\0no-local"
+        });
+        key.push_str(if self.remote_override.is_some() {
+            "\0remote-override"
+        } else {
+            "\0no-remote-override"
+        });
+        key
+    }
+
+    fn system_prompt(&mut self) -> String {
+        // The local-model branch embeds the live workspace listing and
+        // snippets selected from the latest history, so it is always
+        // built fresh. The remote branch is a pure function of the keyed
+        // state above and is cached across steps.
+        let local_prompt = self.local.is_some()
+            || (self.options.uses_local() && self.remote_override.is_none());
+        if local_prompt {
+            return self.build_system_prompt();
+        }
+        let key = self.system_prompt_key();
+        if let Some((cached_key, prompt)) = &self.system_prompt_cache
+            && cached_key == &key
+        {
+            return prompt.clone();
+        }
+        let prompt = self.build_system_prompt();
+        self.system_prompt_cache = Some((key, prompt.clone()));
+        prompt
+    }
+
+    fn build_system_prompt(&self) -> String {
         let platform = if cfg!(target_os = "android") {
             "Android (Termux)"
         } else {
@@ -1563,39 +1666,41 @@ impl Worker {
         }
         let system = self.system_prompt();
         compact_history(&mut self.history, system.len());
-        let mut messages = vec![json!({"role":"system","content":system})];
-        messages.extend(self.history.iter().cloned());
-        let mut schemas = tools_schema(&self.options)
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        if self.options.generated_tools {
-            schemas.extend(self.dynamic_tools.clone());
-        }
+        let schemas = self.cached_tools_schema();
         // On-device models are slow and do not need provider extensions;
         // keep the stream plain and the answer short enough to arrive.
-        let (max_tokens, stream_options) = if self.local.is_some() {
-            (
-                self.options.max_output_tokens.min(LOCAL_MAX_OUTPUT_TOKENS),
-                Value::Null,
-            )
+        let max_tokens = if self.local.is_some() {
+            self.options.max_output_tokens.min(LOCAL_MAX_OUTPUT_TOKENS)
         } else {
-            (
-                self.options.max_output_tokens,
-                json!({"include_usage":true}),
-            )
+            self.options.max_output_tokens
         };
-        let mut body: Value = json!({"model":self.model,"messages":messages,
-            "max_tokens":max_tokens,"stream":true});
-        if !stream_options.is_null() {
-            body["stream_options"] = stream_options;
+        // Serialize the request directly from borrowed values: no deep
+        // clone of the history into a messages array and no second
+        // whole-body Value to re-serialize. Field presence and values are
+        // exactly what the previous body Value produced.
+        let mut body = String::with_capacity(system.len() + self.history.len() * 512 + 1024);
+        body.push_str("{\"model\":");
+        body.push_str(&serde_json::to_string(&self.model).unwrap_or_default());
+        body.push_str(",\"messages\":[{\"role\":\"system\",\"content\":");
+        body.push_str(&serde_json::to_string(&system).unwrap_or_default());
+        body.push('}');
+        for message in &self.history {
+            body.push(',');
+            body.push_str(&message.to_string());
+        }
+        body.push_str("],\"max_tokens\":");
+        body.push_str(&max_tokens.to_string());
+        body.push_str(",\"stream\":true");
+        if self.local.is_none() {
+            body.push_str(",\"stream_options\":{\"include_usage\":true}");
         }
         // Some providers reject an empty tools array, so omit the key instead.
         // Local ONNX inference uses <tool_call> tags rather than schema arrays.
         if !finalize && !schemas.is_empty() && self.local.is_none() {
-            body["tools"] = json!(schemas);
+            body.push_str(",\"tools\":");
+            body.push_str(&serde_json::to_string(schemas.as_slice()).unwrap_or_default());
         }
-        let body = body.to_string();
+        body.push('}');
         if body.len() > 480 * 1024 {
             return Err(Step::Failed("Context exceeds the safe request budget. Split this task or shorten instructions/attached skills; no instructions or current objective were silently removed.".into(), Some(413)));
         }
@@ -2059,15 +2164,13 @@ impl Worker {
             "run_command" => self.run_command(id, &s("command")),
             "run_code" => self.run_code(id, a),
             "local_inference" => self.local_inference(id, &s("action"), &s("model")),
-            host if crate::tool_bridge::tools(&self.options)
+            host if self
+                .cached_tools_schema()
                 .iter()
-                .any(|t| t.name == host)
-                || self.options.generated_tools
-                    && (self
-                        .dynamic_tools
-                        .iter()
-                        .any(|t| t["function"]["name"] == host)
-                        || host.starts_with("fn_")) =>
+                .any(|t| {
+                    t.pointer("/function/name").and_then(Value::as_str) == Some(host)
+                })
+                || (self.options.generated_tools && host.starts_with("fn_")) =>
             {
                 self.host_tool(id, host, a)
             }
@@ -2266,15 +2369,28 @@ impl Worker {
             .get("end_line")
             .and_then(Value::as_u64)
             .map(|n| n as usize);
-        let lines: Vec<&str> = text.lines().collect();
-        let (s, e) = (
-            start.unwrap_or(1),
-            end.unwrap_or(lines.len()).min(lines.len()),
-        );
-        let mut body: String = lines
-            .get(s.saturating_sub(1)..e.max(s.saturating_sub(1)))
-            .unwrap_or(&[])
-            .join("\n");
+        // Stream the requested window straight into one pre-sized buffer
+        // instead of collecting a &str for every line in the file. The
+        // selection matches the old slice semantics: 1-based inclusive
+        // lines, clamped to the file, empty when end < start. Output is
+        // truncated at 60k below, so the buffer never needs to grow past
+        // that plus one line.
+        let start_idx = start.unwrap_or(1).saturating_sub(1);
+        let take = end
+            .map(|e| e.saturating_sub(start_idx))
+            .unwrap_or(usize::MAX);
+        let mut body = String::with_capacity(text.len().min(60_000));
+        let mut first = true;
+        for line in text.lines().skip(start_idx).take(take) {
+            if !first {
+                body.push('\n');
+            }
+            first = false;
+            body.push_str(line);
+            if body.len() > 60_000 {
+                break;
+            }
+        }
         if body.len() > 60_000 {
             let mut end = 60_000;
             while !body.is_char_boundary(end) {

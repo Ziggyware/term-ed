@@ -79,17 +79,32 @@ struct Glob {
     dir: bool,
 }
 
+/// Case-fold a relative path once. ASCII input folds byte-wise (identical
+/// results: `fold` only lowercases A–Z, and only on Windows); anything else
+/// goes through the char path.
+fn fold_path(rel: &str) -> Vec<char> {
+    if rel.is_ascii() {
+        rel.bytes().map(|b| fold(b as char)).collect()
+    } else {
+        rel.chars().map(fold).collect()
+    }
+}
+
 impl Glob {
-    /// Match the complete path and every path tail. Testing tails includes the
-    /// file name, so a separate allocation and match for the name is unnecessary.
-    fn matches(&self, rel: &str) -> bool {
-        let text: Vec<char> = rel.chars().map(fold).collect();
-        if self.pattern.matches_chars(&text) {
+    /// Match against an already-folded path: the complete path and every
+    /// path tail. Testing tails includes the file name, so a separate
+    /// allocation and match for the name is unnecessary. The NFA scratch buffers are
+    /// allocated once and reused across the full-path and tail attempts,
+    /// instead of two fresh vectors per tail.
+    fn matches_folded(&self, text: &[char]) -> bool {
+        let mut current = Vec::new();
+        let mut next = Vec::new();
+        if self.pattern.matches_chars_with(text, &mut current, &mut next) {
             return true;
         }
-        text.iter()
-            .enumerate()
-            .any(|(i, c)| *c == '/' && self.pattern.matches_chars(&text[i + 1..]))
+        text.iter().enumerate().any(|(i, c)| {
+            *c == '/' && self.pattern.matches_chars_with(&text[i + 1..], &mut current, &mut next)
+        })
     }
 }
 
@@ -170,32 +185,43 @@ impl FilterSet {
 
     /// Does a root-relative file path pass the filter?
     pub fn matches_file(&self, rel: &str) -> bool {
-        if !self.dir_includes.is_empty() && !self.dir_includes.iter().any(|g| in_dir(rel, g)) {
+        // The empty filter (the common case) passes everything; skip the
+        // fold entirely. Otherwise the path is folded ONCE and every rule
+        // is evaluated against that single buffer.
+        if self.is_empty() {
+            return true;
+        }
+        let text = fold_path(rel);
+        if !self.dir_includes.is_empty() && !self.dir_includes.iter().any(|g| in_dir(&text, g)) {
             return false;
         }
-        if self.dir_excludes.iter().any(|g| hits_path(rel, g)) {
+        if self.dir_excludes.iter().any(|g| hits_path(&text, g)) {
             return false;
         }
         if !self.includes.is_empty() {
             let included = self.includes.iter().any(|g| {
                 if g.dir {
-                    in_dir(rel, g)
+                    in_dir(&text, g)
                 } else {
-                    g.matches(rel)
+                    g.matches_folded(&text)
                 }
             });
             if !included {
                 return false;
             }
         }
-        !self.excludes.iter().any(|g| hits_path(rel, g))
+        !self.excludes.iter().any(|g| hits_path(&text, g))
     }
 
     /// May the walker descend into this directory? Directory rules prune (and
     /// scope) the tree; file patterns never do, so a broad include is not
     /// silently narrowed by an over-eager directory skip.
     pub fn allows_dir(&self, rel: &str) -> bool {
-        if self.dir_excludes.iter().any(|g| hits_path(rel, g)) {
+        if self.dir_excludes.is_empty() {
+            return true;
+        }
+        let text = fold_path(rel);
+        if self.dir_excludes.iter().any(|g| hits_path(&text, g)) {
             return false;
         }
         // Includes match *any path tail*. A directory that does not match
@@ -236,21 +262,21 @@ fn parse_entries(spec: &str) -> Vec<(bool, Glob)> {
     out
 }
 
-/// `a/b/c.txt` -> `["a", "a/b"]`.
-fn ancestors(rel: &str) -> impl Iterator<Item = &str> {
-    rel.match_indices('/').map(move |(i, _)| &rel[..i])
-}
-
 /// A file is inside a directory pattern when any of its ancestors match.
-fn in_dir(rel: &str, g: &Glob) -> bool {
-    ancestors(rel).any(|d| g.matches(d))
+/// Ancestors of a folded path are its prefixes ending just before a `/`
+/// (`a/b/c.txt` -> `a`, `a/b`) — slices of the one folded buffer, so a
+/// path with d components costs one fold, not d.
+fn in_dir(text: &[char], g: &Glob) -> bool {
+    text.iter()
+        .enumerate()
+        .any(|(i, c)| *c == '/' && g.matches_folded(&text[..i]))
 }
 
 /// Exclusions are a little more generous than includes: a pattern that names
 /// a directory takes its whole subtree with it, whether or not it was written
 /// with a trailing separator (`!node_modules` behaves like `!node_modules/`).
-fn hits_path(rel: &str, g: &Glob) -> bool {
-    g.matches(rel) || ancestors(rel).any(|d| g.matches(d))
+fn hits_path(text: &[char], g: &Glob) -> bool {
+    g.matches_folded(text) || in_dir(text, g)
 }
 
 /// Case-insensitive matching on Windows, exact elsewhere.
@@ -359,9 +385,23 @@ impl GlobPattern {
         self.matches_chars(&text)
     }
 
+    fn matches_chars(&self, text: &[char]) -> bool {
+        let mut current = Vec::new();
+        let mut next = Vec::new();
+        self.matches_chars_with(text, &mut current, &mut next)
+    }
+
     /// Rolling NFA simulation: O(pattern × text) time, O(text) space, no
     /// recursion, and a hard state budget for adversarial filter strings.
-    fn matches_chars(&self, text: &[char]) -> bool {
+    /// `current`/`next` are caller-owned scratch rows, reused across calls
+    /// so repeated matching (path tails, filter rules) does not allocate
+    /// two fresh vectors per attempt.
+    fn matches_chars_with(
+        &self,
+        text: &[char],
+        current: &mut Vec<bool>,
+        next: &mut Vec<bool>,
+    ) -> bool {
         const MAX_STATES: usize = 200_000;
 
         let Some(first) = self.tokens.iter().position(GlobToken::is_variable) else {
@@ -393,8 +433,10 @@ impl GlobPattern {
         let tokens = &self.tokens[first..=last];
         let text = &text[first..text.len() - suffix];
         let width = text.len() + 1;
-        let mut current = vec![false; width];
-        let mut next = vec![false; width];
+        current.clear();
+        current.resize(width, false);
+        next.clear();
+        next.resize(width, false);
         let mut budget = MAX_STATES;
         current[0] = true;
 
@@ -453,7 +495,7 @@ impl GlobPattern {
                     }
                 }
             }
-            std::mem::swap(&mut current, &mut next);
+            std::mem::swap(current, next);
         }
         current[text.len()]
     }
@@ -519,14 +561,12 @@ impl TextFile {
             return Ok(None);
         }
         let bytes = std::fs::read(path)?;
-        let Ok((_encoding, mut text)) = crate::text_encoding::decode(&bytes) else {
+        let Ok((_encoding, text)) = crate::text_encoding::decode_cow(&bytes) else {
             // Not decodable text (binary, unreadable JSON, etc.): skip.
             return Ok(None);
         };
         let crlf = text.contains("\r\n");
-        if crlf {
-            text = text.replace("\r\n", "\n");
-        }
+        let text = lf_normalized(text);
         Ok(Some(Self {
             path: path.to_path_buf(),
             text,
@@ -1038,6 +1078,45 @@ impl Drop for Visitor {
     fn drop(&mut self) { self.ctx.send_files(&mut self.batch); }
 }
 
+/// Normalize CRLF to LF in one pass over the decoded text. A borrowed
+/// (plain UTF-8) input is copied exactly once — straight into the result
+/// when it is already LF-only, or through the single `replace` pass when
+/// it is not. An owned input (UTF-16 decode, UTF-8 fallback) is compacted
+/// in place inside its own allocation: no second full copy either way.
+fn lf_normalized(text: Cow<'_, str>) -> String {
+    match text {
+        Cow::Borrowed(s) => {
+            if s.contains("\r\n") {
+                s.replace("\r\n", "\n")
+            } else {
+                s.to_string()
+            }
+        }
+        Cow::Owned(mut s) => {
+            if s.contains("\r\n") {
+                let mut bytes = s.into_bytes();
+                let mut write = 0;
+                let mut read = 0;
+                while read < bytes.len() {
+                    if bytes[read] == b'\r' && bytes.get(read + 1) == Some(&b'\n') {
+                        read += 1; // drop the \r; the \n is copied next round
+                        continue;
+                    }
+                    bytes[write] = bytes[read];
+                    write += 1;
+                    read += 1;
+                }
+                bytes.truncate(write);
+                // Removing ASCII \r bytes from valid UTF-8 leaves valid
+                // UTF-8; the checked conversion is one validation pass,
+                // not a copy.
+                s = String::from_utf8(bytes).expect("CRLF compaction keeps UTF-8 validity");
+            }
+            s
+        }
+    }
+}
+
 fn read_search_file(path: &Path, ignore_binary: bool, counters: &Counters) -> std::io::Result<Option<String>> {
     use std::io::Read;
     if crate::credentials::is_private_path(path) { return Ok(None); }
@@ -1055,20 +1134,17 @@ fn read_search_file(path: &Path, ignore_binary: bool, counters: &Counters) -> st
     // UTF-8 / UTF-16 text is used as-is; anything else is binary. A file
     // that decodes as UTF-8 or UTF-16 is text even if it contains NULs, so
     // the binary skip must not fire first.
-    if let Ok((_encoding, text)) = crate::text_encoding::decode(&bytes) {
-        let mut text = text;
-        if text.contains("\r\n") { text = text.replace("\r\n", "\n"); }
-        return Ok(Some(text));
+    if let Ok((_encoding, text)) = crate::text_encoding::decode_cow(&bytes) {
+        return Ok(Some(lf_normalized(text)));
     }
     // SIMD NUL detection examines EVERY byte, not just an 8 KiB prefix.
     if ignore_binary && memchr::memchr(0, &bytes).is_some() {
         counters.skipped_binary.fetch_add(1, Ordering::Relaxed);
         return Ok(None);
     }
-    let mut text = String::from_utf8(bytes).map_err(|e| std::io::Error::new(
+    let text = String::from_utf8(bytes).map_err(|e| std::io::Error::new(
         std::io::ErrorKind::InvalidData, format!("not UTF-8: {e}")))?;
-    if text.contains("\r\n") { text = text.replace("\r\n", "\n"); }
-    Ok(Some(text))
+    Ok(Some(lf_normalized(Cow::Owned(text))))
 }
 
 fn collect_hits_limit(out: &mut Vec<FileHits>, path: &Path, rel: String, text: &str,
@@ -1085,6 +1161,10 @@ fn collect_hits_limit(out: &mut Vec<FileHits>, path: &Path, rel: String, text: &
         let mut preview_char = 0;
         let mut scanned_byte = 0;
         let mut scanned_char = 0;
+        // The ordinary (non-minified) preview is the whole line: build it
+        // once per line, not once per hit — a line with k hits previously
+        // paid k identical trim/copy constructions.
+        let mut line_preview: Option<String> = None;
         for m in re.find_iter(line).filter(|m| !m.is_empty()) {
             if total >= limit { break; }
             scanned_char += line[scanned_byte..m.start()].chars().count();
@@ -1104,7 +1184,9 @@ fn collect_hits_limit(out: &mut Vec<FileHits>, path: &Path, rel: String, text: &
                 let trim = preview.trim_end_matches('\r').len();
                 preview.truncate(trim);
                 (preview, preview_char)
-            } else { (line.to_string(), 0) };
+            } else {
+                (line_preview.get_or_insert_with(|| line.to_string()).clone(), 0)
+            };
             hits.push(Hit { line: line_no, start, end, text: preview,
                 text_offset: offset, kind: MatchKind::Content });
             total += 1;

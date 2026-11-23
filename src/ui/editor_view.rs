@@ -16,8 +16,7 @@ use crate::theme::{Palette, mix};
 const MINIMAP_WIDTH: u16 = 14;
 
 #[allow(clippy::needless_range_loop)]
-pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
-    let pal = app.theme.palette.clone();
+pub fn render(buf: &mut Buffer, area: Rect, app: &mut App, pal: &Palette) -> Option<Position> {
     let settings_minimap = app.settings.minimap;
     let show_numbers = app.settings.line_numbers;
     let focus_editor = app.focus == Focus::Editor;
@@ -126,6 +125,10 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
     let tab = e.tab();
 
     let rows = e.visual_rows(h);
+    // One scratch buffer for the current line's text, refilled only when
+    // the row's line changes (wrapped rows of one line share it).
+    let mut line_scratch = String::new();
+    let mut scratch_line = usize::MAX;
     let mut levels = std::collections::HashMap::new();
     let active_guide = active_guide(e, unit);
     let (cur_line, cur_col) = e.cursor();
@@ -183,11 +186,15 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
         }
 
         // Code.
-        let line_text = e.doc.line_str(line);
+        if scratch_line != line {
+            fill_line(&e.doc, line, &mut line_scratch);
+            scratch_line = line;
+        }
+        let line_text: &str = &line_scratch;
         let line_start = e.doc.line_start(line);
         let lh = e.hl.line(line);
         let ctx = LineCtx {
-            pal: &pal,
+            pal,
             lh,
             line,
             line_start,
@@ -204,14 +211,14 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
             }),
         };
         let origin = seg.dstart + e.scroll_col;
-        draw_line(buf, text, y, &line_text, seg, origin, tab, &ctx);
+        draw_line(buf, text, y, line_text, seg, origin, tab, &ctx);
 
         // Box selection past the end of a short line (virtual space), and the
         // column of carets for a zero-width box.
         if let Some((l, r)) = ctx.box_cols
             && last
         {
-            let eol = crate::editor::display_col(&line_text, line_text.chars().count(), tab);
+            let eol = crate::editor::display_col(line_text, line_text.chars().count(), tab);
             let left_px = text.x as usize + seg.indent;
             let paint = |buf: &mut Buffer, dc: usize, color: Color| {
                 if dc >= origin {
@@ -233,7 +240,7 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
         if let Some((s, en)) = ctx.sel_range {
             let eol = line_start + line_text.chars().count();
             if last && s <= eol && en > eol && line + 1 < total {
-                let dc = crate::editor::display_col(&line_text, line_text.chars().count(), tab);
+                let dc = crate::editor::display_col(line_text, line_text.chars().count(), tab);
                 if dc >= origin {
                     let x = text.x + (seg.indent + dc - origin) as u16;
                     if x < text.right() {
@@ -281,9 +288,9 @@ pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
     }
 
     if minimap_w > 0 {
-        render_minimap(buf, minimap, e, &pal, mm_top);
+        render_minimap(buf, minimap, e, pal, mm_top);
     }
-    render_scrollbar(buf, scrollbar, e, &pal, find_matches, changes);
+    render_scrollbar(buf, scrollbar, e, pal, find_matches, changes);
 
     caret.filter(|_| focus_editor)
 }
@@ -450,6 +457,39 @@ fn draw_line(
     }
 }
 
+/// Fill `out` with the document's line `line` minus its line ending —
+/// exactly the text `Document::line_str` returns, without a fresh
+/// allocation per call.
+fn fill_line(doc: &crate::document::Document, line: usize, out: &mut String) {
+    out.clear();
+    if line >= doc.rope.len_lines() {
+        return;
+    }
+    for chunk in doc.rope.line(line).chunks() {
+        out.push_str(chunk);
+    }
+    while out.ends_with('\n') || out.ends_with('\r') {
+        out.pop();
+    }
+}
+
+/// Reference-highlight ranges from the last computation, keyed by every
+/// input the result depends on: the caret word, the document version and
+/// length, and the viewport (first visible line + height).
+struct RefRanges {
+    word: String,
+    version: u64,
+    len_chars: usize,
+    scroll_line: usize,
+    h: usize,
+    ranges: Vec<(usize, usize)>,
+}
+
+thread_local! {
+    static REF_RANGES: std::cell::RefCell<Option<RefRanges>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Occurrences of the identifier under the caret in the visible region
 /// (Visual Studio's "highlight references").
 fn reference_ranges(e: &Editor, h: usize) -> Vec<(usize, usize)> {
@@ -460,33 +500,71 @@ fn reference_ranges(e: &Editor, h: usize) -> Vec<(usize, usize)> {
         return Vec::new();
     };
     let word = e.doc.rope.slice(s..en).to_string();
-    let wchars: Vec<char> = word.chars().collect();
-    let n = wchars.len();
-    if n < 2 || wchars.iter().all(|c| c.is_ascii_digit()) {
+    let n = word.chars().count();
+    if n < 2 || word.chars().all(|c| c.is_ascii_digit()) {
         return Vec::new();
     }
+    let version = e.doc.version;
+    let len_chars = e.doc.rope.len_chars();
+    let hit = REF_RANGES.with(|cell| {
+        let slot = cell.borrow();
+        match &*slot {
+            Some(c)
+                if c.word == word
+                    && c.version == version
+                    && c.len_chars == len_chars
+                    && c.scroll_line == e.scroll_line
+                    && c.h == h =>
+            {
+                Some(c.ranges.clone())
+            }
+            _ => None,
+        }
+    });
+    if let Some(ranges) = hit {
+        return ranges;
+    }
+    // The word consists solely of word chars (see Editor::word_at), so an
+    // occurrence that fails a boundary check can never overlap a later
+    // successful one: stepping match_indices by whole words yields the
+    // same ranges as the old per-char scan.
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
     let mut out = Vec::new();
     let last = (e.scroll_line + h).min(e.doc.len_lines());
+    let mut text = String::new();
     for line in e.scroll_line..last {
-        let text = e.doc.line_str(line);
+        fill_line(&e.doc, line, &mut text);
         let base = e.doc.line_start(line);
-        let chars: Vec<char> = text.chars().collect();
-        let mut i = 0;
-        while i + n <= chars.len() {
-            if chars[i..i + n] == wchars[..] {
-                let before = i == 0 || !(chars[i - 1].is_alphanumeric() || chars[i - 1] == '_');
-                let after = i + n == chars.len()
-                    || !(chars[i + n].is_alphanumeric() || chars[i + n] == '_');
-                if before && after {
-                    out.push((base + i, base + i + n));
-                    i += n;
-                    continue;
-                }
+        let mut char_idx = 0usize;
+        let mut scanned_to = 0usize; // byte offset char_idx counts up to
+        for (byte, _) in text.match_indices(word.as_str()) {
+            char_idx += text[scanned_to..byte].chars().count();
+            scanned_to = byte;
+            let before = text[..byte]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !is_word(c));
+            let after = text[byte + word.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !is_word(c));
+            if before && after {
+                out.push((base + char_idx, base + char_idx + n));
             }
-            i += 1;
         }
     }
-    if out.len() < 2 { Vec::new() } else { out }
+    let ranges = if out.len() < 2 { Vec::new() } else { out };
+    REF_RANGES.with(|cell| {
+        *cell.borrow_mut() = Some(RefRanges {
+            word,
+            version,
+            len_chars,
+            scroll_line: e.scroll_line,
+            h,
+            ranges: ranges.clone(),
+        });
+    });
+    ranges
 }
 
 fn leading_width(text: &str, tab: usize) -> Option<usize> {
@@ -506,19 +584,24 @@ fn leading_width(text: &str, tab: usize) -> Option<usize> {
 
 fn level_of(e: &Editor, line: usize, unit: usize) -> usize {
     let tab = e.tab();
-    if let Some(w) = leading_width(&e.doc.line_str(line), tab) {
+    // One scratch buffer for every line this call inspects (the blank-line
+    // neighbour scan can touch hundreds).
+    let mut scratch = String::new();
+    fill_line(&e.doc, line, &mut scratch);
+    if let Some(w) = leading_width(&scratch, tab) {
         return w / unit;
     }
     // Blank line: inherit the deeper of the nearest non-blank neighbours'
     // levels, but only if both sides are indented (like VS).
     let total = e.doc.len_lines();
-    let up = (0..line)
-        .rev()
-        .take(200)
-        .find_map(|l| leading_width(&e.doc.line_str(l), tab));
-    let down = (line + 1..total)
-        .take(200)
-        .find_map(|l| leading_width(&e.doc.line_str(l), tab));
+    let up = (0..line).rev().take(200).find_map(|l| {
+        fill_line(&e.doc, l, &mut scratch);
+        leading_width(&scratch, tab)
+    });
+    let down = (line + 1..total).take(200).find_map(|l| {
+        fill_line(&e.doc, l, &mut scratch);
+        leading_width(&scratch, tab)
+    });
     match (up, down) {
         (Some(a), Some(b)) => a.min(b) / unit,
         _ => 0,
@@ -573,6 +656,7 @@ fn render_minimap(buf: &mut Buffer, area: Rect, e: &Editor, pal: &Palette, top: 
     let cells = area.width.saturating_sub(1) as usize;
     let x0 = area.x + 1;
     let view = e.scroll_line..e.scroll_line + e.view_height;
+    let mut line_scratch = String::new();
 
     for row in 0..area.height as usize {
         let first = top + row * 4;
@@ -591,7 +675,8 @@ fn render_minimap(buf: &mut Buffer, area: Rect, e: &Editor, pal: &Palette, top: 
             let l = first + dy;
             let mut cols: Vec<Option<Color>> = vec![None; cells * 4];
             if l < total {
-                let text = e.doc.line_str(l);
+                fill_line(&e.doc, l, &mut line_scratch);
+                let text: &str = &line_scratch;
                 let spans = e.hl.line(l).map(|h| h.spans.as_slice()).unwrap_or(&[]);
                 let mut d = 0usize;
                 let mut si = 0;

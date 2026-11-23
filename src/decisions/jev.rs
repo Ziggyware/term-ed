@@ -14,6 +14,10 @@ pub struct JevHttpBackend {
     endpoint: String,
     api_key: String,
     fallback: LocalHeuristicBackend,
+    /// One pooled agent for the backend's lifetime: connection reuse
+    /// across calls instead of a fresh agent (and pool) per request.
+    /// `ureq::Agent` is `Send + Sync` and takes `&self` per request.
+    agent: ureq::Agent,
 }
 
 impl JevHttpBackend {
@@ -22,14 +26,11 @@ impl JevHttpBackend {
             endpoint: endpoint.into().trim_end_matches('/').to_string(),
             api_key: api_key.into(),
             fallback: LocalHeuristicBackend::new(),
+            agent: ureq::Agent::config_builder()
+                .timeout_connect(Some(Duration::from_secs(4)))
+                .build()
+                .new_agent(),
         }
-    }
-
-    fn client(&self) -> ureq::Agent {
-        ureq::Agent::config_builder()
-            .timeout_connect(Some(Duration::from_secs(4)))
-            .build()
-            .new_agent()
     }
 }
 
@@ -50,7 +51,7 @@ impl DecisionEngine for JevHttpBackend {
         });
 
         let url = format!("{}/decisions/noul", self.endpoint);
-        let resp = self.client()
+        let resp = self.agent
             .post(&url)
             .header("Authorization", &format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
@@ -97,7 +98,7 @@ impl DecisionEngine for JevHttpBackend {
         });
 
         let url = format!("{}/decisions/choice", self.endpoint);
-        let resp = self.client()
+        let resp = self.agent
             .post(&url)
             .header("Authorization", &format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
@@ -150,7 +151,7 @@ impl DecisionEngine for JevHttpBackend {
         });
 
         let url = format!("{}/decisions/score", self.endpoint);
-        let resp = self.client()
+        let resp = self.agent
             .post(&url)
             .header("Authorization", &format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")

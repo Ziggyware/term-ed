@@ -740,55 +740,49 @@ impl App {
     }
 
     fn select_field(&mut self, field: Field, label: &str, sub: bool) -> Result<()> {
-        let mut prefs = self.preferences.clone();
         let id = self.management.sub_agent.clone().unwrap_or_default();
-        let config = if sub {
-            &mut prefs
-                .sub_agents
-                .iter_mut()
-                .find(|p| p.id == id)
-                .ok_or_else(|| anyhow::anyhow!("Profile no longer exists"))?
-                .agent
-        } else {
-            &mut prefs.agent
-        };
-        let toggle = match field {
-            Field::ReadOnly => {
-                config.read_only = !config.read_only;
-                true
-            }
-            Field::Plugins => {
-                config.plugins = !config.plugins;
-                true
-            }
-            Field::SubAgents => {
-                config.sub_agents = !config.sub_agents;
-                true
-            }
-            Field::GeneratedTools => {
-                config.generated_tools = !config.generated_tools;
-                true
-            }
-            Field::Toolkit => {
-                config.toolkit = !config.toolkit;
-                true
-            }
-            Field::AutoContext => {
-                config.auto_context = !config.auto_context;
-                true
-            }
-            Field::Commands => {
-                config.commands = match config.commands {
-                    CommandPolicy::Ask => CommandPolicy::Deny,
-                    CommandPolicy::Deny => CommandPolicy::RiskAssessed,
-                    CommandPolicy::RiskAssessed => CommandPolicy::Allow,
-                    CommandPolicy::Allow => CommandPolicy::Ask,
-                };
-                true
-            }
-            _ => false,
-        };
+        // Toggle fields mutate and save immediately; the rest only open a
+        // text editor, so they read the live config and never pay for a
+        // full Preferences clone.
+        let toggle = matches!(
+            field,
+            Field::ReadOnly
+                | Field::Plugins
+                | Field::SubAgents
+                | Field::GeneratedTools
+                | Field::Toolkit
+                | Field::AutoContext
+                | Field::Commands
+        );
         if toggle {
+            let mut prefs = self.preferences.clone();
+            let config = if sub {
+                &mut prefs
+                    .sub_agents
+                    .iter_mut()
+                    .find(|p| p.id == id)
+                    .ok_or_else(|| anyhow::anyhow!("Profile no longer exists"))?
+                    .agent
+            } else {
+                &mut prefs.agent
+            };
+            match field {
+                Field::ReadOnly => config.read_only = !config.read_only,
+                Field::Plugins => config.plugins = !config.plugins,
+                Field::SubAgents => config.sub_agents = !config.sub_agents,
+                Field::GeneratedTools => config.generated_tools = !config.generated_tools,
+                Field::Toolkit => config.toolkit = !config.toolkit,
+                Field::AutoContext => config.auto_context = !config.auto_context,
+                Field::Commands => {
+                    config.commands = match config.commands {
+                        CommandPolicy::Ask => CommandPolicy::Deny,
+                        CommandPolicy::Deny => CommandPolicy::RiskAssessed,
+                        CommandPolicy::RiskAssessed => CommandPolicy::Allow,
+                        CommandPolicy::Allow => CommandPolicy::Ask,
+                    };
+                }
+                _ => unreachable!("toggle set checked above"),
+            }
             self.save_preferences(prefs)?;
             self.open_palette(if sub {
                 PaletteMode::SubAgentSettings
@@ -796,6 +790,17 @@ impl App {
                 PaletteMode::AgentSettings
             });
         } else {
+            let config = if sub {
+                &self
+                    .preferences
+                    .sub_agents
+                    .iter()
+                    .find(|p| p.id == id)
+                    .ok_or_else(|| anyhow::anyhow!("Profile no longer exists"))?
+                    .agent
+            } else {
+                &self.preferences.agent
+            };
             let value = value(field, config);
             self.edit_value(
                 if sub {
@@ -1044,9 +1049,9 @@ impl App {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("No setting selected"))?;
         let input = input.trim();
-        let mut prefs = self.preferences.clone();
         let return_mode = match edit.target {
             EditTarget::RouterKey => {
+                let mut prefs = self.preferences.clone();
                 if self.agent.is_working() || self.automation.busy() {
                     bail!("Stop the AI turn before replacing credentials");
                 }
@@ -1147,51 +1152,61 @@ impl App {
                 self.management.edit = None;
                 return Ok(());
             }
-            EditTarget::CreateSub => {
-                if !config::valid_id(input) || prefs.sub_agents.iter().any(|p| p.id == input) {
-                    bail!("Use a unique ID containing letters, digits, '-' or '_'");
-                }
-                prefs.sub_agents.push(SubAgentConfig {
-                    id: input.into(),
-                    name: input.replace('-', " "),
-                    ..Default::default()
-                });
-                self.management.sub_agent = Some(input.into());
-                PaletteMode::SubAgentSettings
-            }
-            EditTarget::SubName(id) => {
-                let profile = prefs
-                    .sub_agents
-                    .iter_mut()
-                    .find(|p| p.id == id)
-                    .ok_or_else(|| anyhow::anyhow!("Profile not found"))?;
-                profile.name = input.into();
-                PaletteMode::SubAgentSettings
-            }
-            EditTarget::SubDescription(id) => {
-                let profile = prefs
-                    .sub_agents
-                    .iter_mut()
-                    .find(|p| p.id == id)
-                    .ok_or_else(|| anyhow::anyhow!("Profile not found"))?;
-                profile.description = input.into();
-                PaletteMode::SubAgentSettings
-            }
-            EditTarget::Main(field) => {
-                set_field(&mut prefs.agent, field, input)?;
-                PaletteMode::AgentSettings
-            }
-            EditTarget::Sub(id, field) => {
-                let profile = prefs
-                    .sub_agents
-                    .iter_mut()
-                    .find(|p| p.id == id)
-                    .ok_or_else(|| anyhow::anyhow!("Profile not found"))?;
-                set_field(&mut profile.agent, field, input)?;
-                PaletteMode::SubAgentSettings
+            target => {
+                // Only the profile/field edits below need a draft of the
+                // preferences; every target above returns early and never
+                // pays for the clone.
+                let mut prefs = self.preferences.clone();
+                let mode = match target {
+                    EditTarget::CreateSub => {
+                        if !config::valid_id(input) || prefs.sub_agents.iter().any(|p| p.id == input) {
+                            bail!("Use a unique ID containing letters, digits, '-' or '_'");
+                        }
+                        prefs.sub_agents.push(SubAgentConfig {
+                            id: input.into(),
+                            name: input.replace('-', " "),
+                            ..Default::default()
+                        });
+                        self.management.sub_agent = Some(input.into());
+                        PaletteMode::SubAgentSettings
+                    }
+                    EditTarget::SubName(id) => {
+                        let profile = prefs
+                            .sub_agents
+                            .iter_mut()
+                            .find(|p| p.id == id)
+                            .ok_or_else(|| anyhow::anyhow!("Profile not found"))?;
+                        profile.name = input.into();
+                        PaletteMode::SubAgentSettings
+                    }
+                    EditTarget::SubDescription(id) => {
+                        let profile = prefs
+                            .sub_agents
+                            .iter_mut()
+                            .find(|p| p.id == id)
+                            .ok_or_else(|| anyhow::anyhow!("Profile not found"))?;
+                        profile.description = input.into();
+                        PaletteMode::SubAgentSettings
+                    }
+                    EditTarget::Main(field) => {
+                        set_field(&mut prefs.agent, field, input)?;
+                        PaletteMode::AgentSettings
+                    }
+                    EditTarget::Sub(id, field) => {
+                        let profile = prefs
+                            .sub_agents
+                            .iter_mut()
+                            .find(|p| p.id == id)
+                            .ok_or_else(|| anyhow::anyhow!("Profile not found"))?;
+                        set_field(&mut profile.agent, field, input)?;
+                        PaletteMode::SubAgentSettings
+                    }
+                    _ => unreachable!("every other target returned above"),
+                };
+                self.save_preferences(prefs)?;
+                mode
             }
         };
-        self.save_preferences(prefs)?;
         self.management.edit = None;
         self.open_palette(return_mode);
         Ok(())

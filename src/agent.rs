@@ -994,9 +994,11 @@ impl Agent {
         }
     }
 
-    fn handle(&mut self, v: Value, events: &mut Vec<AgentEvent>) {
+    fn handle(&mut self, mut v: Value, events: &mut Vec<AgentEvent>) {
         let method = v.get("method").and_then(Value::as_str).map(String::from);
-        let id = v.get("id").cloned();
+        // The message is owned: move the id/result/params subtrees out
+        // instead of cloning them.
+        let id = v.as_object_mut().and_then(|o| o.remove("id"));
         match (method, id) {
             // Response to one of our requests.
             (None, Some(id)) => {
@@ -1007,7 +1009,10 @@ impl Agent {
                 if let Some(err) = v.get("error") {
                     self.on_error(kind, err);
                 } else {
-                    let result = v.get("result").cloned().unwrap_or(Value::Null);
+                    let result = v
+                        .as_object_mut()
+                        .and_then(|o| o.remove("result"))
+                        .unwrap_or(Value::Null);
                     self.on_result(kind, result, events);
                 }
             }
@@ -1022,7 +1027,10 @@ impl Agent {
             // Request from the agent.
             (Some(m), Some(id)) => {
                 self.host_progress();
-                let p = v.get("params").cloned().unwrap_or(Value::Null);
+                let mut p = v
+                    .as_object_mut()
+                    .and_then(|o| o.remove("params"))
+                    .unwrap_or(Value::Null);
                 match m.as_str() {
                     "session/request_permission" => {
                         let title = p
@@ -1063,7 +1071,10 @@ impl Agent {
                                 .and_then(Value::as_str)
                                 .unwrap_or("")
                                 .to_string(),
-                            arguments: p.get("arguments").cloned().unwrap_or(json!({})),
+                            arguments: p
+                                .as_object_mut()
+                                .and_then(|o| o.remove("arguments"))
+                                .unwrap_or(json!({})),
                         });
                     }
                     "fs/read_text_file" => {

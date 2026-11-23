@@ -98,10 +98,20 @@ struct Checkpoint {
     depth: usize,
 }
 
+/// Parser-state save points are kept every SAVE_EVERY lines instead of at
+/// every line: advancing mutates one live checkpoint in place, and a clone
+/// is only taken at save points (and when an edit invalidates the frontier,
+/// which replays from the nearest save point — the parser is deterministic,
+/// so the replayed state is identical).
+const SAVE_EVERY: usize = 50;
+
 pub struct HighlightCache {
     syntax: &'static SyntaxReference,
-    /// `starts[i]` is the parser state at the beginning of line `i`.
+    /// `starts[k]` is the parser state at the beginning of line `k * SAVE_EVERY`.
     starts: Vec<Checkpoint>,
+    /// Parser state at the beginning of line `lines.len()` (the frontier),
+    /// kept live so advancing costs no per-line clone.
+    frontier: Option<Checkpoint>,
     lines: Vec<LineHighlight>,
     /// Provisional highlighting for a region far beyond the exact frontier,
     /// parsed from a fresh state (first line, lines). Lets a jump to the end
@@ -132,6 +142,7 @@ impl HighlightCache {
         Self {
             syntax,
             starts: Vec::new(),
+            frontier: None,
             lines: Vec::new(),
             approx: None,
         }
@@ -148,14 +159,21 @@ impl HighlightCache {
 
     pub fn invalidate_all(&mut self) {
         self.starts.clear();
+        self.frontier = None;
         self.lines.clear();
         self.approx = None;
     }
 
     /// Drop everything from `line` downwards.
     pub fn invalidate_from(&mut self, line: usize) {
+        // The frontier holds the state at the old `lines.len()`; it is
+        // stale exactly when the cut is below it.
+        if line < self.lines.len() {
+            self.frontier = None;
+        }
         self.lines.truncate(line);
-        self.starts.truncate(line + 1);
+        // Keep save points at lines <= `line`.
+        self.starts.truncate(line / SAVE_EVERY + 1);
         if self
             .approx
             .as_ref()
@@ -230,25 +248,66 @@ impl HighlightCache {
             return true;
         }
         let highlighter = Highlighter::new(theme);
-        if self.starts.is_empty() {
-            self.starts.push(Checkpoint {
-                parse: ParseState::new(self.syntax),
-                hl: HighlightState::new(&highlighter, ScopeStack::new()),
-                depth: 0,
-            });
-        }
         let mut text = String::new();
+        let mut cp = self.restore_frontier(rope, &highlighter, theme, bg, &mut text);
         while self.lines.len() <= upto {
             let i = self.lines.len();
-            let mut cp = self.starts[i].clone();
+            if i.is_multiple_of(SAVE_EVERY) {
+                // Save point: starts[i / SAVE_EVERY] holds the state at
+                // the beginning of line i.
+                let slot = i / SAVE_EVERY;
+                if self.starts.len() == slot {
+                    self.starts.push(cp.clone());
+                } else {
+                    self.starts[slot] = cp.clone();
+                }
+            }
             let lh = self.step(rope, i, &mut cp, &highlighter, theme, bg, &mut text);
             self.lines.push(lh);
-            self.starts.push(cp);
             if i.is_multiple_of(64) && deadline.is_some_and(|d| Instant::now() >= d) {
+                self.frontier = Some(cp);
                 return self.lines.len() > upto;
             }
         }
+        self.frontier = Some(cp);
         true
+    }
+
+    /// The parser state at the beginning of line `lines.len()`: the live
+    /// frontier when present, otherwise replayed from the nearest save
+    /// point at or below it. Parsing is deterministic, so the replayed
+    /// state is exactly what per-line checkpoints used to store.
+    fn restore_frontier(
+        &mut self,
+        rope: &Rope,
+        highlighter: &Highlighter<'_>,
+        theme: &Theme,
+        bg: Color,
+        text: &mut String,
+    ) -> Checkpoint {
+        if let Some(cp) = self.frontier.take() {
+            return cp;
+        }
+        if self.starts.is_empty() {
+            self.starts.push(Checkpoint {
+                parse: ParseState::new(self.syntax),
+                hl: HighlightState::new(highlighter, ScopeStack::new()),
+                depth: 0,
+            });
+        }
+        let target = self.lines.len();
+        let slot = target / SAVE_EVERY;
+        let (mut cp, mut at) = if slot < self.starts.len() {
+            (self.starts[slot].clone(), slot * SAVE_EVERY)
+        } else {
+            let last = self.starts.len() - 1;
+            (self.starts[last].clone(), last * SAVE_EVERY)
+        };
+        while at < target {
+            let _ = self.step(rope, at, &mut cp, highlighter, theme, bg, text);
+            at += 1;
+        }
+        cp
     }
 
     #[allow(clippy::too_many_arguments)]

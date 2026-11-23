@@ -92,6 +92,12 @@ pub struct Palette {
     pub items: Vec<String>,
     pub hints: Vec<String>,
     pub filtered: Vec<fuzzy::Scored>,
+    /// The last full (untruncated) ranking: the (query, paths flag, item
+    /// count) it was computed for, plus every match past the visible 500
+    /// (`filtered` holds the first 500). Lets refilter re-rank only the
+    /// previous matches when the query grows by appending.
+    pub ranked_query: Option<(String, bool, usize)>,
+    pub ranked_tail: Vec<fuzzy::Scored>,
     pub selected: usize,
     pub scroll: usize,
     /// Theme active before a live-preview picker opened (restored on Esc).
@@ -368,6 +374,13 @@ pub struct SearchState {
     /// The query was pre-filled from the editor and is shown selected.
     pub query_selected: bool,
     key: Option<SearchKey>,
+    /// Bumped whenever `results` or `collapsed` changes; stamps the row
+    /// offset cache below.
+    rows_version: u64,
+    /// (rows_version, per-file header row offsets, total row count) for
+    /// the flat results list. Navigation and rendering used to recompute
+    /// the prefix offsets over every result file on every move.
+    rows_cache: std::cell::RefCell<Option<(u64, Vec<usize>, usize)>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -543,7 +556,10 @@ pub struct App {
     pub chord: bool,
     drag: Option<Drag>,
     last_click: Option<(Instant, u16, u16, u8)>,
-    project_files: Option<Vec<String>>,
+    /// Cached project file list, keyed by the walk limit it was built
+    /// with: a list walked with a smaller limit is a different set, not a
+    /// prefix of a larger one, so the limit is part of the key.
+    project_files: Option<(usize, Vec<String>)>,
     /// Neon lighting animation state.
     pub neon: Neon,
     /// Guardian creature living in the title bar.
@@ -692,6 +708,23 @@ impl App {
 
     pub(crate) fn invalidate_project_files(&mut self) {
         self.project_files = None;
+    }
+
+    /// The project file list for `limit`, served from the cache until
+    /// files are created, deleted or renamed (see
+    /// `invalidate_project_files`). The tree walk honors .gitignore and
+    /// stats the whole tree, so repeat callers (Quick Open, semantic
+    /// search, project review) share one walk per limit.
+    fn cached_project_files(&mut self, limit: usize) -> &[String] {
+        if self
+            .project_files
+            .as_ref()
+            .is_none_or(|(l, _)| *l != limit)
+        {
+            let root = self.explorer.root.clone();
+            self.project_files = Some((limit, explorer::project_files(&root, limit)));
+        }
+        &self.project_files.as_ref().unwrap().1
     }
 
     pub fn word_wrap(&self) -> bool {
@@ -1834,6 +1867,15 @@ impl App {
     ///
     /// Embeddings need a model, so this degrades honestly: without one it says
     /// how to get it and offers the text search instead of returning nothing.
+    /// Unsaved-buffer contents by path: exactly one rope materialization
+    /// per open buffer, shared by the project-wide search/code commands.
+    fn buffer_overrides(&self) -> Vec<(PathBuf, String)> {
+        self.editors
+            .iter()
+            .filter_map(|e| e.doc.path.clone().map(|p| (p, e.doc.rope.to_string())))
+            .collect()
+    }
+
     fn find_related(&mut self) {
         let seed = match self
             .editor()
@@ -1857,22 +1899,26 @@ impl App {
         };
 
         // Gather candidate chunks from the project plus unsaved buffers.
-        let overrides: Vec<(PathBuf, String)> = self
-            .editors
-            .iter()
-            .filter_map(|e| e.doc.path.clone().map(|p| (p, e.doc.rope.to_string())))
-            .collect();
+        // The override lookup runs once per project file, so index the
+        // buffers by path (first buffer wins per path, as the previous
+        // linear find did) instead of scanning the list per file and
+        // cloning the winning text.
+        let mut overrides: std::collections::HashMap<PathBuf, String> =
+            std::collections::HashMap::new();
+        for (p, t) in self.buffer_overrides() {
+            overrides.entry(p).or_insert(t);
+        }
         let mut chunks: Vec<crate::embeddings::Chunk> = Vec::new();
-        let files = explorer::project_files(&self.explorer.root, 4000);
+        let files = self.cached_project_files(4000).to_vec();
+        let max = self.autofix.max_file_bytes as usize;
         for rel in &files {
             let path = self.explorer.root.join(rel);
-            let text = overrides
-                .iter()
-                .find(|(p, _)| *p == path)
-                .map(|(_, t)| t.clone())
-                .or_else(|| std::fs::read_to_string(&path).ok());
-            if let Some(text) = text
-                && text.len() <= self.autofix.max_file_bytes as usize
+            if let Some(text) = overrides.get(&path) {
+                if text.len() <= max {
+                    chunks.extend(crate::embeddings::chunk_file(&path, text));
+                }
+            } else if let Ok(text) = std::fs::read_to_string(&path)
+                && text.len() <= max
             {
                 chunks.extend(crate::embeddings::chunk_file(&path, &text));
             }
@@ -1945,9 +1991,11 @@ impl App {
     /// Analyse the project for obvious problems and show what it found. Every
     /// suggestion is a proposal: nothing is written.
     fn review_project(&mut self) {
-        let files: Vec<PathBuf> = explorer::project_files(&self.explorer.root, 5000)
-            .into_iter()
-            .map(|rel| self.explorer.root.join(rel))
+        let root = self.explorer.root.clone();
+        let files: Vec<PathBuf> = self
+            .cached_project_files(5000)
+            .iter()
+            .map(|rel| root.join(rel))
             .collect();
         let report = crate::autofix::limit(
             crate::autofix::analyze_files(&files, self.autofix.max_file_bytes),
@@ -2142,11 +2190,7 @@ impl App {
             self.toast("Put the cursor on a name first", ToastKind::Info);
             return;
         };
-        let overrides: Vec<(PathBuf, String)> = self
-            .editors
-            .iter()
-            .filter_map(|e| e.doc.path.clone().map(|p| (p, e.doc.rope.to_string())))
-            .collect();
+        let overrides = self.buffer_overrides();
         let locations = match crate::code_intel::project_references(
             &self.explorer.root,
             &word.text,
@@ -2279,7 +2323,10 @@ impl App {
             anyhow::bail!("`{word}` is gone; nothing to rename");
         };
         let path = e.doc.path.clone().unwrap_or_else(|| PathBuf::from("buffer"));
-        let buffers = vec![(path, text.clone())];
+        // Move the one materialization into the buffers list and borrow
+        // it back for the rewrite below — no second full-text copy.
+        let buffers = vec![(path, text)];
+        let text = &buffers[0].1;
         let edits = match crate::code_intel::rename(&w, new_name, &buffers) {
             Ok(edits) => edits,
             Err(crate::code_intel::Refusal(why)) => anyhow::bail!("{why}"),
@@ -2617,11 +2664,7 @@ impl App {
                 (items, hints)
             }
             PaletteMode::Files => {
-                let root = self.explorer.root.clone();
-                let files = self
-                    .project_files
-                    .get_or_insert_with(|| explorer::project_files(&root, 50_000))
-                    .clone();
+                let files = self.cached_project_files(50_000).to_vec();
                 let hints = files
                     .iter()
                     .map(|f| {
@@ -2750,6 +2793,8 @@ impl App {
             items,
             hints,
             filtered: Vec::new(),
+            ranked_query: None,
+            ranked_tail: Vec::new(),
             selected: 0,
             scroll: 0,
             restore_theme,
@@ -2781,8 +2826,47 @@ impl App {
     fn refilter(&mut self) {
         let Some(p) = &mut self.palette else { return };
         let paths = p.mode == PaletteMode::Files;
-        p.filtered = fuzzy::rank(&p.input, &p.items, paths);
-        p.filtered.truncate(500);
+        let already_ranked = p.ranked_query.as_ref().is_some_and(|(q, rp, n)| {
+            *rp == paths && *n == p.items.len() && *q == p.input
+        });
+        if !already_ranked {
+            // Appending to the query can only narrow the match set:
+            // nucleo scores each item independently of the others, and a
+            // match for an extended query is always a match for its
+            // prefix. So when the input grew purely by appending, re-rank
+            // just the previous full match set — fed in original index
+            // order, which keeps the stable sort's tie order identical
+            // to a full rank. Anything else re-ranks everything.
+            let appends = p.ranked_query.as_ref().is_some_and(|(q, rp, n)| {
+                *rp == paths
+                    && *n == p.items.len()
+                    && p.input.len() > q.len()
+                    && p.input.starts_with(q.as_str())
+            });
+            let mut full = if appends {
+                let mut all = std::mem::take(&mut p.filtered);
+                all.append(&mut p.ranked_tail);
+                let mut idx: Vec<usize> = all.iter().map(|s| s.index).collect();
+                idx.sort_unstable();
+                let subset: Vec<&String> = idx.iter().map(|&i| &p.items[i]).collect();
+                fuzzy::rank(&p.input, &subset, paths)
+                    .into_iter()
+                    .map(|mut s| {
+                        s.index = idx[s.index];
+                        s
+                    })
+                    .collect()
+            } else {
+                fuzzy::rank(&p.input, &p.items, paths)
+            };
+            if full.len() > 500 {
+                p.ranked_tail = full.split_off(500);
+            } else {
+                p.ranked_tail = Vec::new();
+            }
+            p.filtered = full;
+            p.ranked_query = Some((p.input.clone(), paths, p.items.len()));
+        }
         p.selected = 0;
         p.scroll = 0;
         if p.mode == PaletteMode::GotoLine
@@ -3182,6 +3266,144 @@ impl App {
             .ok()
     }
 
+    /// Whether the current find pattern provably cannot match a string
+    /// containing '\n', so update_find may scan line by line. Conservative:
+    /// anything doubtful returns false and the whole-text scan runs, so the
+    /// match set is always exactly the whole-text scan's.
+    fn find_pattern_line_safe(&self) -> bool {
+        let f = &self.find;
+        if !f.regex {
+            // The pattern is the escaped literal query; it can only match
+            // a newline if the query itself contains one.
+            return !f.query.contains('\n');
+        }
+        let q = &f.query;
+        // Constructs that can match a newline: a literal newline, any
+        // character class (negated classes match '\n', ranges may span
+        // it), \n, \s, \W, unicode properties, hex/unicode escapes naming
+        // U+000A, and the dot-all flag in any (?...) group.
+        if q.contains('\n') || q.contains('[') {
+            return false;
+        }
+        let bytes = q.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' => {
+                    match bytes.get(i + 1) {
+                        Some(b'n') | Some(b's') | Some(b'W') | Some(b'p') | Some(b'P') => {
+                            return false;
+                        }
+                        Some(kind @ (b'x' | b'u' | b'U')) => {
+                            let rest = &q[i + 2..];
+                            let digits: String = if rest.starts_with('{') {
+                                rest[1..].chars().take_while(|c| *c != '}').collect()
+                            } else {
+                                let n = match kind {
+                                    b'x' => 2,
+                                    b'u' => 4,
+                                    _ => 8,
+                                };
+                                rest.chars()
+                                    .take(n)
+                                    .take_while(|c| c.is_ascii_hexdigit())
+                                    .collect()
+                            };
+                            if u32::from_str_radix(&digits, 16) == Ok(0x0a) {
+                                return false;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 2;
+                }
+                b'(' if bytes.get(i + 1) == Some(&b'?') => {
+                    // Flag group ((?i), (?s), (?i-s)…): dot-all counts
+                    // unless the 's' flag is disabled after '-'.
+                    let rest = &q[i + 2..];
+                    let end = rest.find(')').unwrap_or(rest.len());
+                    let flags = &rest[..end];
+                    let (on, off) = flags.split_once('-').unwrap_or((flags, ""));
+                    if on.contains('s') && !off.contains('s') {
+                        return false;
+                    }
+                    i += 2;
+                }
+                _ => i += 1,
+            }
+        }
+        true
+    }
+
+    /// Line-by-line find scan for patterns that cannot match across a
+    /// newline (see find_pattern_line_safe): walks the rope's chunks
+    /// once, carrying a running char offset, so there is no whole-rope
+    /// String and no per-match byte_to_char. The 100,000-item budget
+    /// counts find_iter items exactly as the whole-text scan's
+    /// `take(100_000)` does, including empty matches; a `$` match at the
+    /// position right after a line's '\n' is a slice artifact (the
+    /// whole-text scan has no match there — that is the next line's
+    /// start) and is neither counted nor pushed.
+    fn scan_find_matches(
+        matches: &mut Vec<(usize, usize)>,
+        rope: &ropey::Rope,
+        re: &Regex,
+    ) {
+        fn scan_line(
+            matches: &mut Vec<(usize, usize)>,
+            line: &str,
+            char_base: usize,
+            is_final: bool,
+            re: &Regex,
+            budget: &mut usize,
+        ) -> bool {
+            let mut counted_to = 0usize; // byte offset already char-counted
+            let mut char_at = 0usize; // char offset of counted_to in the line
+            for m in re.find_iter(line) {
+                if m.start() == line.len() && !is_final {
+                    continue; // slice-boundary artifact, see above
+                }
+                if *budget == 0 {
+                    return false;
+                }
+                *budget -= 1;
+                if m.start() == m.end() {
+                    continue;
+                }
+                char_at += line[counted_to..m.start()].chars().count();
+                let start = char_at;
+                char_at += line[m.start()..m.end()].chars().count();
+                counted_to = m.end();
+                matches.push((char_base + start, char_base + char_at));
+            }
+            true
+        }
+
+        let total_bytes = rope.len_bytes();
+        let mut budget = 100_000usize;
+        let mut line = String::new();
+        let mut char_base = 0usize;
+        let mut byte_base = 0usize;
+        'chunks: for chunk in rope.chunks() {
+            let mut rest = chunk;
+            while let Some(pos) = rest.find('\n') {
+                line.push_str(&rest[..=pos]);
+                let is_final = byte_base + line.len() == total_bytes;
+                if !scan_line(matches, &line, char_base, is_final, re, &mut budget) {
+                    break 'chunks;
+                }
+                char_base += line.chars().count();
+                byte_base += line.len();
+                line.clear();
+                rest = &rest[pos + 1..];
+            }
+            line.push_str(rest);
+        }
+        if budget > 0 && !line.is_empty() {
+            scan_line(matches, &line, char_base, true, re, &mut budget);
+        }
+    }
+
     /// Recompute matches if the query, options or document changed.
     pub fn update_find(&mut self) {
         let Some(e) = self.editors.get(self.active) else {
@@ -3211,14 +3433,18 @@ impl App {
             return;
         };
         let rope = &e.doc.rope;
-        let text = rope.to_string();
-        for m in re.find_iter(&text).take(100_000) {
-            if m.start() == m.end() {
-                continue;
+        if self.find_pattern_line_safe() {
+            Self::scan_find_matches(&mut self.find.matches, rope, &re);
+        } else {
+            let text = rope.to_string();
+            for m in re.find_iter(&text).take(100_000) {
+                if m.start() == m.end() {
+                    continue;
+                }
+                self.find
+                    .matches
+                    .push((rope.byte_to_char(m.start()), rope.byte_to_char(m.end())));
             }
-            self.find
-                .matches
-                .push((rope.byte_to_char(m.start()), rope.byte_to_char(m.end())));
         }
         let head = e.sel.start();
         self.find.current = self
@@ -3531,6 +3757,7 @@ impl App {
         self.search.job = None; // Drop cancels, never joins.
         self.search.key = Some(key);
         self.search.results = search::Results::default();
+        self.search.rows_version = self.search.rows_version.wrapping_add(1);
         self.search.error = false;
         self.search.error_message = None;
         self.search.selected = None;
@@ -3575,6 +3802,9 @@ impl App {
         self.start_search_if_due();
         let Some(job) = &mut self.search.job else { return false; };
         let changed = job.pump(&mut self.search.results);
+        if changed {
+            self.search.rows_version = self.search.rows_version.wrapping_add(1);
+        }
         if let Some(error) = &job.error {
             self.search.error = true;
             self.search.error_message = Some(error.clone());
@@ -3685,44 +3915,63 @@ impl App {
             .map(|fi| (fi, 0))
     }
 
-    /// The flat rows of the results list: a header per file, then its
-    /// matches (unless the file is collapsed).
-    fn rebuild_search_rows(&self) -> Vec<usize> {
+    /// Run `f` with the flat-row layout of the results list: the header
+    /// row offset of each file, and the total row count (a header per
+    /// file, then its matches unless the file is collapsed). Rebuilt
+    /// only when results or the collapsed set changed (rows_version);
+    /// navigation and rendering call this on every move/frame.
+    fn with_search_rows<R>(&self, f: impl FnOnce(&[usize], usize) -> R) -> R {
+        {
+            let cache = self.search.rows_cache.borrow();
+            if let Some((v, offsets, total)) = &*cache
+                && *v == self.search.rows_version
+            {
+                return f(offsets, *total);
+            }
+        }
+        let mut offsets = Vec::with_capacity(self.search.results.files.len());
         let mut offset = 0;
-        self.search.results.files.iter().map(|f| {
-            let start = offset;
-            offset += 1 + if self.search.collapsed.contains(&f.path) { 0 } else { f.matches.len() };
-            start
-        }).collect()
+        for file in &self.search.results.files {
+            offsets.push(offset);
+            offset += 1 + if self.search.collapsed.contains(&file.path) { 0 } else { file.matches.len() };
+        }
+        let total = offset;
+        let out = f(&offsets, total);
+        *self.search.rows_cache.borrow_mut() = Some((self.search.rows_version, offsets, total));
+        out
     }
 
     pub fn search_row_count(&self) -> usize {
-        self.search.results.files.iter().map(|f| 1 + if self.search.collapsed.contains(&f.path) { 0 } else { f.matches.len() }).sum()
+        self.with_search_rows(|_, total| total)
     }
 
     /// Virtualized list: allocate only the rows actually visible, even at
     /// 100,000 results. Binary search locates the first file in O(log files).
     pub fn search_visible_rows(&self, start: usize, count: usize) -> Vec<(usize, Option<usize>)> {
         if count == 0 { return Vec::new(); }
-        let offsets = self.rebuild_search_rows();
-        if offsets.is_empty() { return Vec::new(); }
-        let mut fi = offsets.partition_point(|&offset| offset <= start).saturating_sub(1);
-        let mut out = Vec::with_capacity(count);
-        for row in start..start.saturating_add(count) {
-            while fi + 1 < offsets.len() && row >= offsets[fi + 1] { fi += 1; }
-            if fi >= offsets.len() { break; }
-            let delta = row - offsets[fi];
-            let f = &self.search.results.files[fi];
-            if delta > f.matches.len() || (delta > 0 && self.search.collapsed.contains(&f.path)) { break; }
-            out.push((fi, delta.checked_sub(1)));
-        }
-        out
+        self.with_search_rows(|offsets, _| {
+            if offsets.is_empty() { return Vec::new(); }
+            let mut fi = offsets.partition_point(|&offset| offset <= start).saturating_sub(1);
+            let mut out = Vec::with_capacity(count);
+            for row in start..start.saturating_add(count) {
+                while fi + 1 < offsets.len() && row >= offsets[fi + 1] { fi += 1; }
+                if fi >= offsets.len() { break; }
+                let delta = row - offsets[fi];
+                let f = &self.search.results.files[fi];
+                if delta > f.matches.len() || (delta > 0 && self.search.collapsed.contains(&f.path)) { break; }
+                out.push((fi, delta.checked_sub(1)));
+            }
+            out
+        })
     }
 
     pub fn search_row_position(&self, fi: usize, mi: usize) -> Option<usize> {
         let f = self.search.results.files.get(fi)?;
-        let offset: usize = self.search.results.files[..fi].iter().map(|f| 1 + if self.search.collapsed.contains(&f.path) { 0 } else { f.matches.len() }).sum();
-        if self.search.collapsed.contains(&f.path) { Some(offset) } else { Some(offset + 1 + mi) }
+        let collapsed = self.search.collapsed.contains(&f.path);
+        self.with_search_rows(|offsets, _| {
+            let offset = offsets[fi];
+            if collapsed { Some(offset) } else { Some(offset + 1 + mi) }
+        })
     }
 
     fn search_move(&mut self, delta: isize) {
@@ -3796,6 +4045,7 @@ impl App {
         if !self.search.collapsed.remove(&path) {
             self.search.collapsed.insert(path);
         }
+        self.search.rows_version = self.search.rows_version.wrapping_add(1);
     }
 
     /// Replace in one path: an open editor keeps the change in memory (so it

@@ -20,24 +20,33 @@ pub enum TextEncoding {
 /// Detect and decode a text file. Returns the detected encoding and the text
 /// with the BOM stripped. Errors when neither UTF-8 nor UTF-16 applies.
 pub fn decode(bytes: &[u8]) -> Result<(TextEncoding, String), String> {
+    let (encoding, text) = decode_cow(bytes)?;
+    Ok((encoding, text.into_owned()))
+}
+
+/// [`decode`] without the copy for the common case: plain UTF-8 (with or
+/// without a BOM) borrows the input buffer; only UTF-16 materializes a
+/// new string. Callers that normalize or transform the text can work on
+/// the `Cow` and pay for at most one owned result.
+pub fn decode_cow<'a>(bytes: &'a [u8]) -> Result<(TextEncoding, std::borrow::Cow<'a, str>), String> {
+    use std::borrow::Cow;
     if bytes.starts_with(b"\xEF\xBB\xBF") {
         let text = std::str::from_utf8(&bytes[3..])
-            .map_err(|e| format!("not UTF-8: {e}"))?
-            .to_string();
-        return Ok((TextEncoding::Utf8, text));
+            .map_err(|e| format!("not UTF-8: {e}"))?;
+        return Ok((TextEncoding::Utf8, Cow::Borrowed(text)));
     }
     if bytes.starts_with(b"\xFF\xFE") {
         let text = decode_utf16(&bytes[2..], true)?;
-        return Ok((TextEncoding::Utf16Le, text));
+        return Ok((TextEncoding::Utf16Le, Cow::Owned(text)));
     }
     if bytes.starts_with(b"\xFE\xFF") {
         let text = decode_utf16(&bytes[2..], false)?;
-        return Ok((TextEncoding::Utf16Be, text));
+        return Ok((TextEncoding::Utf16Be, Cow::Owned(text)));
     }
     // UTF-8 is tried first: valid UTF-8 with no BOM wins.
     if bytes.iter().all(|&b| b != 0x00) {
         if let Ok(text) = std::str::from_utf8(bytes) {
-            return Ok((TextEncoding::Utf8, text.to_string()));
+            return Ok((TextEncoding::Utf8, Cow::Borrowed(text)));
         }
     }
     // BOM-less UTF-16: char high bytes are zero, so NULs dominate the odd
@@ -54,13 +63,13 @@ pub fn decode(bytes: &[u8]) -> Result<(TextEncoding, String), String> {
             // as text: control characters other than tab/newline/return
             // mean it was binary all along.
             if looks_like_text(&text) {
-                return Ok((TextEncoding::Utf16Le, text));
+                return Ok((TextEncoding::Utf16Le, Cow::Owned(text)));
             }
         }
         if even_nul >= pairs / 2 && even_nul > odd_nul * 4 {
             let text = decode_utf16(data, false)?;
             if looks_like_text(&text) {
-                return Ok((TextEncoding::Utf16Be, text));
+                return Ok((TextEncoding::Utf16Be, Cow::Owned(text)));
             }
         }
     }

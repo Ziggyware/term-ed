@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use ignore::WalkBuilder;
 
@@ -21,7 +22,7 @@ pub struct Explorer {
     pub expanded: HashSet<PathBuf>,
     pub selected: usize,
     pub scroll: usize,
-    listings: HashMap<PathBuf, Vec<(String, bool)>>,
+    listings: HashMap<PathBuf, Rc<[(String, bool)]>>,
     pub errors: Vec<String>,
 }
 
@@ -59,9 +60,11 @@ impl Explorer {
             .unwrap_or_else(|| self.root.display().to_string())
     }
 
-    fn list(&mut self, dir: &Path) -> Vec<(String, bool)> {
+    /// The cached listing for `dir`, shared: callers get a refcount bump
+    /// instead of a deep copy of every name on every tree rebuild.
+    fn list(&mut self, dir: &Path) -> Rc<[(String, bool)]> {
         if let Some(v) = self.listings.get(dir) {
-            return v.clone();
+            return Rc::clone(v);
         }
         let archive = if crate::archive::is_zip(dir) && dir.is_file() {
             Some((dir.to_path_buf(), String::new()))
@@ -69,14 +72,14 @@ impl Explorer {
             crate::archive::member_path(dir).map(|m| (m.archive, m.member))
         };
         if let Some((file, prefix)) = archive {
-            let v = match crate::archive::Index::open(&file) {
-                Ok(index) => index.children(&prefix),
+            let v: Rc<[(String, bool)]> = match crate::archive::Index::open(&file) {
+                Ok(index) => index.children(&prefix).into(),
                 Err(error) => {
                     self.errors.push(format!("Cannot browse ZIP: {error:#}"));
-                    Vec::new()
+                    Rc::from([])
                 }
             };
-            self.listings.insert(dir.to_path_buf(), v.clone());
+            self.listings.insert(dir.to_path_buf(), Rc::clone(&v));
             return v;
         }
         let mut v: Vec<(String, bool)> = walker(dir, 1)
@@ -96,7 +99,8 @@ impl Explorer {
             b.1.cmp(&a.1)
                 .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
         });
-        self.listings.insert(dir.to_path_buf(), v.clone());
+        let v: Rc<[(String, bool)]> = v.into();
+        self.listings.insert(dir.to_path_buf(), Rc::clone(&v));
         v
     }
 
@@ -128,14 +132,14 @@ impl Explorer {
 
     fn push_dir(&mut self, dir: &Path, depth: usize, out: &mut Vec<Entry>) {
         let items = self.list(dir);
-        for (name, is_dir) in items {
-            let path = dir.join(&name);
-            let open = is_dir && self.expanded.contains(&path);
+        for (name, is_dir) in items.iter() {
+            let path = dir.join(name);
+            let open = *is_dir && self.expanded.contains(&path);
             out.push(Entry {
                 path: path.clone(),
-                name,
-                is_dir,
-                is_archive: is_dir && crate::archive::is_zip(&path) && path.is_file(),
+                name: name.clone(),
+                is_dir: *is_dir,
+                is_archive: *is_dir && crate::archive::is_zip(&path) && path.is_file(),
                 depth,
             });
             if open {

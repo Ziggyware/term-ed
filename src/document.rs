@@ -528,14 +528,26 @@ impl Document {
 
     /// Line content without the trailing newline.
     pub fn line_str(&self, line: usize) -> String {
-        if line >= self.rope.len_lines() {
-            return String::new();
-        }
-        let mut s = self.rope.line(line).to_string();
-        while s.ends_with('\n') || s.ends_with('\r') {
-            s.pop();
-        }
+        let mut s = String::new();
+        self.line_into(line, &mut s);
         s
+    }
+
+    /// `line_str` into a caller-owned scratch buffer: clears `out` and
+    /// fills it with the line's content (no trailing newline), reusing
+    /// the buffer's capacity. Read-only callers that touch lines in a
+    /// loop (rendering, cursor math) avoid one allocation per line.
+    pub fn line_into(&self, line: usize, out: &mut String) {
+        out.clear();
+        if line >= self.rope.len_lines() {
+            return;
+        }
+        for chunk in self.rope.line(line).chunks() {
+            out.push_str(chunk);
+        }
+        while out.ends_with('\n') || out.ends_with('\r') {
+            out.pop();
+        }
     }
 
     /// Number of chars in a line, excluding the newline.

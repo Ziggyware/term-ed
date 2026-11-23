@@ -3,12 +3,13 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 
 const MAX_VALUE: usize = 64 * 1024;
 const MAX_ITEMS: usize = 1024;
 const MAX_FUNCTIONS: usize = 16;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Definition {
     pub name: String,
@@ -18,7 +19,26 @@ pub struct Definition {
     #[serde(default)]
     pub input: String,
     pub steps: Vec<Operation>,
+    /// The tool schema built once at define time. Listing schemas is a
+    /// per-turn cost; rebuilding this Value for every list was pure
+    /// waste. Not part of the definition's identity or its wire form.
+    #[serde(skip)]
+    pub schema_cache: Option<Arc<Value>>,
 }
+
+// Identity is the five definition fields only; the schema cache is a
+// derived artifact and must not affect equality (a stored definition
+// has the cache populated, a freshly parsed one does not).
+impl PartialEq for Definition {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.description == other.description
+            && self.input_schema == other.input_schema
+            && self.input == other.input
+            && self.steps == other.steps
+    }
+}
+impl Eq for Definition {}
 
 fn default_join_separator() -> String {
     " ".into()
@@ -118,73 +138,74 @@ fn interpolate_template(template: &str, args: &Value, current: &Value) -> String
         }
     };
 
+    // Scan bytes, not chars: the delimiters are ASCII, and ASCII bytes
+    // never occur inside a multi-byte UTF-8 sequence, so byte positions
+    // find exactly the placeholders the char scan found — without
+    // collecting a Vec<char> for the template or a String per key.
+    let bytes = template.as_bytes();
     let mut out = String::with_capacity(template.len());
-    let chars: Vec<char> = template.chars().collect();
     let mut i = 0;
-    while i < chars.len() {
+    while i < bytes.len() {
         // Handle `{{key}}`
-        if chars[i] == '{' && chars.get(i + 1) == Some(&'{') {
-            if let Some(end) = chars[i + 2..]
-                .windows(2)
-                .position(|w| w == ['}', '}'])
-                .map(|p| i + 2 + p)
-            {
-                let key: String = chars[i + 2..end].iter().collect();
-                if let Some(val) = resolve_key(&key) {
-                    out.push_str(&val);
-                    i = end + 2;
-                    continue;
-                }
+        if bytes[i] == b'{' && bytes.get(i + 1) == Some(&b'{')
+            && let Some(p) = template[i + 2..].find("}}")
+        {
+            let end = i + 2 + p;
+            if let Some(val) = resolve_key(&template[i + 2..end]) {
+                out.push_str(&val);
+                i = end + 2;
+                continue;
             }
         }
         // Handle `${key}`
-        if chars[i] == '$' && chars.get(i + 1) == Some(&'{') {
-            if let Some(end) = chars[i + 2..].iter().position(|&c| c == '}').map(|p| i + 2 + p) {
-                let key: String = chars[i + 2..end].iter().collect();
-                if let Some(val) = resolve_key(&key) {
-                    out.push_str(&val);
-                    i = end + 1;
-                    continue;
-                }
+        if bytes[i] == b'$' && bytes.get(i + 1) == Some(&b'{')
+            && let Some(p) = template[i + 2..].find('}')
+        {
+            let end = i + 2 + p;
+            if let Some(val) = resolve_key(&template[i + 2..end]) {
+                out.push_str(&val);
+                i = end + 1;
+                continue;
             }
         }
         // Handle `{key}`
-        if chars[i] == '{' {
-            if let Some(end) = chars[i + 1..].iter().position(|&c| c == '}').map(|p| i + 1 + p) {
-                let key: String = chars[i + 1..end].iter().collect();
-                if !key.is_empty()
-                    && key
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '/' | '.'))
-                    && let Some(val) = resolve_key(&key)
-                {
-                    out.push_str(&val);
-                    i = end + 1;
-                    continue;
-                }
+        if bytes[i] == b'{' && let Some(p) = template[i + 1..].find('}') {
+            let end = i + 1 + p;
+            let key = &template[i + 1..end];
+            if !key.is_empty()
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '/' | '.'))
+                && let Some(val) = resolve_key(key)
+            {
+                out.push_str(&val);
+                i = end + 1;
+                continue;
             }
         }
         // Handle `$key` when `key` is a known property on `args`
-        if chars[i] == '$'
-            && chars
+        if bytes[i] == b'$'
+            && bytes
                 .get(i + 1)
-                .is_some_and(|c| c.is_ascii_alphabetic() || *c == '_')
+                .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_')
         {
             let mut end = i + 1;
-            while end < chars.len()
-                && (chars[end].is_ascii_alphanumeric() || chars[end] == '_')
+            while end < bytes.len()
+                && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_')
             {
                 end += 1;
             }
-            let key: String = chars[i + 1..end].iter().collect();
-            if let Some(val) = resolve_key(&key) {
+            if let Some(val) = resolve_key(&template[i + 1..end]) {
                 out.push_str(&val);
                 i = end;
                 continue;
             }
         }
-        out.push(chars[i]);
-        i += 1;
+        // Push the whole char starting at byte i (the delimiters above
+        // are single-byte, but a literal char may be multi-byte).
+        let ch_len = template[i..].chars().next().map_or(1, char::len_utf8);
+        out.push_str(&template[i..i + ch_len]);
+        i += ch_len;
     }
     out
 }
@@ -511,8 +532,120 @@ pub fn normalize_definition_value(mut value: Value) -> Value {
     Value::Object(cleaned)
 }
 
+/// Byte length of one character inside a JSON string literal, under
+/// serde_json's default escaping (only `"`, `\` and control characters
+/// are escaped; everything else is raw UTF-8).
+fn escaped_char_len(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{0008}' | '\u{000C}' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// Exact byte length of `value`'s compact JSON serialization — the
+/// same number `value.to_string().len()` produces — computed without
+/// materializing the string. Accumulation stops once the total passes
+/// `cap` (the result is then `cap + 1`), which is all a size guard
+/// needs to decide.
+fn serialized_len(value: &Value, cap: usize) -> usize {
+    fn walk(v: &Value, cap: usize, acc: &mut usize) {
+        if *acc > cap {
+            return;
+        }
+        match v {
+            Value::Null => *acc += 4,
+            Value::Bool(b) => *acc += if *b { 4 } else { 5 },
+            Value::Number(n) => *acc += n.to_string().len(),
+            Value::String(s) => {
+                *acc += 2;
+                for c in s.chars() {
+                    *acc += escaped_char_len(c);
+                    if *acc > cap {
+                        return;
+                    }
+                }
+            }
+            Value::Array(items) => {
+                *acc += 2;
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        *acc += 1;
+                    }
+                    walk(item, cap, acc);
+                    if *acc > cap {
+                        return;
+                    }
+                }
+            }
+            Value::Object(map) => {
+                *acc += 2;
+                for (i, (k, item)) in map.iter().enumerate() {
+                    if i > 0 {
+                        *acc += 1;
+                    }
+                    *acc += 3; // key quotes + colon
+                    for c in k.chars() {
+                        *acc += escaped_char_len(c);
+                    }
+                    walk(item, cap, acc);
+                    if *acc > cap {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+    let mut acc = 0;
+    walk(value, cap, &mut acc);
+    acc.min(cap.saturating_add(1))
+}
+
+/// Dedup key for the `unique` operation. The historical key is the
+/// value's JSON serialization, which is injective across all Values —
+/// so a string may safely key by its borrowed content instead (string
+/// serializations are exactly the quoted, escaped content, and the
+/// enum discriminant keeps a string's content from ever comparing
+/// equal to another kind's serialization).
+enum DedupKey<'a> {
+    Text(&'a str),
+    Serial(String),
+}
+
+impl PartialEq for DedupKey<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Text(a), Self::Text(b)) => a == b,
+            (Self::Serial(a), Self::Serial(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+impl Eq for DedupKey<'_> {}
+impl std::hash::Hash for DedupKey<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            Self::Text(s) => {
+                0u8.hash(state);
+                s.hash(state);
+            }
+            Self::Serial(s) => {
+                1u8.hash(state);
+                s.hash(state);
+            }
+        }
+    }
+}
+
+fn dedup_key(value: &Value) -> DedupKey<'_> {
+    match value {
+        Value::String(s) => DedupKey::Text(s),
+        _ => DedupKey::Serial(value.to_string()),
+    }
+}
+
 fn bounded(value: Value) -> Result<Value, String> {
-    if value.to_string().len() > MAX_VALUE {
+    if serialized_len(&value, MAX_VALUE) > MAX_VALUE {
         Err("Function value exceeds 64 KiB".into())
     } else {
         Ok(value)
@@ -826,8 +959,18 @@ impl Definition {
     pub fn schema(&self) -> Value {
         json!({"type":"function","function":{"name":self.name,"description":self.description,"parameters":self.input_schema}})
     }
+
+    /// The schema Value, cloned from the define-time cache when present.
+    fn schema_value(&self) -> Value {
+        match &self.schema_cache {
+            Some(cached) => (**cached).clone(),
+            None => self.schema(),
+        }
+    }
     fn execute(&self, args: &Value) -> Result<Value, String> {
-        bounded(args.clone())?;
+        if serialized_len(args, MAX_VALUE) > MAX_VALUE {
+            return Err("Function value exceeds 64 KiB".into());
+        }
         validate_input(args, &self.input_schema)?;
         let mut value = args
             .pointer(&self.input)
@@ -986,16 +1129,35 @@ impl Definition {
                         json!(joined)
                     }
                 }
-                Operation::Unique => {
-                    let mut seen = HashSet::new();
-                    json!(
-                        array(&value)?
-                            .iter()
-                            .filter(|v| seen.insert(v.to_string()))
-                            .cloned()
-                            .collect::<Vec<_>>()
-                    )
-                }
+                Operation::Unique => match value {
+                    // Direct array: dedup in place. The keep flags are
+                    // computed in a first pass whose borrowed keys point
+                    // into the array; the set is dropped before `retain`
+                    // mutates anything, so no element is cloned and no
+                    // key outlives the elements it borrows.
+                    Value::Array(mut arr) => {
+                        let mut keep = Vec::with_capacity(arr.len());
+                        {
+                            let mut seen = HashSet::new();
+                            for item in arr.iter() {
+                                keep.push(seen.insert(dedup_key(item)));
+                            }
+                        }
+                        let mut flags = keep.into_iter();
+                        arr.retain(|_| flags.next().unwrap_or(false));
+                        Value::Array(arr)
+                    }
+                    other => {
+                        let mut seen = HashSet::new();
+                        json!(
+                            array(&other)?
+                                .iter()
+                                .filter(|v| seen.insert(dedup_key(v)))
+                                .cloned()
+                                .collect::<Vec<_>>()
+                        )
+                    }
+                },
                 Operation::Sort => {
                     let mut items: Vec<_> = array(&value)?
                         .iter()
@@ -1049,11 +1211,11 @@ impl Registry {
         self.define_inner(value, true)
     }
     fn define_inner(&mut self, value: Value, allow_identical_replace: bool) -> Result<Value, String> {
-        if value.to_string().len() > 16 * 1024 {
+        if serialized_len(&value, 16 * 1024) > 16 * 1024 {
             return Err("Function definition exceeds 16 KiB".into());
         }
         let normalized = normalize_definition_value(value);
-        let definition: Definition =
+        let mut definition: Definition =
             serde_json::from_value(normalized).map_err(|e| format!("Invalid pure function: {e}"))?;
         definition.validate()?;
         if let Some(existing) = self.definitions.get(&definition.name) {
@@ -1063,7 +1225,8 @@ impl Registry {
         } else if self.definitions.len() >= MAX_FUNCTIONS {
             return Err("Session limit of 16 generated functions reached".into());
         }
-        let result = json!({"name":definition.name,"dynamic_function":definition.schema(),"scope":"this task / user turn only","execution":"pure bounded data transformations; no local code execution"});
+        definition.schema_cache = Some(Arc::new(definition.schema()));
+        let result = json!({"name":definition.name,"dynamic_function":definition.schema_value(),"scope":"this task / user turn only","execution":"pure bounded data transformations; no local code execution"});
         self.definitions.insert(definition.name.clone(), definition);
         Ok(result)
     }
@@ -1072,7 +1235,7 @@ impl Registry {
             || (!name.starts_with("fn_") && self.definitions.contains_key(&format!("fn_{name}")))
     }
     pub fn schemas(&self) -> Vec<Value> {
-        self.definitions.values().map(Definition::schema).collect()
+        self.definitions.values().map(Definition::schema_value).collect()
     }
     pub fn call(&self, name: &str, args: &Value) -> Result<Value, String> {
         let def = self
@@ -1222,5 +1385,51 @@ mod tests {
             .unwrap(),
             json!("ffmpeg -y -ss 30 -t 5 -i \"song.mp3\" -c copy \"hook.mp3\"")
         );
+    }
+
+    #[test]
+    fn serialized_len_matches_materialized_length() {
+        let values = [
+            json!(null),
+            json!(true),
+            json!(12.5),
+            json!("plain"),
+            json!("esc \"aped\" \\ \n \t \u{0001} é"),
+            json!([]),
+            json!({}),
+            json!([1, "two", [3.25, null], {"k": "v"}]),
+            json!({"a": [true, false], "b": {"c": "d\ne"}, "": ""}),
+        ];
+        for v in &values {
+            assert_eq!(serialized_len(v, usize::MAX), v.to_string().len(), "{v}");
+            // Capped accumulation reports cap + 1 once past the cap.
+            assert_eq!(serialized_len(v, 4), (v.to_string().len()).min(5), "{v}");
+        }
+    }
+
+    #[test]
+    fn template_scan_handles_multibyte_and_all_placeholder_forms() {
+        let args = json!({"name": "Ada", "count": 3});
+        let out = interpolate_template(
+            "héllo {name}, ${count}×, {{name}}, $name, {missing} fin",
+            &args,
+            &Value::Null,
+        );
+        assert_eq!(out, "héllo Ada, 3×, Ada, Ada, {missing} fin");
+    }
+
+    #[test]
+    fn unique_keeps_serialization_distinct_values() {
+        let mut registry = Registry::default();
+        registry
+            .define(json!({"name":"fn_uniq","description":"d","input_schema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]},"input":"/text","steps":[{"op":"json_parse"},{"op":"unique"}]}))
+            .unwrap();
+        let out = registry
+            .call(
+                "fn_uniq",
+                &json!({"text": "[1, \"1\", 1, \"1\", true, \"true\", [1], [1], {\"a\":1}, {\"a\":1}]"}),
+            )
+            .unwrap();
+        assert_eq!(out, json!([1, "1", true, "true", [1], {"a": 1}]));
     }
 }

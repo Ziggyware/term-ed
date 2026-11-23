@@ -100,6 +100,132 @@ impl Automation {
     }
 }
 
+/// Length of a JSON value's compact serialization, computed without
+/// materializing it (the old guard built the whole string just to
+/// measure it). The walk stops as soon as the running total passes
+/// `cap`; the result is then only known to exceed it, which is all a
+/// size guard needs.
+fn json_serialized_len(value: &Value, cap: usize) -> usize {
+    fn add(total: &mut usize, cap: usize, n: usize) -> bool {
+        *total += n;
+        *total <= cap
+    }
+    fn string_len(s: &str) -> usize {
+        // serde_json's compact escaping: '"' and '\\' plus \b \t \n \f
+        // \r take two bytes, other control characters take six (\u00XX),
+        // everything else is written as raw UTF-8.
+        2 + s
+            .chars()
+            .map(|c| match c {
+                '"' | '\\' | '\u{8}' | '\t' | '\n' | '\u{c}' | '\r' => 2,
+                c if (c as u32) < 0x20 => 6,
+                c => c.len_utf8(),
+            })
+            .sum::<usize>()
+    }
+    fn number_len(n: &serde_json::Number) -> usize {
+        // Format into a stack buffer — a JSON number's shortest repr is
+        // well under 40 bytes — keeping the walker allocation-free.
+        struct Counter<'a> {
+            buf: &'a mut [u8],
+            len: usize,
+        }
+        impl std::fmt::Write for Counter<'_> {
+            fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                self.buf[self.len..self.len + s.len()].copy_from_slice(s.as_bytes());
+                self.len += s.len();
+                Ok(())
+            }
+        }
+        let mut buf = [0u8; 40];
+        let mut counter = Counter {
+            buf: &mut buf,
+            len: 0,
+        };
+        let _ = std::fmt::Write::write_fmt(&mut counter, format_args!("{n}"));
+        counter.len
+    }
+    fn walk(value: &Value, cap: usize, total: &mut usize) -> bool {
+        match value {
+            Value::Null => add(total, cap, 4),
+            Value::Bool(b) => add(total, cap, if *b { 4 } else { 5 }),
+            Value::Number(n) => add(total, cap, number_len(n)),
+            Value::String(s) => add(total, cap, string_len(s)),
+            Value::Array(items) => {
+                if !add(total, cap, 2) {
+                    return false;
+                }
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 && !add(total, cap, 1) {
+                        return false;
+                    }
+                    if !walk(item, cap, total) {
+                        return false;
+                    }
+                }
+                true
+            }
+            Value::Object(map) => {
+                if !add(total, cap, 2) {
+                    return false;
+                }
+                for (i, (key, item)) in map.iter().enumerate() {
+                    if i > 0 && !add(total, cap, 1) {
+                        return false;
+                    }
+                    if !add(total, cap, string_len(key) + 1) {
+                        return false;
+                    }
+                    if !walk(item, cap, total) {
+                        return false;
+                    }
+                }
+                true
+            }
+        }
+    }
+    let mut total = 0;
+    walk(value, cap, &mut total);
+    total
+}
+
+/// First `max_chars` characters of a rope as a String, gathered chunk
+/// by chunk in one pass — the rope is never materialized beyond the
+/// excerpt (the old code built the full text, then scanned it twice).
+fn rope_head_string(rope: &ropey::Rope, max_chars: usize) -> String {
+    let slice = rope.slice(..rope.len_chars().min(max_chars));
+    let mut out = String::with_capacity(slice.len_bytes());
+    for chunk in slice.chunks() {
+        out.push_str(chunk);
+    }
+    out
+}
+
+/// supervision::excerpt over a rope with the same byte budget and
+/// truncation marker, slicing the rope to the kept prefix before any
+/// String exists. Returns (text, truncated).
+fn rope_excerpt(rope: &ropey::Rope, max: usize) -> (String, bool) {
+    if rope.len_bytes() <= max {
+        return (rope.to_string(), false);
+    }
+    // Mirrors the marker supervision::excerpt appends at this budget.
+    const MARKER: &str = "\n[truncated; read source]";
+    if max < MARKER.len() {
+        return (MARKER[..max].to_string(), true);
+    }
+    let budget = max - MARKER.len();
+    // byte_to_char returns the index of the char containing the budget
+    // byte (or starting at it), so the slice ends at that char's start
+    // byte — the same boundary excerpt() walks back to.
+    let slice = rope.slice(..rope.byte_to_char(budget));
+    let mut out = String::with_capacity(slice.len_bytes() + MARKER.len());
+    for chunk in slice.chunks() {
+        out.push_str(chunk);
+    }
+    out.push_str(MARKER);
+    (out, true)
+}
+
 impl App {
     pub(crate) fn setup_bridge(&mut self) {
         // Only external ACP agents need a relay subprocess. Built-in calls use
@@ -200,7 +326,7 @@ impl App {
             );
             return;
         }
-        if args.to_string().len() > 256 * 1024 {
+        if json_serialized_len(&args, 256 * 1024) > 256 * 1024 {
             self.reply_tool(reply, Err("Tool arguments exceed 256 KiB".into()));
             return;
         }
@@ -218,9 +344,9 @@ impl App {
                         self.editors.iter().find(|e| e.doc.path.as_ref() == Some(&path))
                     }.ok_or_else(|| "That file is not open in the editor".to_string())?;
                     if let Some(path) = &editor.doc.path { workspace_path(&self.explorer.root, &path.to_string_lossy())?; }
-                    let text = editor.doc.rope.to_string();
+                    let rope = &editor.doc.rope;
                     Ok(json!({"file":editor.doc.path.as_ref().map(|p|p.to_string_lossy()),"unsaved":editor.doc.is_dirty(),
-                        "text":text.chars().take(60_000).collect::<String>(),"truncated":text.chars().count()>60_000}))
+                        "text":rope_head_string(rope, 60_000),"truncated":rope.len_chars()>60_000}))
                 })();
                 self.reply_tool(reply, result);
             }
@@ -691,13 +817,8 @@ impl App {
                                 .into(),
                         );
                     }
-                    let text = editor.doc.rope.to_string();
-                    let truncated = text.len() > 12 * 1024;
-                    (
-                        crate::supervision::excerpt(&text, 12 * 1024),
-                        editor.doc.is_dirty(),
-                        truncated,
-                    )
+                    let (text, truncated) = rope_excerpt(&editor.doc.rope, 12 * 1024);
+                    (text, editor.doc.is_dirty(), truncated)
                 } else {
                     use std::io::Read;
                     let mut bytes = Vec::new();
@@ -747,7 +868,7 @@ impl App {
                 if e.doc.is_read_only()||workspace_path(&self.explorer.root,&path.to_string_lossy()).is_err(){return None;}
                 let relative=path.strip_prefix(&self.explorer.root).unwrap_or(path).to_string_lossy();
                 if references.iter().any(|r|r["file"].as_str()==Some(relative.as_ref())){return None;}
-                let text=e.doc.rope.to_string();Some(json!({"file":relative,"text":crate::supervision::excerpt(&text,12*1024),"unsaved":e.doc.is_dirty(),"snapshot":true,"truncated":text.len()>12*1024}))
+                let (text,truncated)=rope_excerpt(&e.doc.rope,12*1024);Some(json!({"file":relative,"text":text,"unsaved":e.doc.is_dirty(),"snapshot":true,"truncated":truncated}))
             })
         } else {
             None
@@ -994,7 +1115,7 @@ impl App {
         let buffer = call.file.as_ref().and_then(|p| self.editors.iter().find(|e| e.doc.path.as_ref() == Some(p)))
             .or_else(|| call.untitled.and_then(|id| self.editors.iter().find(|e| e.doc.id == id && e.doc.path.is_none())))
             .map(|e| json!({"file":e.doc.path.as_ref().map(|p| p.to_string_lossy()),"unsaved":e.doc.is_dirty(),
-                "text":e.doc.rope.to_string().chars().take(32_000).collect::<String>()}));
+                "text":rope_head_string(&e.doc.rope, 32_000)}));
         self.reply_tool(call.reply, result.map(|result| json!({"result":result,"messages":call.messages,"buffer":buffer,
             "note":"Plugin edits are in memory and undoable. Do not overwrite them with stale disk content."})));
     }
@@ -1528,6 +1649,61 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         mpsc,
     };
+
+    #[test]
+    fn json_serialized_len_matches_materialized_length() {
+        let cases = [
+            json!(null),
+            json!(true),
+            json!(false),
+            json!(0),
+            json!(-42),
+            json!(1.5),
+            json!(1e300),
+            json!("plain"),
+            json!("quote \" backslash \\ newline \n tab \t"),
+            json!("control \u{1}\u{1f} unicode é—\u{10ffff}"),
+            json!([]),
+            json!({}),
+            json!({"a": [1, "two", {"b": null}], "c": {}}),
+            json!([[["deep"], 12345678901234567890u64]]),
+        ];
+        for value in &cases {
+            assert_eq!(
+                json_serialized_len(value, usize::MAX),
+                value.to_string().len(),
+                "{value}"
+            );
+        }
+        // Early exit: once past the cap the walk stops, but the guard
+        // comparison still resolves correctly.
+        let big = json!({"payload": "x".repeat(300_000)});
+        assert!(json_serialized_len(&big, 256 * 1024) > 256 * 1024);
+        assert_eq!(
+            json_serialized_len(&big, usize::MAX),
+            big.to_string().len()
+        );
+    }
+
+    #[test]
+    fn rope_excerpt_matches_supervision_excerpt() {
+        for text in [
+            "short text\n",
+            "",
+            "a".repeat(20_000).as_str(),
+            "é—".repeat(8_000).as_str(),
+            "mixed é text\n".repeat(2_000).as_str(),
+        ] {
+            let rope = ropey::Rope::from_str(text);
+            let (excerpt, truncated) = rope_excerpt(&rope, 12 * 1024);
+            assert_eq!(excerpt, crate::supervision::excerpt(text, 12 * 1024));
+            assert_eq!(truncated, text.len() > 12 * 1024);
+            assert_eq!(
+                rope_head_string(&rope, 60_000),
+                text.chars().take(60_000).collect::<String>()
+            );
+        }
+    }
 
     fn app(tag: &str) -> App {
         static N: AtomicUsize = AtomicUsize::new(0);

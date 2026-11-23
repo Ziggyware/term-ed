@@ -75,8 +75,12 @@ fn input(
     Position::new(r.x + (before - skip_w) as u16, r.y)
 }
 
-pub fn render_palette(buf: &mut Buffer, screen: Rect, app: &mut App) -> Option<Position> {
-    let pal = app.theme.palette.clone();
+pub fn render_palette(
+    buf: &mut Buffer,
+    screen: Rect,
+    app: &mut App,
+    pal: &crate::theme::Palette,
+) -> Option<Position> {
     let nerd = app.settings.nerd_font;
     let (cur_line, total_lines) = app
         .editor()
@@ -448,8 +452,12 @@ fn area_color(label: &str, pal: &crate::theme::Palette) -> Color {
     }
 }
 
-pub fn render_find(buf: &mut Buffer, editor: Rect, app: &mut App) -> Option<Position> {
-    let pal = app.theme.palette.clone();
+pub fn render_find(
+    buf: &mut Buffer,
+    editor: Rect,
+    app: &mut App,
+    pal: &crate::theme::Palette,
+) -> Option<Position> {
     let f = &app.find;
     let compact = app.compact;
     let w = if compact {
@@ -661,10 +669,14 @@ fn put_hit_text(
 }
 
 /// Find/Replace in Files: a full-height, virtualized result workbench.
-pub fn render_search(buf: &mut Buffer, editor: Rect, app: &mut App) -> Option<Position> {
+pub fn render_search(
+    buf: &mut Buffer,
+    editor: Rect,
+    app: &mut App,
+    pal: &crate::theme::Palette,
+) -> Option<Position> {
     use crate::app::SearchField;
     if !app.search.visible { return None; }
-    let pal = app.theme.palette.clone();
     let compact = app.compact;
     let replace = app.search.replace;
     let w = if compact { editor.width } else {
@@ -862,8 +874,7 @@ pub fn render_search(buf: &mut Buffer, editor: Rect, app: &mut App) -> Option<Po
 }
 
 
-pub fn render_dialog(buf: &mut Buffer, screen: Rect, app: &mut App) {
-    let pal = app.theme.palette.clone();
+pub fn render_dialog(buf: &mut Buffer, screen: Rect, app: &mut App, pal: &crate::theme::Palette) {
     let Some(d) = &app.dialog else { return };
     // Dim everything behind the modal.
     shadow(buf, screen);

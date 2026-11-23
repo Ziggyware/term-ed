@@ -78,35 +78,53 @@ fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// Byte offset of the `char_idx`-th character of `line` (or the line's
+/// length when `char_idx` is at/past the end). One forward scan, no
+/// per-line `Vec<char>` materialization.
+fn byte_of(line: &str, char_idx: usize) -> usize {
+    line.char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(line.len())
+}
+
 /// The word at a character column, with a best-effort kind. Returns `None` on
 /// whitespace, punctuation or an empty line.
 pub fn word_at(line: &str, col: usize) -> Option<Word> {
-    let chars: Vec<char> = line.chars().collect();
-    if chars.is_empty() {
+    let char_count = line.chars().count();
+    if char_count == 0 {
         return None;
     }
     // A caret sitting just after a word (the common case: you typed it and
     // pressed the menu key) belongs to that word.
-    let mut i = col.min(chars.len().saturating_sub(1));
-    if !is_word_char(chars[i]) {
-        if i == 0 || !is_word_char(chars[i - 1]) {
+    let mut i = col.min(char_count - 1);
+    let byte_i = byte_of(line, i);
+    if !is_word_char(line[byte_i..].chars().next().unwrap()) {
+        if i == 0 || !is_word_char(line[..byte_i].chars().next_back().unwrap()) {
             return None;
         }
         i -= 1;
     }
-    let mut start = i;
-    while start > 0 && is_word_char(chars[start - 1]) {
-        start -= 1;
-    }
-    let mut end = i + 1;
-    while end < chars.len() && is_word_char(chars[end]) {
-        end += 1;
-    }
+    let byte_i = byte_of(line, i);
+    // The word extends over the contiguous word characters around the
+    // caret; both walks are bounded by the word's own length.
+    let start = i
+        - line[..byte_i]
+            .chars()
+            .rev()
+            .take_while(|c| is_word_char(*c))
+            .count();
+    let end = i + 1
+        + line[byte_i..]
+            .chars()
+            .skip(1)
+            .take_while(|c| is_word_char(*c))
+            .count();
     // A leading digit run is a number literal, not an identifier.
-    if chars[start].is_ascii_digit() {
+    if line[byte_of(line, start)..].chars().next().unwrap().is_ascii_digit() {
         return None;
     }
-    let text: String = chars[start..end].iter().collect();
+    let text = line[byte_of(line, start)..byte_of(line, end)].to_string();
     Some(Word {
         kind: classify(line, start, end),
         text,
@@ -127,10 +145,11 @@ fn prev_token(before: &str) -> &str {
 }
 
 fn classify(line: &str, start: usize, end: usize) -> SymbolKind {
-    let chars: Vec<char> = line.chars().collect();
-    let before: String = chars[..start].iter().collect();
-    let after: String = chars[end..].iter().collect();
-    let word: String = chars[start..end].iter().collect();
+    let byte_start = byte_of(line, start);
+    let byte_end = byte_of(line, end);
+    let before = &line[..byte_start];
+    let after = &line[byte_end..];
+    let word = &line[byte_start..byte_end];
     let after_trim = after.trim_start();
     let first = word.chars().next().unwrap_or(' ');
 
@@ -139,7 +158,7 @@ fn classify(line: &str, start: usize, end: usize) -> SymbolKind {
     {
         return SymbolKind::Constant;
     }
-    match prev_token(&before) {
+    match prev_token(before) {
         "fn" | "def" | "func" | "function" | "sub" => return SymbolKind::Function,
         "struct" | "class" | "enum" | "trait" | "interface" | "type" | "impl" | "record" => {
             return SymbolKind::Type
@@ -179,28 +198,47 @@ pub fn occurrences(text: &str, word: &str) -> Vec<Occurrence> {
     if word.is_empty() {
         return Vec::new();
     }
+    let word_chars = word.chars().count();
     let mut out = Vec::new();
     for (i, line) in text.split('\n').enumerate() {
-        let chars: Vec<char> = line.chars().collect();
-        let target: Vec<char> = word.chars().collect();
-        let mut c = 0;
-        while c + target.len() <= chars.len() {
-            let candidate = &chars[c..c + target.len()];
-            let matches = candidate == target.as_slice()
-                && (c == 0 || !is_word_char(chars[c - 1]))
-                && (c + target.len() == chars.len() || !is_word_char(chars[c + target.len()]));
-            if matches {
-                out.push(Occurrence {
-                    line: i,
-                    col: c,
-                    text: word.to_string(),
-                    kind: classify(line, c, c + target.len()),
-                    preview: line.trim().to_string(),
-                });
-                c += target.len();
-            } else {
-                c += 1;
+        // One pass over the line's char boundaries: a candidate is a byte
+        // position where the word matches literally, fenced by non-word
+        // characters (or the line edges). A match consumes the word, so
+        // candidates never overlap — the same positions the old
+        // char-vector scan reported, in the same order.
+        let mut preview: Option<String> = None;
+        let mut iter = line.char_indices();
+        let mut prev: Option<char> = None;
+        let mut col = 0usize;
+        while let Some((byte, ch)) = iter.next() {
+            if line[byte..].starts_with(word) {
+                let next = line[byte + word.len()..].chars().next();
+                let before_ok = prev.is_none_or(|c| !is_word_char(c));
+                let after_ok = next.is_none_or(|c| !is_word_char(c));
+                if before_ok && after_ok {
+                    let preview = preview
+                        .get_or_insert_with(|| line.trim().to_string())
+                        .clone();
+                    out.push(Occurrence {
+                        line: i,
+                        col,
+                        text: word.to_string(),
+                        kind: classify(line, col, col + word_chars),
+                        preview,
+                    });
+                    let mut last = ch;
+                    for _ in 1..word_chars {
+                        if let Some((_, skipped)) = iter.next() {
+                            last = skipped;
+                        }
+                    }
+                    prev = Some(last);
+                    col += word_chars;
+                    continue;
+                }
             }
+            prev = Some(ch);
+            col += 1;
         }
     }
     out
@@ -212,8 +250,8 @@ pub fn occurrences(text: &str, word: &str) -> Vec<Occurrence> {
 /// declaration and at every use. The token before the word and the shape
 /// after it carry the distinction.
 fn is_declaration(line: &str, occ: &Occurrence) -> bool {
-    let before: String = line.chars().take(occ.col).collect();
-    let prev = prev_token(&before);
+    let before = &line[..byte_of(line, occ.col)];
+    let prev = prev_token(before);
     match occ.kind {
         // A function declaration is introduced by a keyword; a bare
         // `name(` is a call.
@@ -230,10 +268,7 @@ fn is_declaration(line: &str, occ: &Occurrence) -> bool {
             }
             // An all-caps use (`x = MAX + 1`) is not a declaration; an
             // all-caps binding (`MAX: usize = 4`, `MAX = 4`) is.
-            let after: String = line
-                .chars()
-                .skip(occ.col + occ.text.chars().count())
-                .collect();
+            let after = &line[byte_of(line, occ.col + occ.text.chars().count())..];
             let after = after.trim_start();
             after.starts_with(':') || after.starts_with('=')
         }
@@ -245,26 +280,36 @@ fn is_declaration(line: &str, occ: &Occurrence) -> bool {
     }
 }
 
+/// Split one occurrence scan into (declarations, uses) with the
+/// declaration predicate applied once per occurrence. `definitions` and
+/// `references` are the two halves of this partition, so the three
+/// functions can never disagree about a position — and the text is
+/// scanned once, not three times.
+fn partition(text: &str, word: &str) -> (Vec<Occurrence>, Vec<Occurrence>) {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut defs = Vec::new();
+    let mut refs = Vec::new();
+    for occ in occurrences(text, word) {
+        let line = lines.get(occ.line).copied().unwrap_or("");
+        if is_declaration(line, &occ) {
+            defs.push(occ);
+        } else {
+            refs.push(occ);
+        }
+    }
+    (defs, refs)
+}
+
 /// Definition candidates: occurrences that are declarations, in the order
 /// a person would try them. `word` may be a `Type::member` tail, which is
 /// why the field kind is accepted here.
 pub fn definitions(text: &str, word: &str) -> Vec<Occurrence> {
-    let lines: Vec<&str> = text.split('\n').collect();
-    occurrences(text, word)
-        .into_iter()
-        .filter(|o| {
-            let line = lines.get(o.line).copied().unwrap_or("");
-            is_declaration(line, o)
-        })
-        .collect()
+    partition(text, word).0
 }
 
 /// Every occurrence that is *not* a declaration, i.e. a use.
 pub fn references(text: &str, word: &str) -> Vec<Occurrence> {
-    occurrences(text, word)
-        .into_iter()
-        .filter(|o| !definitions(text, word).iter().any(|d| d.line == o.line && d.col == o.col))
-        .collect()
+    partition(text, word).1
 }
 
 /// A symbol's health, as shown by **Inspect Symbol**.
@@ -279,11 +324,7 @@ pub struct Inspection {
 }
 
 pub fn inspect(text: &str, word: &Word) -> Inspection {
-    let defs = definitions(text, &word.text);
-    let refs = occurrences(text, &word.text)
-        .into_iter()
-        .filter(|o| !defs.iter().any(|d| d.line == o.line && d.col == o.col))
-        .collect::<Vec<_>>();
+    let (defs, refs) = partition(text, &word.text);
     let mut findings = Vec::new();
     let mut lines: Vec<usize> = defs.iter().map(|d| d.line).collect();
     lines.extend(refs.iter().map(|r| r.line));
@@ -596,7 +637,8 @@ pub fn dedupe_lines(text: &str, from: usize, to: usize) -> String {
     let mut seen = BTreeSet::new();
     let mut keep = Vec::with_capacity(to - from + 1);
     for l in &lines[from..=to] {
-        let key = l.trim_end().to_string();
+        // Keys borrow the line text; only the set nodes allocate.
+        let key = l.trim_end();
         if key.trim().is_empty() || seen.insert(key) {
             keep.push(*l);
         }
@@ -731,10 +773,30 @@ pub fn project_references(
     Ok(out)
 }
 
+thread_local! {
+    /// Compiled word matchers, keyed by the word. Compiling a regex costs
+    /// far more than the scans it serves, and callers ask for the same
+    /// words repeatedly (every caret move in a rename preview).
+    static WORD_REGEX_CACHE: std::cell::RefCell<std::collections::HashMap<String, Option<Regex>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 /// A compiled word-boundary matcher, for callers that want to preview a rename
 /// count without building edits.
 pub fn word_regex(word: &str) -> Option<Regex> {
-    Regex::new(&format!(r"\b{}\b", regex::escape(word))).ok()
+    WORD_REGEX_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(compiled) = cache.get(word) {
+            return compiled.clone();
+        }
+        let compiled = Regex::new(&format!(r"\b{}\b", regex::escape(word))).ok();
+        // Bounded: a rename preview touches a handful of words; if a
+        // caller ever churns through more, it just recompiles.
+        if cache.len() < 128 {
+            cache.insert(word.to_string(), compiled.clone());
+        }
+        compiled
+    })
 }
 
 #[cfg(test)]

@@ -21,6 +21,84 @@ use crate::neon::{render_aurora, render_creature};
 use crate::theme::mix;
 use util::{bold, ellipsize, fg, fgbg, fill, put, put_char, width};
 
+// ---------------------------------------------------------------------------
+// Per-frame render caches. The renderer is single-threaded, so these live
+// in thread-locals keyed by everything their value depends on; a key miss
+// recomputes exactly the value the uncached code produced.
+
+/// Whole-document (char, word) counts for the status bar, keyed by the
+/// document's path + version + char length. `version` increments on every
+/// edit, so a hit means the text — and therefore the counts — is unchanged.
+struct DocCounts {
+    path: Option<std::path::PathBuf>,
+    version: u64,
+    len_chars: usize,
+    words: usize,
+}
+
+thread_local! {
+    static DOC_COUNTS: std::cell::RefCell<Option<DocCounts>> =
+        const { std::cell::RefCell::new(None) };
+    static ROOT_LABEL: std::cell::RefCell<Option<(std::path::PathBuf, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn doc_counts(e: &crate::editor::Editor) -> (usize, usize) {
+    let rope = &e.doc.rope;
+    let chars = rope.len_chars();
+    DOC_COUNTS.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if let Some(c) = &*slot
+            && c.path == e.doc.path
+            && c.version == e.doc.version
+            && c.len_chars == chars
+        {
+            return (chars, c.words);
+        }
+        // Count word starts across rope chunks without materializing the
+        // document: identical to split_whitespace().count(), which splits
+        // on char::is_whitespace.
+        let mut words = 0usize;
+        let mut in_word = false;
+        for chunk in rope.chunks() {
+            for ch in chunk.chars() {
+                if ch.is_whitespace() {
+                    in_word = false;
+                } else if !in_word {
+                    in_word = true;
+                    words += 1;
+                }
+            }
+        }
+        *slot = Some(DocCounts {
+            path: e.doc.path.clone(),
+            version: e.doc.version,
+            len_chars: chars,
+            words,
+        });
+        (chars, words)
+    })
+}
+
+/// The sidebar's uppercased root label, rebuilt only when the root changes.
+fn root_label(root: &std::path::Path) -> String {
+    ROOT_LABEL.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if let Some((cached_root, label)) = &*slot
+            && cached_root == root
+        {
+            return label.clone();
+        }
+        let name = root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| root.display().to_string());
+        let label = format!("⌄ {}", name.to_uppercase());
+        *slot = Some((root.to_path_buf(), label.clone()));
+        label
+    })
+}
+
 pub fn draw(frame: &mut Frame, app: &mut App, truecolor: bool) {
     app.graphics.pending = None;
     let area = frame.area();
@@ -76,12 +154,12 @@ pub fn draw(frame: &mut Frame, app: &mut App, truecolor: bool) {
     );
 
     if compact {
-        render_title_compact(buf, title, app);
+        render_title_compact(buf, title, app, &pal);
     } else {
         render_title(buf, title, app);
     }
     if sidebar_w > 0 {
-        render_sidebar(buf, sidebar, app);
+        render_sidebar(buf, sidebar, app, &pal);
     }
 
     // Agent panel: docked on the right when there is room, otherwise a
@@ -106,10 +184,10 @@ pub fn draw(frame: &mut Frame, app: &mut App, truecolor: bool) {
     if expanded {
         // The agent panel fills the main window; the editor is hidden.
     } else if app.editors.is_empty() {
-        render_welcome(buf, main, app);
+        render_welcome(buf, main, app, &pal);
         // Project search works without an open file too.
         if app.search.visible
-            && let Some(c) = overlay::render_search(buf, main, app)
+            && let Some(c) = overlay::render_search(buf, main, app, &pal)
         {
             cursor = Some(c);
         }
@@ -127,7 +205,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, truecolor: bool) {
             main.height.saturating_sub(tabs_h + crumbs_h),
         );
         if tabs_h > 0 {
-            render_tabs(buf, tabs, app);
+            render_tabs(buf, tabs, app, &pal);
         }
         if crumbs_h > 0 {
             render_breadcrumbs(buf, crumbs, app);
@@ -138,15 +216,15 @@ pub fn draw(frame: &mut Frame, app: &mut App, truecolor: bool) {
         {
             image_canvas::render(buf, editor, app);
         } else {
-            cursor = editor_view::render(buf, editor, app);
+            cursor = editor_view::render(buf, editor, app, &pal);
         }
         if app.find.visible
-            && let Some(c) = overlay::render_find(buf, editor, app)
+            && let Some(c) = overlay::render_find(buf, editor, app, &pal)
         {
             cursor = Some(c);
         }
         if app.search.visible
-            && let Some(c) = overlay::render_search(buf, editor, app)
+            && let Some(c) = overlay::render_search(buf, editor, app, &pal)
         {
             cursor = Some(c);
         }
@@ -155,14 +233,14 @@ pub fn draw(frame: &mut Frame, app: &mut App, truecolor: bool) {
         let w = body.width.saturating_sub(6).clamp(20.min(body.width), 40);
         let drawer = Rect::new(body.x, body.y, w, body.height);
         util::shadow(buf, Rect::new(drawer.right(), body.y, 1, body.height));
-        render_sidebar(buf, drawer, app);
+        render_sidebar(buf, drawer, app, &pal);
         app.layout.drawer = drawer;
         if app.focus == Focus::Explorer {
             cursor = None;
         }
     }
     if app.show_agent {
-        let c = agent_panel::render(buf, agent_area, app);
+        let c = agent_panel::render(buf, agent_area, app, &pal);
         if app.focus == Focus::Agent {
             cursor = c;
         } else if !docked {
@@ -170,9 +248,9 @@ pub fn draw(frame: &mut Frame, app: &mut App, truecolor: bool) {
         }
     }
     if toolbar_h > 0 {
-        render_toolbar(buf, toolbar, app);
+        render_toolbar(buf, toolbar, app, &pal);
     }
-    render_status(buf, status, app);
+    render_status(buf, status, app, &pal);
 
     // Dockable windows (terminals float on top of everything).
     app.dock.apply_docking(area);
@@ -200,10 +278,10 @@ pub fn draw(frame: &mut Frame, app: &mut App, truecolor: bool) {
         app.graphics.pending = None;
     }
     if app.palette.is_some() {
-        cursor = overlay::render_palette(buf, area, app);
+        cursor = overlay::render_palette(buf, area, app, &pal);
     }
     if app.dialog.is_some() {
-        overlay::render_dialog(buf, area, app);
+        overlay::render_dialog(buf, area, app, &pal);
         cursor = None;
     }
     if !truecolor {
@@ -312,8 +390,7 @@ fn render_title(buf: &mut Buffer, area: Rect, app: &mut App) {
 }
 
 /// Phone title bar: big tap targets for the drawer, quick open and commands.
-fn render_title_compact(buf: &mut Buffer, area: Rect, app: &mut App) {
-    let pal = app.theme.palette.clone();
+fn render_title_compact(buf: &mut Buffer, area: Rect, app: &mut App, pal: &crate::theme::Palette) {
     fill(buf, area, pal.titlebar_bg);
     let btn = |buf: &mut Buffer, x: u16, label: &str, on: bool| {
         let bg = if on { pal.accent } else { pal.input_bg };
@@ -392,8 +469,7 @@ fn render_title_compact(buf: &mut Buffer, area: Rect, app: &mut App) {
 /// Touch keyboard: a 2×9 grid of keys a soft keyboard lacks. Every cell has
 /// a fixed position (muscle memory), cells share the width evenly, and the
 /// modifier keys show their latch state.
-fn render_toolbar(buf: &mut Buffer, area: Rect, app: &mut App) {
-    let pal = app.theme.palette.clone();
+fn render_toolbar(buf: &mut Buffer, area: Rect, app: &mut App, pal: &crate::theme::Palette) {
     let bg = pal.titlebar_bg;
     fill(buf, area, bg);
     let page = &TOOLBAR_PAGES[app.toolbar_page % TOOLBAR_PAGES.len()];
@@ -464,8 +540,7 @@ fn render_toolbar(buf: &mut Buffer, area: Rect, app: &mut App) {
     }
 }
 
-fn render_sidebar(buf: &mut Buffer, area: Rect, app: &mut App) {
-    let pal = app.theme.palette.clone();
+fn render_sidebar(buf: &mut Buffer, area: Rect, app: &mut App, pal: &crate::theme::Palette) {
     let nerd = app.settings.nerd_font;
     fill(buf, area, pal.sidebar_bg);
     let inner_right = area.right().saturating_sub(1);
@@ -497,7 +572,7 @@ fn render_sidebar(buf: &mut Buffer, area: Rect, app: &mut App) {
         fgbg(pal.sidebar_dim, pal.sidebar_bg),
         inner_right,
     );
-    let root = format!("⌄ {}", app.explorer.root_name().to_uppercase());
+    let root = root_label(&app.explorer.root);
     put(
         buf,
         area.x + 1,
@@ -524,11 +599,13 @@ fn render_sidebar(buf: &mut Buffer, area: Rect, app: &mut App) {
     app.layout.sidebar_scrollbar = scrollbar;
 
     let active_path = app.editor().and_then(|e| e.doc.path.clone());
-    let dirty: Vec<std::path::PathBuf> = app
+    // Borrowed, not cloned: a set of the dirty editors' paths, built once
+    // per frame so each row's membership test is O(1), not a linear scan.
+    let dirty: std::collections::HashSet<&std::path::Path> = app
         .editors
         .iter()
         .filter(|e| e.doc.is_dirty())
-        .filter_map(|e| e.doc.path.clone())
+        .filter_map(|e| e.doc.path.as_deref())
         .collect();
     let ex = &app.explorer;
     for (row, entry) in ex
@@ -608,7 +685,7 @@ fn render_sidebar(buf: &mut Buffer, area: Rect, app: &mut App) {
             );
             x += 1;
         }
-        let is_dirty = dirty.contains(&entry.path);
+        let is_dirty = dirty.contains(entry.path.as_path());
         let style = if is_dirty {
             name_style.fg(pal.warning)
         } else {
@@ -689,8 +766,7 @@ fn render_sidebar(buf: &mut Buffer, area: Rect, app: &mut App) {
     }
 }
 
-fn render_tabs(buf: &mut Buffer, area: Rect, app: &mut App) {
-    let pal = app.theme.palette.clone();
+fn render_tabs(buf: &mut Buffer, area: Rect, app: &mut App, pal: &crate::theme::Palette) {
     let nerd = app.settings.nerd_font;
     fill(buf, area, pal.tabbar_bg);
     // Compute widths and scroll so the active tab is visible.
@@ -907,8 +983,7 @@ fn enclosing_scope(e: &crate::editor::Editor) -> Option<String> {
     None
 }
 
-fn render_status(buf: &mut Buffer, area: Rect, app: &mut App) {
-    let pal = app.theme.palette.clone();
+fn render_status(buf: &mut Buffer, area: Rect, app: &mut App, pal: &crate::theme::Palette) {
     let (bg, fgc) = (pal.status_bg, pal.status_fg);
     fill(buf, area, bg);
     let dark = mix(bg, ratatui::style::Color::Black, 0.25);
@@ -1071,17 +1146,16 @@ fn render_status(buf: &mut Buffer, area: Rect, app: &mut App) {
             };
             segs.push(Seg::new(pos, SegTone::Position, 10).click(Command::GotoLine));
 
-            // File shape: characters, words and lines. Cheap enough to keep
-            // live (it is the same rope the renderer already walks), and it is
-            // what people reach for when writing rather than coding.
+            // File shape: characters, words and lines. Whole-document
+            // counts come from doc_counts (cached by document version);
+            // selection counts are computed from the selection text.
             let lines = e.doc.len_lines();
-            let sel_or_doc = if sel_len > 0 {
-                e.selected_text()
+            let (chars, words) = if sel_len > 0 {
+                let text = e.selected_text();
+                (text.chars().count(), text.split_whitespace().count())
             } else {
-                e.doc.rope.to_string()
+                doc_counts(e)
             };
-            let chars = sel_or_doc.chars().count();
-            let words = sel_or_doc.split_whitespace().count();
             if compact {
                 segs.push(Seg::new(format!("{lines}L"), SegTone::File, 5));
             } else if sel_len > 0 {
@@ -1147,7 +1221,7 @@ fn render_status(buf: &mut Buffer, area: Rect, app: &mut App) {
     let mut rx = area.right().saturating_sub(total);
     for seg in segs {
         let start = rx;
-        rx = put(buf, rx + 1, area.y, &seg.text, seg_style(&pal, seg.tone), area.right()) + 1;
+        rx = put(buf, rx + 1, area.y, &seg.text, seg_style(pal, seg.tone), area.right()) + 1;
         if let Some(c) = seg.cmd {
             app.layout
                 .click_items
@@ -1249,8 +1323,7 @@ const LOGO: [&str; 6] = [
 
 const SMALL_LOGO: [&str; 2] = ["▀█▀ █▀▀ █▀█ █▀▄▀█ █▀▀ █▀▄", " █  ██▄ █▀▄ █ ▀ █ ██▄ █▄▀"];
 
-fn render_welcome(buf: &mut Buffer, area: Rect, app: &mut App) {
-    let pal = app.theme.palette.clone();
+fn render_welcome(buf: &mut Buffer, area: Rect, app: &mut App, pal: &crate::theme::Palette) {
     fill(buf, area, pal.bg);
     let compact = app.compact;
     // Every row is also a tap target.

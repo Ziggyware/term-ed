@@ -413,7 +413,11 @@ impl AgentConfig {
     pub fn restricted_by(&self, parent: &Self) -> Self {
         let mut child = self.clone();
         child.backend = "builtin".into();
-        child.inherited_instructions = parent.inherited_instructions.clone();
+        // Wholesale replacements use clone_from so the child's existing
+        // allocations are reused instead of dropped and re-created.
+        child
+            .inherited_instructions
+            .clone_from(&parent.inherited_instructions);
         if !parent.instructions.trim().is_empty() {
             child
                 .inherited_instructions
@@ -433,15 +437,17 @@ impl AgentConfig {
             }
         }
         if !parent.allowed_plugins.is_empty() {
-            child.allowed_plugins = if child.allowed_plugins.is_empty() {
-                parent.allowed_plugins.clone()
-            } else {
+            if child.allowed_plugins.is_empty() {
                 child
+                    .allowed_plugins
+                    .clone_from(&parent.allowed_plugins);
+            } else {
+                child.allowed_plugins = child
                     .allowed_plugins
                     .into_iter()
                     .filter(|p| parent.allowed_plugins.contains(p))
-                    .collect()
-            };
+                    .collect();
+            }
             // An empty intersection must not turn into "all plugins".
             if child.allowed_plugins.is_empty() {
                 child.plugins = false;
@@ -451,23 +457,23 @@ impl AgentConfig {
             && (child.endpoint.is_empty() || child.endpoint == parent.endpoint);
         if inherits_provider {
             if child.endpoint.is_empty() {
-                child.endpoint = parent.endpoint.clone();
+                child.endpoint.clone_from(&parent.endpoint);
             }
-            child.provider = parent.provider.clone();
+            child.provider.clone_from(&parent.provider);
         }
         // Children inherit the local inference server too, whether they came
         // from an `auto` provider or explicitly ask for on-device inference.
         if child.uses_local() && child.local_endpoint.is_empty() {
-            child.local_endpoint = parent.local_endpoint.clone();
+            child.local_endpoint.clone_from(&parent.local_endpoint);
         }
         // Do not accidentally forward a provider's credential to a different
         // explicitly configured specialist endpoint.
         if child.api_key_env.is_empty() && inherits_provider {
-            child.api_key_env = parent.api_key_env.clone();
+            child.api_key_env.clone_from(&parent.api_key_env);
         }
         child.max_steps = child.max_steps.min(parent.max_steps);
         if child.model.is_empty() && inherits_provider {
-            child.model = parent.model.clone();
+            child.model.clone_from(&parent.model);
         }
         child.task_timeout_secs = child.task_timeout_secs.min(parent.task_timeout_secs);
         child.sub_agents &= parent.sub_agents;
@@ -475,16 +481,18 @@ impl AgentConfig {
         child.toolkit &= parent.toolkit;
         // A parent that narrowed groups keeps the child inside the same set.
         if !parent.toolkit_groups.is_empty() {
-            child.toolkit_groups = if child.toolkit_groups.is_empty() {
-                parent.toolkit_groups.clone()
-            } else {
+            if child.toolkit_groups.is_empty() {
                 child
+                    .toolkit_groups
+                    .clone_from(&parent.toolkit_groups);
+            } else {
+                child.toolkit_groups = child
                     .toolkit_groups
                     .iter()
                     .filter(|g| parent.toolkit_groups.iter().any(|p| p == *g))
                     .cloned()
-                    .collect()
-            };
+                    .collect();
+            }
             if child.toolkit_groups.is_empty() {
                 child.toolkit = false;
             }
@@ -849,10 +857,12 @@ fn prepare_legacy_overlay(overlay: &mut Value) {
 /// preserved, and edits to built-ins made afterwards persist as usual.
 fn refresh_builtin_sub_agents(prefs: &mut Preferences) {
     let defaults = Preferences::default().sub_agents;
-    let mut refreshed: Vec<SubAgentConfig> = defaults.clone();
-    for p in &prefs.sub_agents {
-        if !defaults.iter().any(|d| d.id == p.id) {
-            refreshed.push(p.clone());
+    let default_ids: Vec<String> = defaults.iter().map(|d| d.id.clone()).collect();
+    let mut refreshed = defaults;
+    // Move (not clone) the user's custom profiles after the defaults.
+    for p in std::mem::take(&mut prefs.sub_agents) {
+        if !default_ids.contains(&p.id) {
+            refreshed.push(p);
         }
     }
     prefs.sub_agents = refreshed;

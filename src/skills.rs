@@ -2,6 +2,8 @@
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
+use std::time::SystemTime;
 
 use crate::config::{AgentConfig, config_dir, valid_id};
 
@@ -37,7 +39,127 @@ pub fn workspace_dir(root: &Path) -> PathBuf {
     root.join(".termed/skills")
 }
 
+/// Discovery walks two roots, canonicalizes every skill directory and
+/// reads/parses every SKILL.md — far too costly to repeat on every tool
+/// dispatch (App::reload_skills runs per dispatch). Results are cached
+/// process-wide, keyed by a filesystem fingerprint: the mtimes of both
+/// roots and of every skill directory, plus each SKILL.md's mtime and
+/// length (stats only — no reads). Any external create/edit/delete that
+/// touches those paths changes the fingerprint and forces a re-walk,
+/// while explicit mutations through create()/remove() bump a generation
+/// counter that invalidates every entry immediately. Skill CONTENT is
+/// never cached: Skill::read() still reads from disk on every call.
+#[derive(Clone, PartialEq)]
+struct DirStamp {
+    mtime: Option<SystemTime>,
+    entries: Vec<(String, Option<SystemTime>, Option<SystemTime>, u64)>,
+}
+
+#[derive(Clone, PartialEq)]
+struct Fingerprint {
+    generation: u64,
+    roots: Vec<DirStamp>,
+}
+
+struct DiscoveryCache {
+    generation: u64,
+    entries: Vec<(PathBuf, Fingerprint, Vec<Skill>)>,
+}
+
+static DISCOVERY_CACHE: Mutex<DiscoveryCache> = Mutex::new(DiscoveryCache {
+    generation: 0,
+    entries: Vec::new(),
+});
+
+fn discovery_cache() -> MutexGuard<'static, DiscoveryCache> {
+    // A poisoned lock must not disable caching or panic callers; the
+    // cached data is a pure function of the filesystem stamps.
+    DISCOVERY_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn stamp_root(dir: &Path) -> DirStamp {
+    let mtime = std::fs::metadata(dir).and_then(|m| m.modified()).ok();
+    let mut entries = Vec::new();
+    if let Ok(read) = std::fs::read_dir(dir) {
+        let mut paths: Vec<_> = read.flatten().map(|e| e.path()).collect();
+        paths.sort();
+        for path in paths {
+            let Some(name) = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .filter(|s| valid_id(s))
+            else {
+                continue;
+            };
+            let dir_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+            let (file_mtime, file_len) = match std::fs::metadata(path.join("SKILL.md")) {
+                Ok(meta) => (meta.modified().ok(), meta.len()),
+                Err(_) => (None, 0),
+            };
+            entries.push((name.to_string(), dir_mtime, file_mtime, file_len));
+        }
+    }
+    DirStamp { mtime, entries }
+}
+
+fn fingerprint(root: &Path, generation: u64) -> Fingerprint {
+    Fingerprint {
+        generation,
+        roots: vec![
+            stamp_root(&config_dir().join("skills")),
+            stamp_root(&workspace_dir(root)),
+        ],
+    }
+}
+
+/// Explicit skill mutations invalidate the whole cache at once: the next
+/// discover() anywhere re-walks and sees the change in the same session.
+fn invalidate_discovery() {
+    let mut cache = discovery_cache();
+    cache.generation += 1;
+    cache.entries.clear();
+}
+
 pub fn discover(root: &Path, disabled: &[String]) -> Vec<Skill> {
+    let mut skills = discover_cached(root);
+    if !disabled.is_empty() {
+        for skill in &mut skills {
+            skill.enabled = !disabled.iter().any(|s| s == &skill.id);
+        }
+    }
+    skills
+}
+
+fn discover_cached(root: &Path) -> Vec<Skill> {
+    let (generation, fingerprint) = {
+        let cache = discovery_cache();
+        let fingerprint = fingerprint(root, cache.generation);
+        if let Some((_, _, skills)) = cache
+            .entries
+            .iter()
+            .find(|(r, f, _)| r == root && *f == fingerprint)
+        {
+            return skills.clone();
+        }
+        (cache.generation, fingerprint)
+    };
+    let skills = discover_uncached(root);
+    let mut cache = discovery_cache();
+    // Store only if no explicit mutation raced the walk; otherwise the
+    // next call re-walks and picks the mutation up.
+    if cache.generation == generation {
+        if cache.entries.len() >= 8 {
+            cache.entries.clear();
+        }
+        cache.entries.retain(|(r, _, _)| r != root);
+        cache.entries.push((root.to_path_buf(), fingerprint, skills.clone()));
+    }
+    skills
+}
+
+fn discover_uncached(root: &Path) -> Vec<Skill> {
     let mut found = std::collections::BTreeMap::new();
     for (dir, workspace) in [
         (config_dir().join("skills"), false),
@@ -74,7 +196,9 @@ pub fn discover(root: &Path, disabled: &[String]) -> Vec<Skill> {
                 // Match the editor's canonical path identity so alias paths
                 // cannot bypass dirty-buffer protection during deletion.
                 path: canonical,
-                enabled: !disabled.iter().any(|s| s == id),
+                // The cached form is all-enabled; discover() applies the
+                // caller's disabled list to the clone it hands out.
+                enabled: true,
                 workspace,
             };
             if let Ok(text) = skill.read() {
@@ -133,6 +257,8 @@ pub fn create(root: &Path, id: &str) -> Result<PathBuf> {
         out,
         "---\nname: {id}\ndescription: Describe when the AI should use this skill\n---\n\n# {id}\n\nAdd instructions, conventions and verification steps here.\n"
     )?;
+    drop(out);
+    invalidate_discovery();
     Ok(file)
 }
 
@@ -151,6 +277,7 @@ pub fn remove(root: &Path, skill: &Skill) -> Result<()> {
     if let Some(dir) = skill.path.parent() {
         let _ = std::fs::remove_dir(dir);
     }
+    invalidate_discovery();
     Ok(())
 }
 
@@ -208,6 +335,61 @@ pub fn required_context(skills: &[Skill], selected: &[String]) -> Result<String>
         context.push_str(&block);
     }
     Ok(context)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discovery_cache_tracks_direct_edits_and_explicit_mutations() {
+        let root =
+            std::env::temp_dir().join(format!("termed-skills-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(workspace_dir(&root)).unwrap();
+        // Direct on-disk creation (no API call) is picked up via stamps.
+        let dir = workspace_dir(&root).join("cache-probe");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: Probe\ndescription: first\n---\n",
+        )
+        .unwrap();
+        let found = discover(&root, &[]);
+        let skill = found.iter().find(|s| s.id == "cache-probe").unwrap();
+        assert_eq!(skill.description, "first");
+        // A repeat call with unchanged stamps returns the same listing.
+        assert_eq!(discover(&root, &[]).len(), found.len());
+        // Editing the file changes its stamp and forces a re-walk.
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: Probe\ndescription: second, longer\n---\n",
+        )
+        .unwrap();
+        let found = discover(&root, &[]);
+        assert_eq!(
+            found.iter().find(|s| s.id == "cache-probe").unwrap().description,
+            "second, longer"
+        );
+        // Explicit mutations invalidate immediately, same session.
+        create(&root, "cache-made").unwrap();
+        assert!(discover(&root, &[]).iter().any(|s| s.id == "cache-made"));
+        let made = discover(&root, &[])
+            .into_iter()
+            .find(|s| s.id == "cache-made")
+            .unwrap();
+        remove(&root, &made).unwrap();
+        assert!(!discover(&root, &[]).iter().any(|s| s.id == "cache-made"));
+        // Disabled flags apply per call on top of the cached walk.
+        assert!(
+            !discover(&root, &["cache-probe".to_string()])
+                .iter()
+                .find(|s| s.id == "cache-probe")
+                .unwrap()
+                .enabled
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 /// Renders the complete, prioritized instruction block for an agent configuration.

@@ -611,6 +611,10 @@ pub struct Host {
     tx: Sender<(usize, Value)>,
     /// Requests termed sent that a plugin has not answered yet.
     pending: HashMap<u64, (usize, String)>,
+    /// In-flight request count per plugin, kept in lockstep with
+    /// `pending` so `busy_plugin` is a lookup, not a scan of every
+    /// outstanding request.
+    pending_counts: HashMap<usize, usize>,
     next_id: u64,
     /// Failed starts (kept out of `problem` so the manifest stays clean).
     pub start_errors: HashMap<usize, String>,
@@ -627,6 +631,7 @@ impl Host {
             rx,
             tx,
             pending: HashMap::new(),
+            pending_counts: HashMap::new(),
             next_id: 1,
             start_errors: HashMap::new(),
         };
@@ -641,6 +646,7 @@ impl Host {
         }
         self.plugins.clear();
         self.pending.clear();
+        self.pending_counts.clear();
         while self.rx.try_recv().is_ok() {}
         self.start_errors.clear();
         let disabled = load_disabled(&self.config_path);
@@ -820,9 +826,17 @@ impl Host {
             .filter(|(_, p)| p.enabled && p.runnable() && p.events.iter().any(|e| e == name))
             .map(|(i, _)| i)
             .collect();
+        if targets.is_empty() {
+            return;
+        }
+        // One serialization for every target; the wire bytes are the
+        // same the per-target notify() calls produced.
+        let text = json!({ "jsonrpc": "2.0", "method": "event",
+                "params": { "name": name, "params": params } })
+        .to_string();
         for pi in targets {
             self.start(pi);
-            self.notify(pi, name, params.clone());
+            self.write_text(pi, &text);
         }
     }
 
@@ -832,7 +846,26 @@ impl Host {
     }
 
     pub fn busy_plugin(&self, pi: usize) -> bool {
-        self.pending.values().any(|(owner, _)| *owner == pi)
+        self.pending_counts.contains_key(&pi)
+    }
+
+    /// Rebuild `pending_counts` from `pending` after a bulk removal
+    /// (retain/clear paths); point updates adjust it incrementally.
+    fn recount_pending(&mut self) {
+        self.pending_counts.clear();
+        for (owner, _) in self.pending.values() {
+            *self.pending_counts.entry(*owner).or_insert(0) += 1;
+        }
+    }
+
+    /// Drop one in-flight request from `pending_counts`.
+    fn dec_pending(&mut self, pi: usize) {
+        if let Some(count) = self.pending_counts.get_mut(&pi) {
+            *count -= 1;
+            if *count == 0 {
+                self.pending_counts.remove(&pi);
+            }
+        }
     }
 
     /// Run a validated command and return its request ID so AI callers can
@@ -867,6 +900,7 @@ impl Host {
         let rid = self.next_id;
         self.next_id += 1;
         self.pending.insert(rid, (pi, id.clone()));
+        *self.pending_counts.entry(pi).or_insert(0) += 1;
         self.write(
             pi,
             json!({"jsonrpc":"2.0","id":rid,"method":"command",
@@ -882,20 +916,26 @@ impl Host {
     }
 
     fn write(&mut self, pi: usize, msg: Value) {
+        self.write_text(pi, &msg.to_string());
+    }
+
+    /// Send one pre-serialized JSON-RPC line to a plugin.
+    fn write_text(&mut self, pi: usize, text: &str) {
         let Some(proc) = self.procs.get(&pi) else {
             return;
         };
-        let mut text = msg.to_string();
-        text.push('\n');
+        let mut line = String::with_capacity(text.len() + 1);
+        line.push_str(text);
+        line.push('\n');
         // The writer thread owns the pipe; if it has gone away the message is
         // dropped, and `pump` reports the exit.
-        let _ = proc.out.send(text);
+        let _ = proc.out.send(line);
     }
 
     /// Take everything the plugins have said since the last call.
     pub fn pump(&mut self) -> Vec<Msg> {
         let mut out = Vec::new();
-        while let Ok((pi, v)) = self.rx.try_recv() {
+        while let Ok((pi, mut v)) = self.rx.try_recv() {
             if let Some(text) = v.get("stderr").and_then(Value::as_str) {
                 out.push(Msg::Junk {
                     plugin: pi,
@@ -905,15 +945,20 @@ impl Host {
             }
             let id = v.get("id").and_then(Value::as_u64);
             if let Some(method) = v.get("method").and_then(Value::as_str) {
+                let method = method.to_string();
                 out.push(Msg::Request {
                     plugin: pi,
                     id,
-                    method: method.to_string(),
-                    params: v.get("params").cloned().unwrap_or(Value::Null),
+                    method,
+                    params: v
+                        .as_object_mut()
+                        .and_then(|o| o.remove("params"))
+                        .unwrap_or(Value::Null),
                 });
             } else if let Some(id) = id {
                 if self.pending.get(&id).is_some_and(|(owner, _)| *owner == pi) {
                     self.pending.remove(&id);
+                    self.dec_pending(pi);
                     let result = if let Some(error) = v.get("error") {
                         Err(error
                             .get("message")
@@ -921,7 +966,9 @@ impl Host {
                             .unwrap_or("Plugin command failed")
                             .to_string())
                     } else {
-                        Ok(v.get("result").cloned().unwrap_or(Value::Null))
+                        Ok(v.as_object_mut()
+                            .and_then(|o| o.remove("result"))
+                            .unwrap_or(Value::Null))
                     };
                     out.push(Msg::Response {
                         plugin: pi,
@@ -938,11 +985,15 @@ impl Host {
                 dead.push((*pi, status.code()));
             }
         }
+        let any_dead = !dead.is_empty();
         for (pi, code) in dead {
             self.procs.remove(&pi);
             // Commands it never answered are not going to be answered.
             self.pending.retain(|_, (owner, _)| *owner != pi);
             out.push(Msg::Exited { plugin: pi, code });
+        }
+        if any_dead {
+            self.recount_pending();
         }
         out
     }
@@ -950,6 +1001,7 @@ impl Host {
     /// Stop a running plugin.
     pub fn stop(&mut self, pi: usize) {
         self.pending.retain(|_, (owner, _)| *owner != pi);
+        self.recount_pending();
         if let Some(mut p) = self.procs.remove(&pi) {
             crate::process_guard::terminate(&mut p.child);
         }

@@ -25,7 +25,7 @@ fn spinner() -> &'static str {
 }
 
 /// One rendered row of the transcript.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Row {
     spans: Vec<(String, Style)>,
     bg: Option<Color>,
@@ -398,6 +398,399 @@ fn diff_lines(old: Option<&str>, new: &str, limit: usize) -> (Vec<(char, String)
     (out, total)
 }
 
+/// Everything one entry's rendered rows depend on, hashed: the entry's
+/// own content (including the fields that mutate while streaming — tool
+/// status/text/diffs, a permission card's chosen option), its positional
+/// context (previous entry kind for Agent spacing, live-tail status for
+/// Thought, its index for Permission buttons), and the spinner frame for
+/// running tools so the animation still advances. Any change rebuilds
+/// that entry and everything after it; an unchanged prefix is reused
+/// verbatim, so rows can never go stale.
+fn entry_fingerprint(app: &App, i: usize, working: bool) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let a = &app.agent;
+    let e = &a.entries[i];
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match e {
+        Entry::User(t) => {
+            0u8.hash(&mut hasher);
+            t.hash(&mut hasher);
+        }
+        Entry::Agent(t) => {
+            1u8.hash(&mut hasher);
+            t.hash(&mut hasher);
+            (i > 0 && matches!(a.entries[i - 1], Entry::User(_))).hash(&mut hasher);
+        }
+        Entry::Thought(t) => {
+            2u8.hash(&mut hasher);
+            t.hash(&mut hasher);
+            (i + 1 == a.entries.len() && working).hash(&mut hasher);
+        }
+        Entry::Tool(t) => {
+            3u8.hash(&mut hasher);
+            t.title.hash(&mut hasher);
+            t.kind.hash(&mut hasher);
+            std::mem::discriminant(&t.status).hash(&mut hasher);
+            t.text.hash(&mut hasher);
+            for (p, l) in &t.locations {
+                p.hash(&mut hasher);
+                l.hash(&mut hasher);
+            }
+            for d in &t.diffs {
+                d.path.hash(&mut hasher);
+                d.old.hash(&mut hasher);
+                d.new.hash(&mut hasher);
+            }
+            if matches!(t.status, ToolStatus::Pending | ToolStatus::Running) {
+                spinner().hash(&mut hasher);
+            }
+        }
+        Entry::Plan(items) => {
+            4u8.hash(&mut hasher);
+            for (c, s) in items {
+                c.hash(&mut hasher);
+                std::mem::discriminant(s).hash(&mut hasher);
+            }
+        }
+        Entry::Permission(p) => {
+            5u8.hash(&mut hasher);
+            p.title.hash(&mut hasher);
+            for o in &p.options {
+                o.hash(&mut hasher);
+            }
+            p.chosen.hash(&mut hasher);
+            i.hash(&mut hasher);
+        }
+        Entry::Notice { text, error } => {
+            6u8.hash(&mut hasher);
+            text.hash(&mut hasher);
+            error.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+/// The frame-level inputs to every entry's rows: text width, the palette
+/// colors the entry rendering uses, and the explorer root (tool titles
+/// are relativized against it).
+fn entry_rows_key(app: &App, w: usize, panel_bg: Color) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let pal = &app.theme.palette;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    w.hash(&mut hasher);
+    format!("{:?}", panel_bg).hash(&mut hasher);
+    for c in [
+        pal.popup_dim,
+        pal.accent,
+        pal.tab_active_fg,
+        pal.fg,
+        pal.success,
+        pal.error,
+        pal.warning,
+        pal.diff_added,
+        pal.diff_deleted,
+        pal.accent_fg,
+        pal.border,
+        pal.match_fg,
+        pal.logo[0],
+    ] {
+        format!("{:?}", c).hash(&mut hasher);
+    }
+    app.explorer.root.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Per-entry row segments from the previous frame, with the fingerprint
+/// each segment was built from.
+struct EntryRowsCache {
+    key: u64,
+    segments: Vec<(u64, Vec<Row>)>,
+}
+
+thread_local! {
+    static ENTRY_ROWS_CACHE: std::cell::RefCell<Option<EntryRowsCache>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The transcript's entry rows, reusing the previous frame's segments for
+/// every entry whose fingerprint still matches and rebuilding only from
+/// the first changed entry onward (while streaming, that is just the
+/// tail). The header and trailer rows build_rows adds around the entries
+/// are NOT cached — they carry the live working/elapsed state.
+fn cached_entry_rows(app: &App, w: usize, panel_bg: Color, working: bool, dim: Style) -> Vec<Row> {
+    let a = &app.agent;
+    let key = entry_rows_key(app, w, panel_bg);
+    ENTRY_ROWS_CACHE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let cache = slot.get_or_insert_with(|| EntryRowsCache {
+            key,
+            segments: Vec::new(),
+        });
+        if cache.key != key {
+            cache.key = key;
+            cache.segments.clear();
+        }
+        cache.segments.truncate(a.entries.len());
+        let mut valid = 0;
+        while valid < a.entries.len()
+            && cache
+                .segments
+                .get(valid)
+                .is_some_and(|(f, _)| *f == entry_fingerprint(app, valid, working))
+        {
+            valid += 1;
+        }
+        cache.segments.truncate(valid);
+        let last = a.entries.len().saturating_sub(1);
+        for i in valid..a.entries.len() {
+            let fp = entry_fingerprint(app, i, working);
+            let seg = entry_rows(app, i, &a.entries[i], w, panel_bg, working, last, dim);
+            cache.segments.push((fp, seg));
+        }
+        cache
+            .segments
+            .iter()
+            .flat_map(|(_, seg)| seg.iter().cloned())
+            .collect()
+    })
+}
+
+/// Rows for one transcript entry. Extracted from build_rows so the
+/// per-entry results can be cached (see cached_entry_rows): everything
+/// an entry's rows depend on arrives as a parameter or through `app`.
+#[allow(clippy::too_many_arguments)]
+fn entry_rows(
+    app: &App,
+    i: usize,
+    e: &Entry,
+    w: usize,
+    panel_bg: Color,
+    working: bool,
+    last: usize,
+    dim: Style,
+) -> Vec<Row> {
+    let pal = &app.theme.palette;
+    let a = &app.agent;
+    let mut rows: Vec<Row> = Vec::new();
+    match e {
+        Entry::User(t) => {
+            rows.push(Row::blank());
+            let tint = mix(panel_bg, pal.accent, 0.12);
+            for line in t.lines() {
+                for l in wrap_text(line, w.saturating_sub(2)) {
+                    rows.push(Row {
+                        spans: vec![
+                            ("▍ ".into(), Style::default().fg(pal.accent)),
+                            (l, bold(Style::default().fg(pal.tab_active_fg))),
+                        ],
+                        bg: Some(tint),
+                        ..Default::default()
+                    });
+                }
+            }
+            rows.push(Row::blank());
+        }
+        Entry::Agent(t) => {
+            // Models often emit bare newlines around tool calls: skip those.
+            let t = t.trim_matches('\n');
+            if t.trim().is_empty() {
+                return rows;
+            }
+            if i > 0 && !matches!(a.entries[i - 1], Entry::User(_)) {
+                rows.push(Row::blank());
+            }
+            markdown(t, w, pal, panel_bg, &mut rows)
+        }
+        Entry::Thought(t) => {
+            let st = Style::default()
+                .fg(pal.popup_dim)
+                .add_modifier(Modifier::ITALIC);
+            let text = t.trim();
+            if text.is_empty() {
+                return rows;
+            }
+            if i == last && working {
+                for l in wrap_text(&format!("∴ {text}"), w)
+                    .into_iter()
+                    .rev()
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                {
+                    rows.push(Row::text(l, st));
+                }
+            } else {
+                let first = text.lines().next().unwrap_or("");
+                rows.push(Row::text(ellipsize(&format!("∴ {first}"), w), st));
+            }
+        }
+        Entry::Tool(t) => {
+            let (mark, mark_st) = match t.status {
+                ToolStatus::Pending | ToolStatus::Running => {
+                    (spinner(), Style::default().fg(pal.accent))
+                }
+                ToolStatus::Done => ("✓", Style::default().fg(pal.success)),
+                ToolStatus::Failed => ("✗", Style::default().fg(pal.error)),
+            };
+            let loc = t.locations.first().cloned();
+            // Agents often use a raw path as the title: show "Edit src/x.rs"
+            // relative to the project instead.
+            let title = match (&loc, t.title.is_empty() || t.title.contains('/')) {
+                (Some((p, _)), true) => {
+                    let rel = p
+                        .strip_prefix(&app.explorer.root)
+                        .unwrap_or(p)
+                        .display()
+                        .to_string();
+                    format!("{} {rel}", verb(&t.kind))
+                }
+                _ if t.title.is_empty() => verb(&t.kind).to_string(),
+                _ => t.title.clone(),
+            };
+            let title = ellipsize(
+                &format!("{} {title}", tool_icon(&t.kind)),
+                w.saturating_sub(3),
+            );
+            rows.push(Row {
+                spans: vec![
+                    (format!("{mark} "), mark_st),
+                    (title, Style::default().fg(pal.fg)),
+                ],
+                target: loc.map(|(p, l)| AgentTarget::OpenFile(p, l)),
+                ..Default::default()
+            });
+            for d in &t.diffs {
+                let shown = 12;
+                let (lines, total_changed) = diff_lines(d.old.as_deref(), &d.new, shown);
+                let target = Some(AgentTarget::OpenFile(d.path.clone(), None));
+                for (sign, text) in &lines {
+                    let (bg, fgc) = if *sign == '-' {
+                        (
+                            mix(panel_bg, pal.diff_deleted, 0.28),
+                            mix(pal.fg, pal.diff_deleted, 0.3),
+                        )
+                    } else {
+                        (mix(panel_bg, pal.diff_added, 0.28), pal.fg)
+                    };
+                    for (k, c) in chunk(text, w.saturating_sub(4)).into_iter().enumerate() {
+                        let s = if k == 0 {
+                            format!("  {sign} {c}")
+                        } else {
+                            format!("    {c}")
+                        };
+                        rows.push(Row {
+                            spans: vec![(s, Style::default().fg(fgc))],
+                            bg: Some(bg),
+                            target: target.clone(),
+                            ..Default::default()
+                        });
+                    }
+                }
+                if total_changed > shown {
+                    rows.push(Row::text(
+                        format!("    … {} more changed lines", total_changed - shown),
+                        dim,
+                    ));
+                }
+            }
+            if t.diffs.is_empty()
+                && (!matches!(t.kind.as_str(), "read" | "edit")
+                    || t.status == ToolStatus::Failed)
+                && let Some(text) = &t.text
+            {
+                let line_st = if t.status == ToolStatus::Failed {
+                    Style::default().fg(pal.error)
+                } else {
+                    dim
+                };
+                let all: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+                for l in all.iter().take(4) {
+                    rows.push(Row::text(ellipsize(&format!("  │ {l}"), w), line_st));
+                }
+                if all.len() > 4 {
+                    rows.push(Row::text(
+                        format!("  │ … {} more lines", all.len() - 4),
+                        dim,
+                    ));
+                }
+            }
+        }
+        Entry::Plan(items) => {
+            rows.push(Row::text("Plan", bold(dim)));
+            for (c, s) in items {
+                let (m, st) = match s {
+                    PlanStatus::Pending => ("○", Style::default().fg(pal.fg)),
+                    PlanStatus::Running => ("◐", Style::default().fg(pal.accent)),
+                    PlanStatus::Done => ("✓", Style::default().fg(pal.popup_dim)),
+                };
+                for (k, l) in wrap_text(c, w.saturating_sub(2)).into_iter().enumerate() {
+                    let p = if k == 0 { format!("{m} ") } else { "  ".into() };
+                    rows.push(Row {
+                        spans: vec![(p, Style::default().fg(pal.accent)), (l, st)],
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        Entry::Permission(p) => {
+            rows.push(Row::blank());
+            let warn_bg = mix(panel_bg, pal.warning, 0.15);
+            for l in wrap_text(&format!("⚠ Allow: {}?", p.title), w) {
+                rows.push(Row {
+                    spans: vec![(l, bold(Style::default().fg(pal.warning)))],
+                    bg: Some(warn_bg),
+                    ..Default::default()
+                });
+            }
+            match &p.chosen {
+                Some(c) => rows.push(Row::text(format!("  → {c}"), dim)),
+                None => {
+                    // Buttons, wrapped onto as many rows as needed.
+                    let mut row = Row {
+                        bg: Some(warn_bg),
+                        ..Default::default()
+                    };
+                    let mut x = 0u16;
+                    for (n, (id, label, kind)) in p.options.iter().enumerate() {
+                        let text = ellipsize(&format!(" {} {label} ", n + 1), w);
+                        let tw = width(&text);
+                        if x + tw > w as u16 && x > 0 {
+                            rows.push(std::mem::take(&mut row));
+                            row.bg = Some(warn_bg);
+                            x = 0;
+                        }
+                        let bg = if kind.starts_with("allow") {
+                            mix(warn_bg, pal.success, 0.55)
+                        } else {
+                            mix(warn_bg, pal.error, 0.45)
+                        };
+                        row.spans.push((text, bold(fgbg(Color::White, bg))));
+                        row.spans.push((" ".into(), Style::default()));
+                        row.buttons
+                            .push((x, tw, AgentTarget::Permission(i, id.clone())));
+                        x += tw + 1;
+                    }
+                    rows.push(row);
+                }
+            }
+            rows.push(Row::blank());
+        }
+        Entry::Notice { text, error } => {
+            let st = if *error {
+                Style::default().fg(pal.error)
+            } else {
+                dim
+            };
+            for l in wrap_text(&format!("! {text}"), w) {
+                rows.push(Row::text(l, st));
+            }
+        }
+    }
+    rows
+}
+
+
 fn build_rows(app: &App, w: usize, panel_bg: Color) -> Vec<Row> {
     let pal = &app.theme.palette;
     let a = &app.agent;
@@ -528,224 +921,7 @@ fn build_rows(app: &App, w: usize, panel_bg: Color) -> Vec<Row> {
         return rows;
     }
 
-    let last = a.entries.len().saturating_sub(1);
-    for (i, e) in a.entries.iter().enumerate() {
-        match e {
-            Entry::User(t) => {
-                rows.push(Row::blank());
-                let tint = mix(panel_bg, pal.accent, 0.12);
-                for line in t.lines() {
-                    for l in wrap_text(line, w.saturating_sub(2)) {
-                        rows.push(Row {
-                            spans: vec![
-                                ("▍ ".into(), Style::default().fg(pal.accent)),
-                                (l, bold(Style::default().fg(pal.tab_active_fg))),
-                            ],
-                            bg: Some(tint),
-                            ..Default::default()
-                        });
-                    }
-                }
-                rows.push(Row::blank());
-            }
-            Entry::Agent(t) => {
-                // Models often emit bare newlines around tool calls: skip those.
-                let t = t.trim_matches('\n');
-                if t.trim().is_empty() {
-                    continue;
-                }
-                if i > 0 && !matches!(a.entries[i - 1], Entry::User(_)) {
-                    rows.push(Row::blank());
-                }
-                markdown(t, w, pal, panel_bg, &mut rows)
-            }
-            Entry::Thought(t) => {
-                let st = Style::default()
-                    .fg(pal.popup_dim)
-                    .add_modifier(Modifier::ITALIC);
-                let text = t.trim();
-                if text.is_empty() {
-                    continue;
-                }
-                if i == last && working {
-                    for l in wrap_text(&format!("∴ {text}"), w)
-                        .into_iter()
-                        .rev()
-                        .take(3)
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                    {
-                        rows.push(Row::text(l, st));
-                    }
-                } else {
-                    let first = text.lines().next().unwrap_or("");
-                    rows.push(Row::text(ellipsize(&format!("∴ {first}"), w), st));
-                }
-            }
-            Entry::Tool(t) => {
-                let (mark, mark_st) = match t.status {
-                    ToolStatus::Pending | ToolStatus::Running => {
-                        (spinner(), Style::default().fg(pal.accent))
-                    }
-                    ToolStatus::Done => ("✓", Style::default().fg(pal.success)),
-                    ToolStatus::Failed => ("✗", Style::default().fg(pal.error)),
-                };
-                let loc = t.locations.first().cloned();
-                // Agents often use a raw path as the title: show "Edit src/x.rs"
-                // relative to the project instead.
-                let title = match (&loc, t.title.is_empty() || t.title.contains('/')) {
-                    (Some((p, _)), true) => {
-                        let rel = p
-                            .strip_prefix(&app.explorer.root)
-                            .unwrap_or(p)
-                            .display()
-                            .to_string();
-                        format!("{} {rel}", verb(&t.kind))
-                    }
-                    _ if t.title.is_empty() => verb(&t.kind).to_string(),
-                    _ => t.title.clone(),
-                };
-                let title = ellipsize(
-                    &format!("{} {title}", tool_icon(&t.kind)),
-                    w.saturating_sub(3),
-                );
-                rows.push(Row {
-                    spans: vec![
-                        (format!("{mark} "), mark_st),
-                        (title, Style::default().fg(pal.fg)),
-                    ],
-                    target: loc.map(|(p, l)| AgentTarget::OpenFile(p, l)),
-                    ..Default::default()
-                });
-                for d in &t.diffs {
-                    let shown = 12;
-                    let (lines, total_changed) = diff_lines(d.old.as_deref(), &d.new, shown);
-                    let target = Some(AgentTarget::OpenFile(d.path.clone(), None));
-                    for (sign, text) in &lines {
-                        let (bg, fgc) = if *sign == '-' {
-                            (
-                                mix(panel_bg, pal.diff_deleted, 0.28),
-                                mix(pal.fg, pal.diff_deleted, 0.3),
-                            )
-                        } else {
-                            (mix(panel_bg, pal.diff_added, 0.28), pal.fg)
-                        };
-                        for (k, c) in chunk(text, w.saturating_sub(4)).into_iter().enumerate() {
-                            let s = if k == 0 {
-                                format!("  {sign} {c}")
-                            } else {
-                                format!("    {c}")
-                            };
-                            rows.push(Row {
-                                spans: vec![(s, Style::default().fg(fgc))],
-                                bg: Some(bg),
-                                target: target.clone(),
-                                ..Default::default()
-                            });
-                        }
-                    }
-                    if total_changed > shown {
-                        rows.push(Row::text(
-                            format!("    … {} more changed lines", total_changed - shown),
-                            dim,
-                        ));
-                    }
-                }
-                if t.diffs.is_empty()
-                    && (!matches!(t.kind.as_str(), "read" | "edit")
-                        || t.status == ToolStatus::Failed)
-                    && let Some(text) = &t.text
-                {
-                    let line_st = if t.status == ToolStatus::Failed {
-                        Style::default().fg(pal.error)
-                    } else {
-                        dim
-                    };
-                    let all: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-                    for l in all.iter().take(4) {
-                        rows.push(Row::text(ellipsize(&format!("  │ {l}"), w), line_st));
-                    }
-                    if all.len() > 4 {
-                        rows.push(Row::text(
-                            format!("  │ … {} more lines", all.len() - 4),
-                            dim,
-                        ));
-                    }
-                }
-            }
-            Entry::Plan(items) => {
-                rows.push(Row::text("Plan", bold(dim)));
-                for (c, s) in items {
-                    let (m, st) = match s {
-                        PlanStatus::Pending => ("○", Style::default().fg(pal.fg)),
-                        PlanStatus::Running => ("◐", Style::default().fg(pal.accent)),
-                        PlanStatus::Done => ("✓", Style::default().fg(pal.popup_dim)),
-                    };
-                    for (k, l) in wrap_text(c, w.saturating_sub(2)).into_iter().enumerate() {
-                        let p = if k == 0 { format!("{m} ") } else { "  ".into() };
-                        rows.push(Row {
-                            spans: vec![(p, Style::default().fg(pal.accent)), (l, st)],
-                            ..Default::default()
-                        });
-                    }
-                }
-            }
-            Entry::Permission(p) => {
-                rows.push(Row::blank());
-                let warn_bg = mix(panel_bg, pal.warning, 0.15);
-                for l in wrap_text(&format!("⚠ Allow: {}?", p.title), w) {
-                    rows.push(Row {
-                        spans: vec![(l, bold(Style::default().fg(pal.warning)))],
-                        bg: Some(warn_bg),
-                        ..Default::default()
-                    });
-                }
-                match &p.chosen {
-                    Some(c) => rows.push(Row::text(format!("  → {c}"), dim)),
-                    None => {
-                        // Buttons, wrapped onto as many rows as needed.
-                        let mut row = Row {
-                            bg: Some(warn_bg),
-                            ..Default::default()
-                        };
-                        let mut x = 0u16;
-                        for (n, (id, label, kind)) in p.options.iter().enumerate() {
-                            let text = ellipsize(&format!(" {} {label} ", n + 1), w);
-                            let tw = width(&text);
-                            if x + tw > w as u16 && x > 0 {
-                                rows.push(std::mem::take(&mut row));
-                                row.bg = Some(warn_bg);
-                                x = 0;
-                            }
-                            let bg = if kind.starts_with("allow") {
-                                mix(warn_bg, pal.success, 0.55)
-                            } else {
-                                mix(warn_bg, pal.error, 0.45)
-                            };
-                            row.spans.push((text, bold(fgbg(Color::White, bg))));
-                            row.spans.push((" ".into(), Style::default()));
-                            row.buttons
-                                .push((x, tw, AgentTarget::Permission(i, id.clone())));
-                            x += tw + 1;
-                        }
-                        rows.push(row);
-                    }
-                }
-                rows.push(Row::blank());
-            }
-            Entry::Notice { text, error } => {
-                let st = if *error {
-                    Style::default().fg(pal.error)
-                } else {
-                    dim
-                };
-                for l in wrap_text(&format!("! {text}"), w) {
-                    rows.push(Row::text(l, st));
-                }
-            }
-        }
-    }
+    rows.append(&mut cached_entry_rows(app, w, panel_bg, working, dim));
     if working && !a.entries.is_empty() {
         let secs = a.turn_started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
         rows.push(Row::blank());
@@ -772,8 +948,7 @@ fn build_rows(app: &App, w: usize, panel_bg: Color) -> Vec<Row> {
     rows
 }
 
-pub fn render(buf: &mut Buffer, area: Rect, app: &mut App) -> Option<Position> {
-    let pal = app.theme.palette.clone();
+pub fn render(buf: &mut Buffer, area: Rect, app: &mut App, pal: &Palette) -> Option<Position> {
     let compact = app.compact;
     let panel_bg = pal.sidebar_bg;
     fill(buf, area, panel_bg);
