@@ -1,4 +1,4 @@
-# Standardized Agent Protocol Stack & Visual Architecture for term-ed
+# Standardized Agent Protocol Stack
 
 ## 1. Protocol Matrix
 
@@ -13,22 +13,16 @@
 
 ## 2. Jev Typed Decision Engine
 
-Jev primitives — typed decisions with calibrated confidence scores:
-
-1. **`noul`**: Binary judgment (yes/no/true/false) with confidence and margin.
-   `ask_noul(query, context) -> (bool, confidence in [0.0, 1.0])`
-2. **`choice`**: Selection from a closed set of explicit candidates.
-   `ask_choice(query, [C1, ..., Ck], context) -> (Ci, distribution, confidence)`
-3. **`score`**: Continuous calibrated probability between 0.0 and 1.0.
-   `ask_score(query, context) -> (score in [0.0, 1.0], uncertainty)`
-
-Backend trait (`crates/termed-decisions/src/lib.rs`): `ask_noul`, `ask_choice`, `ask_score` methods with `DecisionContext`, `NoulResult`, `ChoiceResult<T>`, and `ScoreResult`.
+**Primitives:**
+- `noul`: Binary judgment (yes/no) with confidence. `ask_noul(query, context) -> (bool, confidence)`
+- `choice`: Selection from closed candidate set. `ask_choice(query, [C1..Ck], context) -> (Ci, distribution, confidence)`
+- `score`: Calibrated probability. `ask_score(query, context) -> (score in [0.0,1.0], uncertainty)`
 
 | Backend | Description |
 |---|---|
-| **LocalHeuristicBackend** (Default, Zero Config) | 100% offline; static rule tables and heuristic regexes (e.g. `rm`, `mkfs`, `sudo` yield risk ≥0.85; `git status`, `ls` yield risk <0.10). Works in Termux without internet. |
-| **JevHttpBackend** (Opt-in) | Calls TypeSafe's Jev endpoints (`POST /v1/decisions/noul`, `POST /v1/decisions/score`). Sub-150ms calibrated probabilistic decisions. |
-| **ReplayCassetteBackend** (Testing/CI) | Reads serialized decision cassettes (`tests/fixtures/cassettes/*.json`). Guarantees 100% deterministic test passes without external networks or stochastic LLMs. |
+| **LocalHeuristicBackend** (Default, Zero Config) | 100% offline; static rule tables and heuristic regexes. Works in Termux without internet. |
+| **JevHttpBackend** (Opt-in) | Calls TypeSafe's Jev endpoints. Sub-150ms calibrated probabilistic decisions. |
+| **ReplayCassetteBackend** (Testing/CI) | Reads serialized decision cassettes. Guarantees deterministic test passes without external networks. |
 
 ## 3. AG-UI Event Catalog
 
@@ -67,16 +61,12 @@ Backend trait (`crates/termed-decisions/src/lib.rs`): `ask_noul`, `ask_choice`, 
 
 ## 5. AEP Patch Example
 
-JSON-Lines patch format:
-
 ```json
 {"op":"add","path":"src/editor.rs","hunk":[300,310,"old text","new text"]}
 {"op":"remove","path":"src/editor.rs","hunk":[150,160,"",""]}
 ```
 
-Hunks: structured ranges `[start_line, end_line, old_text, new_text]`. Patch operations commit to a `PatchTransaction` stack enabling single-keystroke undo/redo across multi-file edits.
-
-## 6. Target Rust Workspace Architecture
+## 6. Architecture Diagram
 
 ```
 term-ed/

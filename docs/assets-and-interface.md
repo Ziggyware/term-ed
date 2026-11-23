@@ -2,8 +2,6 @@
 
 ## Images
 
-Open PNG, JPEG, GIF, WebP, BMP, ICO in a read-only canvas.
-
 | Control | Action |
 |---|---|
 | `+`/`=` / `-` | Zoom in / out |
@@ -16,13 +14,11 @@ Open PNG, JPEG, GIF, WebP, BMP, ICO in a read-only canvas.
 
 ## ZIP Files
 
-ZIPs are virtual folders, not extracted.
-
 ### Browse as folder
 
 1. Select `.zip` in Explorer (archive icon + **ZIP** badge)
 2. `Enter`/`Right`/click to expand; `Left` to collapse
-3. Open members like normal files; intermediate folders appear even if ZIP omitted directory entries
+3. Open members like normal files
 
 ### Safety & boundaries
 
